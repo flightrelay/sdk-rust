@@ -5,6 +5,7 @@
 //! ```no_run
 //! use flightrelay::FrpListener;
 //!
+//! // Bind to the default FRP port (clients connect to ws://host:5880/frp)
 //! let listener = FrpListener::bind("0.0.0.0:5880", &["0.1.0"]).unwrap();
 //! let mut conn = listener.accept().unwrap();
 //! println!("Controller connected: version={}", conn.version());

@@ -43,5 +43,11 @@ pub use server::{FrpConnection, FrpListener};
 /// Recommended default port for standalone FRP connections.
 pub const DEFAULT_PORT: u16 = 5880;
 
+/// Recommended default WebSocket path for FRP connections.
+pub const DEFAULT_PATH: &str = "/frp";
+
+/// Recommended default URL for standalone FRP connections.
+pub const DEFAULT_URL: &str = "ws://localhost:5880/frp";
+
 /// The FRP spec version this crate implements.
 pub const SPEC_VERSION: &str = "0.1.0";

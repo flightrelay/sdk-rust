@@ -8,7 +8,7 @@
 //! ```no_run
 //! use flightrelay::FrpClient;
 //!
-//! let mut client = FrpClient::connect("ws://192.168.1.50:5880", "my-app", &["0.1.0"]).unwrap();
+//! let mut client = FrpClient::connect("ws://192.168.1.50:5880/frp", "my-app", &["0.1.0"]).unwrap();
 //! loop {
 //!     match client.recv() {
 //!         Ok(msg) => println!("{msg:?}"),
@@ -22,7 +22,7 @@
 //! ```no_run
 //! use flightrelay::FrpClient;
 //!
-//! let mut client = FrpClient::connect("ws://192.168.1.50:5880", "my-sim", &["0.1.0"]).unwrap();
+//! let mut client = FrpClient::connect("ws://192.168.1.50:5880/frp", "my-sim", &["0.1.0"]).unwrap();
 //! client.set_nonblocking(true).unwrap();
 //!
 //! loop {

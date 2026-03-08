@@ -32,7 +32,7 @@ The `client` and `server` features add a dependency on `tungstenite`.
 use flightrelay::{FrpClient, ShotAggregator, FrpMessage};
 
 // Connect to a device and perform the FRP handshake
-let mut client = FrpClient::connect("192.168.1.50:5880", "My App")?;
+let mut client = FrpClient::connect("ws://192.168.1.50:5880/frp", "My App")?;
 let mut shots = ShotAggregator::new();
 
 loop {
@@ -56,6 +56,7 @@ flightrelay = { version = "0.1", features = ["client", "controller"] }
 use flightrelay::{FrpListener, FrpEnvelope, FrpEvent, ShotKey, BallFlight, Velocity, Distance};
 
 // Listen for controllers
+// Bind to the default FRP port (clients connect to ws://host:5880/frp)
 let listener = FrpListener::bind("0.0.0.0:5880", &["0.1.0"])?;
 let mut conn = listener.accept()?;
 
