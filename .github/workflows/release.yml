@@ -1,16 +1,9 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      bump:
-        description: "Version bump type"
-        required: true
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+  push:
+    tags:
+      - "v*"
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,6 +20,15 @@ jobs:
           toolchain: "" # uses rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
 
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::Tag v${tag} does not match Cargo.toml version ${cargo_version}"
+            exit 1
+          fi
+
       - run: cargo clippy --all-features -- -D warnings
       - run: cargo build --all-features
       - run: cargo test --all-features
@@ -36,15 +38,11 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Bump version
+      - name: Bump version for next development cycle
         run: |
           current=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           IFS='.' read -r major minor patch <<< "$current"
-          case "${{ inputs.bump }}" in
-            major) major=$((major + 1)); minor=0; patch=0 ;;
-            minor) minor=$((minor + 1)); patch=0 ;;
-            patch) patch=$((patch + 1)) ;;
-          esac
+          patch=$((patch + 1))
           next="${major}.${minor}.${patch}"
           sed -i "0,/^version = \"${current}\"/s//version = \"${next}\"/" Cargo.toml
           echo "NEXT_VERSION=${next}" >> "$GITHUB_ENV"
@@ -55,4 +53,4 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
           git commit -m "chore: bump version to ${NEXT_VERSION}"
-          git push
+          git push origin HEAD:main
