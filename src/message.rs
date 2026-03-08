@@ -35,8 +35,10 @@ impl FrpMessage {
         let raw: serde_json::Value = serde_json::from_str(json)?;
         if raw.get("device").is_some() {
             Ok(Self::Envelope(serde_json::from_value(raw)?))
-        } else {
+        } else if raw.get("kind").is_some() {
             Ok(Self::Protocol(serde_json::from_value(raw)?))
+        } else {
+            Ok(Self::Protocol(FrpProtocolMessage::Unknown))
         }
     }
 
