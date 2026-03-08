@@ -128,7 +128,7 @@ impl ShotAggregator {
                 .pending
                 .remove(&(env.device.clone(), key.shot_id.clone()))
                 .map(ShotAccumulator::finish),
-            FrpEvent::DeviceInfo { .. } | FrpEvent::Alert { .. } | FrpEvent::Unknown => None,
+            FrpEvent::DeviceTelemetry { .. } | FrpEvent::Alert { .. } | FrpEvent::Unknown => None,
         }
     }
 

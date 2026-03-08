@@ -84,7 +84,7 @@ pub enum FrpEvent {
     ShotFinished {
         key: ShotKey,
     },
-    DeviceInfo {
+    DeviceTelemetry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         manufacturer: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,11 +330,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_device_info_envelope() {
+    fn parse_device_telemetry_envelope() {
         let json = r#"{
             "device": "EagleOne-X4K2",
             "event": {
-                "kind": "device_info",
+                "kind": "device_telemetry",
                 "manufacturer": "Birdie Labs",
                 "model": "Eagle One",
                 "firmware": "1.2.0",
@@ -349,7 +349,7 @@ mod tests {
         let msg = FrpMessage::parse(json).unwrap();
         match msg {
             FrpMessage::Envelope(env) => match &env.event {
-                FrpEvent::DeviceInfo {
+                FrpEvent::DeviceTelemetry {
                     manufacturer,
                     telemetry,
                     ..
@@ -359,7 +359,7 @@ mod tests {
                     assert_eq!(t.get("ready").unwrap(), "true");
                     assert_eq!(t.get("battery_pct").unwrap(), "85");
                 }
-                _ => panic!("expected DeviceInfo"),
+                _ => panic!("expected DeviceTelemetry"),
             },
             _ => panic!("expected Envelope"),
         }
