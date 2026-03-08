@@ -127,6 +127,8 @@ pub enum FrpProtocolMessage {
     /// Controller → Device: set detection mode.
     SetDetectionMode {
         mode: DetectionMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handed: Option<Handedness>,
     },
     /// Unknown protocol message kind — per spec, must be silently ignored.
     #[serde(other)]
@@ -167,6 +169,26 @@ impl fmt::Display for DetectionMode {
             Self::Full => write!(f, "full"),
             Self::Putting => write!(f, "putting"),
             Self::Chipping => write!(f, "chipping"),
+        }
+    }
+}
+
+/// Player handedness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Handedness {
+    /// Right-handed.
+    #[serde(rename = "rh")]
+    Right,
+    /// Left-handed.
+    #[serde(rename = "lh")]
+    Left,
+}
+
+impl fmt::Display for Handedness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Right => write!(f, "rh"),
+            Self::Left => write!(f, "lh"),
         }
     }
 }
@@ -407,11 +429,51 @@ mod tests {
         let json = r#"{"kind":"set_detection_mode","mode":"chipping"}"#;
         let msg = FrpMessage::parse(json).unwrap();
         match msg {
-            FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode { mode }) => {
+            FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode { mode, handed }) => {
                 assert_eq!(mode, DetectionMode::Chipping);
+                assert_eq!(handed, None);
             }
             _ => panic!("expected SetDetectionMode"),
         }
+    }
+
+    #[test]
+    fn parse_set_detection_mode_with_handed() {
+        let json = r#"{"kind":"set_detection_mode","mode":"full","handed":"lh"}"#;
+        let msg = FrpMessage::parse(json).unwrap();
+        match msg {
+            FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode { mode, handed }) => {
+                assert_eq!(mode, DetectionMode::Full);
+                assert_eq!(handed, Some(Handedness::Left));
+            }
+            _ => panic!("expected SetDetectionMode"),
+        }
+    }
+
+    #[test]
+    fn set_detection_mode_roundtrip_without_handed() {
+        let proto = FrpProtocolMessage::SetDetectionMode {
+            mode: DetectionMode::Putting,
+            handed: None,
+        };
+        let msg = FrpMessage::Protocol(proto);
+        let json = msg.to_json().unwrap();
+        assert!(!json.contains("handed"));
+        let back = FrpMessage::parse(&json).unwrap();
+        assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn set_detection_mode_roundtrip_with_handed() {
+        let proto = FrpProtocolMessage::SetDetectionMode {
+            mode: DetectionMode::Full,
+            handed: Some(Handedness::Right),
+        };
+        let msg = FrpMessage::Protocol(proto);
+        let json = msg.to_json().unwrap();
+        assert!(json.contains(r#""handed":"rh""#));
+        let back = FrpMessage::parse(&json).unwrap();
+        assert_eq!(msg, back);
     }
 
     #[test]

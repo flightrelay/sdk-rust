@@ -26,7 +26,7 @@ pub mod server;
 
 pub use error::FrpError;
 pub use message::{
-    DetectionMode, FrpEnvelope, FrpEvent, FrpMessage, FrpProtocolMessage, Severity,
+    DetectionMode, FrpEnvelope, FrpEvent, FrpMessage, FrpProtocolMessage, Handedness, Severity,
 };
 pub use types::{BallFlight, ClubData, FaceImpact, ShotKey};
 pub use units::{Distance, Velocity};
