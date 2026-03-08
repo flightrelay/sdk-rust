@@ -14,9 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "" # uses rust-toolchain.toml
+      - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-features -- -D warnings
       - run: cargo build --all-features

@@ -15,9 +15,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "" # uses rust-toolchain.toml
+      - run: rustup show
       - uses: Swatinem/rust-cache@v2
 
       - name: Verify tag matches Cargo.toml version
