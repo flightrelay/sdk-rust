@@ -47,7 +47,7 @@ loop {
 
 ```toml
 [dependencies]
-flightrelay = { version = "0.0.1", features = ["client", "controller"] }
+flightrelay = { version = "0.1", features = ["client", "controller"] }
 ```
 
 ### Device (emitting shots)
@@ -75,7 +75,7 @@ conn.send_envelope(&FrpEnvelope::new("MyDevice-001", FrpEvent::shot_finished(key
 
 ```toml
 [dependencies]
-flightrelay = { version = "0.0.1", features = ["server"] }
+flightrelay = { version = "0.1", features = ["server"] }
 ```
 
 ### Messages only (no WebSocket)
