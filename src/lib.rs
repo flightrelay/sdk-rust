@@ -7,8 +7,7 @@
 //!
 //! - **`controller`** — [`ShotAggregator`] for accumulating shot lifecycle events
 //! - **`device`** — (reserved for future device-side helpers)
-//! - **`client`** — [`FrpClient`] WebSocket client (connects to a device)
-//! - **`server`** — [`FrpListener`] / [`FrpConnection`] WebSocket server (accepts controllers)
+//! - **`transport`** — [`FrpEndpoint`] / [`FrpConnection`] WebSocket transport for either role
 
 pub mod error;
 pub mod message;
@@ -18,11 +17,8 @@ pub mod units;
 #[cfg(feature = "controller")]
 pub mod accumulator;
 
-#[cfg(feature = "client")]
-pub mod client;
-
-#[cfg(feature = "server")]
-pub mod server;
+#[cfg(feature = "transport")]
+pub mod endpoint;
 
 pub use error::FrpError;
 pub use message::{
@@ -34,11 +30,8 @@ pub use units::{Distance, Velocity};
 #[cfg(feature = "controller")]
 pub use accumulator::{CompletedShot, ShotAggregator};
 
-#[cfg(feature = "client")]
-pub use client::FrpClient;
-
-#[cfg(feature = "server")]
-pub use server::{FrpConnection, FrpListener};
+#[cfg(feature = "transport")]
+pub use endpoint::{EndpointConfig, FrpConnection, FrpEndpoint, Role, Transport};
 
 /// Recommended default port for standalone FRP connections.
 pub const DEFAULT_PORT: u16 = 5880;

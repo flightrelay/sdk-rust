@@ -12,12 +12,12 @@ pub enum FrpError {
     #[error("connection closed")]
     Closed,
 
-    #[cfg(any(feature = "client", feature = "server"))]
+    #[cfg(feature = "transport")]
     #[error("websocket: {0}")]
     WebSocket(Box<tungstenite::Error>),
 }
 
-#[cfg(any(feature = "client", feature = "server"))]
+#[cfg(feature = "transport")]
 impl From<tungstenite::Error> for FrpError {
     fn from(e: tungstenite::Error) -> Self {
         Self::WebSocket(Box::new(e))

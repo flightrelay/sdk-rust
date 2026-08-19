@@ -14,8 +14,19 @@ pub struct ShotKey {
     pub shot_number: u32,
 }
 
+impl ShotKey {
+    /// A shot key from a UUID v4 `shot_id` and a device-supplied `shot_number`.
+    #[must_use]
+    pub fn new(shot_id: impl Into<String>, shot_number: u32) -> Self {
+        Self {
+            shot_id: shot_id.into(),
+            shot_number,
+        }
+    }
+}
+
 /// Ball flight measurement data. All fields optional — send what the hardware supports.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BallFlight {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_speed: Option<Velocity>,
@@ -40,7 +51,7 @@ pub struct BallFlight {
 }
 
 /// Club head measurement data. All fields optional.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClubData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club_speed: Option<Velocity>,
@@ -67,7 +78,7 @@ pub struct ClubData {
 }
 
 /// Face impact location — where on the club face the ball was struck.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FaceImpact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lateral: Option<Distance>,

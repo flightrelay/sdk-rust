@@ -15,8 +15,7 @@ tungstenite = { version = "0.26", optional = true }
 [features]
 controller = []
 device = []
-client = ["dep:tungstenite"]
-server = ["dep:tungstenite"]
+transport = ["dep:tungstenite"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

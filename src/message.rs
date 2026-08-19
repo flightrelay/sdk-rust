@@ -64,6 +64,17 @@ pub struct FrpEnvelope {
     pub event: FrpEvent,
 }
 
+impl FrpEnvelope {
+    /// Wrap `event` in an envelope for the launch monitor `device`.
+    #[must_use]
+    pub fn new(device: impl Into<String>, event: FrpEvent) -> Self {
+        Self {
+            device: device.into(),
+            event,
+        }
+    }
+}
+
 /// Device events, tagged by `"kind"`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -105,6 +116,38 @@ pub enum FrpEvent {
     Unknown,
 }
 
+impl FrpEvent {
+    /// Ball strike detected — the first event of a shot sequence.
+    #[must_use]
+    pub fn shot_trigger(key: ShotKey) -> Self {
+        Self::ShotTrigger { key }
+    }
+
+    /// Ball flight measurement data.
+    #[must_use]
+    pub fn ball_flight(key: ShotKey, ball: BallFlight) -> Self {
+        Self::BallFlight { key, ball }
+    }
+
+    /// Club head measurement data.
+    #[must_use]
+    pub fn club_path(key: ShotKey, club: ClubData) -> Self {
+        Self::ClubPath { key, club }
+    }
+
+    /// Club face impact location.
+    #[must_use]
+    pub fn face_impact(key: ShotKey, impact: FaceImpact) -> Self {
+        Self::FaceImpact { key, impact }
+    }
+
+    /// Shot sequence complete — the terminal event of a shot sequence.
+    #[must_use]
+    pub fn shot_finished(key: ShotKey) -> Self {
+        Self::ShotFinished { key }
+    }
+}
+
 /// Protocol-level messages (no device envelope).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -116,14 +159,9 @@ pub enum FrpProtocolMessage {
         name: Option<String>,
     },
     /// Device → Controller: version confirmation.
-    Init {
-        version: String,
-    },
+    Init { version: String },
     /// Protocol-level alert (no device context).
-    Alert {
-        severity: Severity,
-        message: String,
-    },
+    Alert { severity: Severity, message: String },
     /// Controller → Device: set detection mode and/or handedness.
     ///
     /// Both fields are optional and latched independently — the most recent
@@ -206,7 +244,10 @@ mod tests {
     fn parse_start() {
         let json = r#"{"kind":"start","version":["0.1.0"],"name":"My Dashboard"}"#;
         let msg = FrpMessage::parse(json).unwrap();
-        assert!(matches!(msg, FrpMessage::Protocol(FrpProtocolMessage::Start { .. })));
+        assert!(matches!(
+            msg,
+            FrpMessage::Protocol(FrpProtocolMessage::Start { .. })
+        ));
     }
 
     #[test]
