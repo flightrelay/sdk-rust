@@ -37,7 +37,11 @@ pub struct BallFlight {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carry_distance: Option<Distance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry_offline: Option<Distance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_distance: Option<Distance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_offline: Option<Distance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll_distance: Option<Distance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -45,9 +49,58 @@ pub struct BallFlight {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flight_time: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descent_angle: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backspin_rpm: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidespin_rpm: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_spin_rpm: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spin_axis: Option<f64>,
+}
+
+impl BallFlight {
+    /// Fill in a missing spin pair from the other, complete pair.
+    ///
+    /// `backspin_rpm` + `sidespin_rpm` and `total_spin_rpm` + `spin_axis`
+    /// describe the same spin: `backspin = total × cos(axis)`,
+    /// `sidespin = total × sin(axis)`. When both values of one pair are present
+    /// and neither value of the other is, the other pair is computed and RPM
+    /// values are rounded. A total spin of 0 has no axis: zero components
+    /// leave `spin_axis` unset, and a total of 0 without an axis completes to
+    /// zero components. A partial pair on either side leaves the spin unchanged.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn complete_spin(&mut self) {
+        let components_absent = self.backspin_rpm.is_none() && self.sidespin_rpm.is_none();
+        let total_absent = self.total_spin_rpm.is_none() && self.spin_axis.is_none();
+        match (
+            self.backspin_rpm,
+            self.sidespin_rpm,
+            self.total_spin_rpm,
+            self.spin_axis,
+        ) {
+            (Some(back), Some(side), _, _) if total_absent => {
+                let (back, side) = (f64::from(back), f64::from(side));
+                let total = back.hypot(side).round() as i32;
+                self.total_spin_rpm = Some(total);
+                if total != 0 {
+                    self.spin_axis = Some(side.atan2(back).to_degrees());
+                }
+            }
+            (_, _, Some(total), axis) if components_absent => {
+                let axis = match axis {
+                    Some(axis) => axis.to_radians(),
+                    None if total == 0 => 0.0,
+                    None => return,
+                };
+                let total = f64::from(total);
+                self.backspin_rpm = Some((total * axis.cos()).round() as i32);
+                self.sidespin_rpm = Some((total * axis.sin()).round() as i32);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Club head measurement data. All fields optional.
@@ -75,6 +128,10 @@ pub struct ClubData {
     pub club_offset: Option<Distance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club_height: Option<Distance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spin_loft: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_point_distance: Option<Distance>,
 }
 
 /// Face impact location — where on the club face the ball was struck.
@@ -92,4 +149,115 @@ pub mod telemetry {
     pub const BATTERY_PCT: &str = "battery_pct";
     pub const TILT: &str = "tilt";
     pub const ROLL: &str = "roll";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_spin_from_components() {
+        let mut ball = BallFlight {
+            backspin_rpm: Some(3200),
+            sidespin_rpm: Some(-450),
+            ..Default::default()
+        };
+        ball.complete_spin();
+        assert_eq!(ball.total_spin_rpm, Some(3231));
+        assert!((ball.spin_axis.unwrap() - -8.0047).abs() < 1e-3);
+        assert_eq!(ball.backspin_rpm, Some(3200));
+        assert_eq!(ball.sidespin_rpm, Some(-450));
+    }
+
+    #[test]
+    fn complete_spin_from_total_and_axis() {
+        let mut ball = BallFlight {
+            total_spin_rpm: Some(3231),
+            spin_axis: Some(-8.0),
+            ..Default::default()
+        };
+        ball.complete_spin();
+        assert_eq!(ball.backspin_rpm, Some(3200));
+        assert_eq!(ball.sidespin_rpm, Some(-450));
+        assert_eq!(ball.total_spin_rpm, Some(3231));
+        assert_eq!(ball.spin_axis, Some(-8.0));
+    }
+
+    #[test]
+    fn complete_spin_pairs_agree_both_ways() {
+        let mut ball = BallFlight {
+            total_spin_rpm: Some(2650),
+            spin_axis: Some(12.5),
+            ..Default::default()
+        };
+        ball.complete_spin();
+        let mut back = BallFlight {
+            backspin_rpm: ball.backspin_rpm,
+            sidespin_rpm: ball.sidespin_rpm,
+            ..Default::default()
+        };
+        back.complete_spin();
+        assert_eq!(back.total_spin_rpm, Some(2650));
+        assert!((back.spin_axis.unwrap() - 12.5).abs() < 0.05);
+    }
+
+    #[test]
+    fn complete_spin_zero_total_has_no_axis() {
+        let mut ball = BallFlight {
+            backspin_rpm: Some(0),
+            sidespin_rpm: Some(0),
+            ..Default::default()
+        };
+        ball.complete_spin();
+        assert_eq!(ball.total_spin_rpm, Some(0));
+        assert_eq!(ball.spin_axis, None);
+
+        let mut ball = BallFlight {
+            total_spin_rpm: Some(0),
+            ..Default::default()
+        };
+        ball.complete_spin();
+        assert_eq!(ball.backspin_rpm, Some(0));
+        assert_eq!(ball.sidespin_rpm, Some(0));
+    }
+
+    #[test]
+    fn complete_spin_ignores_partial_pairs() {
+        // Backspin without sidespin: no total or axis is derived.
+        let mut ball = BallFlight {
+            backspin_rpm: Some(3200),
+            ..Default::default()
+        };
+        ball.complete_spin();
+        assert_eq!(
+            ball,
+            BallFlight {
+                backspin_rpm: Some(3200),
+                ..Default::default()
+            }
+        );
+
+        // A nonzero total without an axis: no components are derived.
+        let mut ball = BallFlight {
+            total_spin_rpm: Some(3000),
+            ..Default::default()
+        };
+        ball.complete_spin();
+        assert_eq!(ball.backspin_rpm, None);
+        assert_eq!(ball.sidespin_rpm, None);
+    }
+
+    #[test]
+    fn complete_spin_keeps_both_pairs() {
+        let original = BallFlight {
+            backspin_rpm: Some(3200),
+            sidespin_rpm: Some(-450),
+            total_spin_rpm: Some(3231),
+            spin_axis: Some(-8.0),
+            ..Default::default()
+        };
+        let mut ball = original.clone();
+        ball.complete_spin();
+        assert_eq!(ball, original);
+    }
 }

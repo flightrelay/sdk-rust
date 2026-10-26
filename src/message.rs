@@ -15,6 +15,10 @@ use crate::error::FrpError;
 use crate::types::{BallFlight, ClubData, FaceImpact, ShotKey};
 
 /// Top-level FRP message — either an envelope (device event) or a protocol message.
+// Messages are parsed, handled and dropped one at a time, so the size gap
+// between variants costs nothing; boxing `Envelope` would only complicate
+// matching on it.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum FrpMessage {
     /// Device event envelope: `{ "device": "...", "event": { "kind": "..." } }`
@@ -576,6 +580,151 @@ mod tests {
         let json = msg.to_json().unwrap();
         let back = FrpMessage::parse(&json).unwrap();
         assert_eq!(msg, back);
+    }
+
+    fn shot_fields_ball() -> BallFlight {
+        BallFlight {
+            launch_speed: Some(crate::Velocity::MetersPerSecond(67.2)),
+            carry_distance: Some(crate::Distance::Meters(180.5)),
+            carry_offline: Some(crate::Distance::Meters(-7.6)),
+            total_offline: Some(crate::Distance::Yards(-9.2)),
+            descent_angle: Some(38.4),
+            backspin_rpm: Some(3200),
+            sidespin_rpm: Some(-450),
+            total_spin_rpm: Some(3231),
+            spin_axis: Some(-8.0),
+            ..Default::default()
+        }
+    }
+
+    fn shot_fields_club() -> ClubData {
+        ClubData {
+            club_speed: Some(crate::Velocity::MetersPerSecond(42.1)),
+            spin_loft: Some(22.1),
+            low_point_distance: Some(crate::Distance::Inches(-0.8)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parse_shot_fields() {
+        let json = r#"{
+            "device": "EagleOne-X4K2",
+            "event": {
+                "kind": "ball_flight",
+                "key": {
+                    "shot_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "shot_number": 42
+                },
+                "ball": {
+                    "carry_distance": "180.5m",
+                    "carry_offline": "-7.6m",
+                    "total_offline": "-8.4m",
+                    "descent_angle": 38.4,
+                    "total_spin_rpm": 3231,
+                    "spin_axis": -8.0
+                }
+            }
+        }"#;
+        let FrpMessage::Envelope(env) = FrpMessage::parse(json).unwrap() else {
+            panic!("expected Envelope");
+        };
+        let FrpEvent::BallFlight { ball, .. } = env.event else {
+            panic!("expected BallFlight");
+        };
+        assert_eq!(ball.carry_offline, Some(crate::Distance::Meters(-7.6)));
+        assert_eq!(ball.total_offline, Some(crate::Distance::Meters(-8.4)));
+        assert_eq!(ball.descent_angle, Some(38.4));
+        assert_eq!(ball.total_spin_rpm, Some(3231));
+        assert_eq!(ball.spin_axis, Some(-8.0));
+        assert_eq!(ball.backspin_rpm, None);
+
+        let json = r#"{
+            "device": "EagleOne-X4K2",
+            "event": {
+                "kind": "club_path",
+                "key": {
+                    "shot_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "shot_number": 42
+                },
+                "club": { "spin_loft": 22.1, "low_point_distance": "1.6in" }
+            }
+        }"#;
+        let FrpMessage::Envelope(env) = FrpMessage::parse(json).unwrap() else {
+            panic!("expected Envelope");
+        };
+        let FrpEvent::ClubPath { club, .. } = env.event else {
+            panic!("expected ClubPath");
+        };
+        assert_eq!(club.spin_loft, Some(22.1));
+        assert_eq!(club.low_point_distance, Some(crate::Distance::Inches(1.6)));
+    }
+
+    #[test]
+    fn shot_fields_roundtrip() {
+        let key = ShotKey::new("550e8400-e29b-41d4-a716-446655440000", 42);
+        for event in [
+            FrpEvent::ball_flight(key.clone(), shot_fields_ball()),
+            FrpEvent::club_path(key.clone(), shot_fields_club()),
+        ] {
+            let msg = FrpMessage::Envelope(FrpEnvelope::new("EagleOne-X4K2", event));
+            let json = msg.to_json().unwrap();
+            assert_eq!(FrpMessage::parse(&json).unwrap(), msg);
+        }
+
+        let json = serde_json::to_value(shot_fields_ball()).unwrap();
+        assert_eq!(json["carry_offline"], "-7.6m");
+        assert_eq!(json["total_offline"], "-9.2yd");
+        assert_eq!(json["descent_angle"], 38.4);
+        assert_eq!(json["total_spin_rpm"], 3231);
+        assert_eq!(json["spin_axis"], -8.0);
+        let json = serde_json::to_value(shot_fields_club()).unwrap();
+        assert_eq!(json["spin_loft"], 22.1);
+        assert_eq!(json["low_point_distance"], "-0.8in");
+    }
+
+    #[test]
+    fn shot_fields_omitted_when_absent() {
+        let ball = BallFlight {
+            carry_distance: Some(crate::Distance::Meters(180.5)),
+            backspin_rpm: Some(3200),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&ball).unwrap(),
+            r#"{"carry_distance":"180.5m","backspin_rpm":3200}"#
+        );
+        let club = ClubData {
+            path: Some(-2.1),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_string(&club).unwrap(), r#"{"path":-2.1}"#);
+        assert_eq!(serde_json::to_string(&BallFlight::default()).unwrap(), "{}");
+        assert_eq!(serde_json::to_string(&ClubData::default()).unwrap(), "{}");
+    }
+
+    #[test]
+    fn json_without_shot_fields_parses() {
+        let ball: BallFlight = serde_json::from_str(
+            r#"{"launch_speed":"67.2mps","launch_azimuth":-1.3,"launch_elevation":14.2,
+                "carry_distance":"180.5m","total_distance":"195.0m","roll_distance":"14.5m",
+                "max_height":"28.3m","flight_time":6.2,"backspin_rpm":3200,"sidespin_rpm":-450}"#,
+        )
+        .unwrap();
+        assert_eq!(ball.carry_distance, Some(crate::Distance::Meters(180.5)));
+        assert_eq!(ball.carry_offline, None);
+        assert_eq!(ball.total_offline, None);
+        assert_eq!(ball.descent_angle, None);
+        assert_eq!(ball.total_spin_rpm, None);
+        assert_eq!(ball.spin_axis, None);
+
+        let club: ClubData = serde_json::from_str(
+            r#"{"club_speed":"42.1mps","path":-2.1,"club_offset":"0.47in","club_height":"0.12in"}"#,
+        )
+        .unwrap();
+        assert_eq!(club.path, Some(-2.1));
+        assert_eq!(club.spin_loft, None);
+        assert_eq!(club.low_point_distance, None);
     }
 
     #[test]
