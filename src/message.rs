@@ -287,7 +287,7 @@ mod tests {
                     _ => panic!("expected ShotTrigger"),
                 }
             }
-            _ => panic!("expected Envelope"),
+            FrpMessage::Protocol(_) => panic!("expected Envelope"),
         }
     }
 
@@ -329,7 +329,7 @@ mod tests {
                 }
                 _ => panic!("expected BallFlight"),
             },
-            _ => panic!("expected Envelope"),
+            FrpMessage::Protocol(_) => panic!("expected Envelope"),
         }
     }
 
@@ -370,7 +370,7 @@ mod tests {
                 }
                 _ => panic!("expected ClubPath"),
             },
-            _ => panic!("expected Envelope"),
+            FrpMessage::Protocol(_) => panic!("expected Envelope"),
         }
     }
 
@@ -399,7 +399,7 @@ mod tests {
                 }
                 _ => panic!("expected FaceImpact"),
             },
-            _ => panic!("expected Envelope"),
+            FrpMessage::Protocol(_) => panic!("expected Envelope"),
         }
     }
 
@@ -435,7 +435,7 @@ mod tests {
                 }
                 _ => panic!("expected DeviceTelemetry"),
             },
-            _ => panic!("expected Envelope"),
+            FrpMessage::Protocol(_) => panic!("expected Envelope"),
         }
     }
 
@@ -470,7 +470,7 @@ mod tests {
                 }
                 _ => panic!("expected device Alert"),
             },
-            _ => panic!("expected Envelope"),
+            FrpMessage::Protocol(_) => panic!("expected Envelope"),
         }
     }
 
@@ -736,7 +736,7 @@ mod tests {
         let msg = FrpMessage::parse(json).unwrap();
         match msg {
             FrpMessage::Envelope(env) => assert_eq!(env.event, FrpEvent::Unknown),
-            _ => panic!("expected Envelope"),
+            FrpMessage::Protocol(_) => panic!("expected Envelope"),
         }
     }
 
