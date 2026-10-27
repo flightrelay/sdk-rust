@@ -171,12 +171,13 @@ mod tests {
             launch_azimuth: Some(-1.3),
             launch_elevation: Some(14.2),
             carry_distance: Some(Distance::Meters(180.5)),
-            total_distance: None,
-            roll_distance: None,
-            max_height: None,
-            flight_time: None,
+            carry_offline: Some(Distance::Meters(-7.6)),
+            descent_angle: Some(38.4),
             backspin_rpm: Some(3200),
             sidespin_rpm: Some(-450),
+            total_spin_rpm: Some(3231),
+            spin_axis: Some(-8.0),
+            ..Default::default()
         };
         let ball_msg = FrpMessage::Envelope(FrpEnvelope {
             device: device.into(),
@@ -190,16 +191,10 @@ mod tests {
         // Club path
         let club = ClubData {
             club_speed: Some(Velocity::MetersPerSecond(42.1)),
-            club_speed_post: None,
             path: Some(-2.1),
-            attack_angle: None,
-            face_angle: None,
-            dynamic_loft: None,
-            smash_factor: None,
-            swing_plane_horizontal: None,
-            swing_plane_vertical: None,
-            club_offset: None,
-            club_height: None,
+            spin_loft: Some(22.1),
+            low_point_distance: Some(Distance::Inches(1.6)),
+            ..Default::default()
         };
         let club_msg = FrpMessage::Envelope(FrpEnvelope {
             device: device.into(),
@@ -249,15 +244,8 @@ mod tests {
 
         let ball = BallFlight {
             launch_speed: Some(Velocity::MilesPerHour(100.0)),
-            launch_azimuth: None,
             launch_elevation: Some(12.0),
-            carry_distance: None,
-            total_distance: None,
-            roll_distance: None,
-            max_height: None,
-            flight_time: None,
-            backspin_rpm: None,
-            sidespin_rpm: None,
+            ..Default::default()
         };
         agg.feed(&FrpMessage::Envelope(FrpEnvelope {
             device: "Dev".into(),
