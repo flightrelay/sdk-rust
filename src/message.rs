@@ -8,8 +8,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::FrpError;
 use crate::types::{BallFlight, ClubData, FaceImpact, ShotKey};
@@ -166,16 +168,31 @@ pub enum FrpProtocolMessage {
     Init { version: String },
     /// Protocol-level alert (no device context).
     Alert { severity: Severity, message: String },
-    /// Controller → Device: set detection mode and/or handedness.
+    /// Controller → Device: set detection mode, handedness and/or club.
     ///
-    /// Both fields are optional and latched independently — the most recent
+    /// All fields are optional and latched independently — the most recent
     /// value for each field is the active value. Omitting a field does not
-    /// reset it.
+    /// reset it. A field whose value is not recognized parses as `None`, so
+    /// the rest of the message still applies.
     SetDetectionMode {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_lenient"
+        )]
         mode: Option<DetectionMode>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_lenient"
+        )]
         handed: Option<Handedness>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_lenient"
+        )]
+        club: Option<Club>,
     },
     /// Unknown protocol message kind — per spec, must be silently ignored.
     #[serde(other)]
@@ -238,6 +255,191 @@ impl fmt::Display for Handedness {
             Self::Left => write!(f, "lh"),
         }
     }
+}
+
+/// Club in play, sent as a tracking hint on `set_detection_mode`.
+///
+/// Serializes to the FRP club codes (`"DR"`, `"7I"`, `"PT"`, ...). `Display`
+/// and `FromStr` use the same codes, case-sensitively.
+///
+/// Ordered driver through putter, as in [`Club::ALL`]. New codes may be added
+/// in minor releases, so matches need a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Club {
+    #[serde(rename = "DR")]
+    Driver,
+    #[serde(rename = "MD")]
+    MiniDriver,
+    #[serde(rename = "2W")]
+    Wood2,
+    #[serde(rename = "3W")]
+    Wood3,
+    #[serde(rename = "4W")]
+    Wood4,
+    #[serde(rename = "5W")]
+    Wood5,
+    #[serde(rename = "6W")]
+    Wood6,
+    #[serde(rename = "7W")]
+    Wood7,
+    #[serde(rename = "8W")]
+    Wood8,
+    #[serde(rename = "9W")]
+    Wood9,
+    #[serde(rename = "1H")]
+    Hybrid1,
+    #[serde(rename = "2H")]
+    Hybrid2,
+    #[serde(rename = "3H")]
+    Hybrid3,
+    #[serde(rename = "4H")]
+    Hybrid4,
+    #[serde(rename = "5H")]
+    Hybrid5,
+    #[serde(rename = "6H")]
+    Hybrid6,
+    #[serde(rename = "7H")]
+    Hybrid7,
+    #[serde(rename = "8H")]
+    Hybrid8,
+    #[serde(rename = "9H")]
+    Hybrid9,
+    #[serde(rename = "1I")]
+    Iron1,
+    #[serde(rename = "2I")]
+    Iron2,
+    #[serde(rename = "3I")]
+    Iron3,
+    #[serde(rename = "4I")]
+    Iron4,
+    #[serde(rename = "5I")]
+    Iron5,
+    #[serde(rename = "6I")]
+    Iron6,
+    #[serde(rename = "7I")]
+    Iron7,
+    #[serde(rename = "8I")]
+    Iron8,
+    #[serde(rename = "9I")]
+    Iron9,
+    #[serde(rename = "PW")]
+    PitchingWedge,
+    #[serde(rename = "GW")]
+    GapWedge,
+    #[serde(rename = "SW")]
+    SandWedge,
+    #[serde(rename = "LW")]
+    LobWedge,
+    #[serde(rename = "PT")]
+    Putter,
+}
+
+impl Club {
+    /// Every club, driver through putter.
+    pub const ALL: &[Club] = &[
+        Club::Driver,
+        Club::MiniDriver,
+        Club::Wood2,
+        Club::Wood3,
+        Club::Wood4,
+        Club::Wood5,
+        Club::Wood6,
+        Club::Wood7,
+        Club::Wood8,
+        Club::Wood9,
+        Club::Hybrid1,
+        Club::Hybrid2,
+        Club::Hybrid3,
+        Club::Hybrid4,
+        Club::Hybrid5,
+        Club::Hybrid6,
+        Club::Hybrid7,
+        Club::Hybrid8,
+        Club::Hybrid9,
+        Club::Iron1,
+        Club::Iron2,
+        Club::Iron3,
+        Club::Iron4,
+        Club::Iron5,
+        Club::Iron6,
+        Club::Iron7,
+        Club::Iron8,
+        Club::Iron9,
+        Club::PitchingWedge,
+        Club::GapWedge,
+        Club::SandWedge,
+        Club::LobWedge,
+        Club::Putter,
+    ];
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Driver => "DR",
+            Self::MiniDriver => "MD",
+            Self::Wood2 => "2W",
+            Self::Wood3 => "3W",
+            Self::Wood4 => "4W",
+            Self::Wood5 => "5W",
+            Self::Wood6 => "6W",
+            Self::Wood7 => "7W",
+            Self::Wood8 => "8W",
+            Self::Wood9 => "9W",
+            Self::Hybrid1 => "1H",
+            Self::Hybrid2 => "2H",
+            Self::Hybrid3 => "3H",
+            Self::Hybrid4 => "4H",
+            Self::Hybrid5 => "5H",
+            Self::Hybrid6 => "6H",
+            Self::Hybrid7 => "7H",
+            Self::Hybrid8 => "8H",
+            Self::Hybrid9 => "9H",
+            Self::Iron1 => "1I",
+            Self::Iron2 => "2I",
+            Self::Iron3 => "3I",
+            Self::Iron4 => "4I",
+            Self::Iron5 => "5I",
+            Self::Iron6 => "6I",
+            Self::Iron7 => "7I",
+            Self::Iron8 => "8I",
+            Self::Iron9 => "9I",
+            Self::PitchingWedge => "PW",
+            Self::GapWedge => "GW",
+            Self::SandWedge => "SW",
+            Self::LobWedge => "LW",
+            Self::Putter => "PT",
+        }
+    }
+}
+
+impl fmt::Display for Club {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+impl FromStr for Club {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|club| club.code() == s)
+            .ok_or_else(|| format!("unknown club code: {s:?}"))
+    }
+}
+
+/// Reads an optional `set_detection_mode` field, mapping `null` and any value
+/// that is not a known one to `None` so the device ignores that field and
+/// applies the rest of the message.
+fn deserialize_lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 #[cfg(test)]
@@ -479,9 +681,10 @@ mod tests {
         let json = r#"{"kind":"set_detection_mode","mode":"chipping"}"#;
         let msg = FrpMessage::parse(json).unwrap();
         match msg {
-            FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode { mode, handed }) => {
+            FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode { mode, handed, club }) => {
                 assert_eq!(mode, Some(DetectionMode::Chipping));
                 assert_eq!(handed, None);
+                assert_eq!(club, None);
             }
             _ => panic!("expected SetDetectionMode"),
         }
@@ -492,9 +695,10 @@ mod tests {
         let json = r#"{"kind":"set_detection_mode","mode":"full","handed":"lh"}"#;
         let msg = FrpMessage::parse(json).unwrap();
         match msg {
-            FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode { mode, handed }) => {
+            FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode { mode, handed, club }) => {
                 assert_eq!(mode, Some(DetectionMode::Full));
                 assert_eq!(handed, Some(Handedness::Left));
+                assert_eq!(club, None);
             }
             _ => panic!("expected SetDetectionMode"),
         }
@@ -505,9 +709,10 @@ mod tests {
         let json = r#"{"kind":"set_detection_mode","handed":"rh"}"#;
         let msg = FrpMessage::parse(json).unwrap();
         match msg {
-            FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode { mode, handed }) => {
+            FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode { mode, handed, club }) => {
                 assert_eq!(mode, None);
                 assert_eq!(handed, Some(Handedness::Right));
+                assert_eq!(club, None);
             }
             _ => panic!("expected SetDetectionMode"),
         }
@@ -518,6 +723,7 @@ mod tests {
         let proto = FrpProtocolMessage::SetDetectionMode {
             mode: Some(DetectionMode::Putting),
             handed: None,
+            club: None,
         };
         let msg = FrpMessage::Protocol(proto);
         let json = msg.to_json().unwrap();
@@ -531,6 +737,7 @@ mod tests {
         let proto = FrpProtocolMessage::SetDetectionMode {
             mode: Some(DetectionMode::Full),
             handed: Some(Handedness::Right),
+            club: None,
         };
         let msg = FrpMessage::Protocol(proto);
         let json = msg.to_json().unwrap();
@@ -544,6 +751,7 @@ mod tests {
         let proto = FrpProtocolMessage::SetDetectionMode {
             mode: None,
             handed: Some(Handedness::Left),
+            club: None,
         };
         let msg = FrpMessage::Protocol(proto);
         let json = msg.to_json().unwrap();
@@ -551,6 +759,192 @@ mod tests {
         assert!(json.contains(r#""handed":"lh""#));
         let back = FrpMessage::parse(&json).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn parse_set_detection_mode_with_club() {
+        let json = r#"{"kind":"set_detection_mode","mode":"chipping","handed":"rh","club":"SW"}"#;
+        let msg = FrpMessage::parse(json).unwrap();
+        assert_eq!(
+            msg,
+            FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
+                mode: Some(DetectionMode::Chipping),
+                handed: Some(Handedness::Right),
+                club: Some(Club::SandWedge),
+            })
+        );
+
+        let json = r#"{"kind":"set_detection_mode","club":"7I"}"#;
+        let msg = FrpMessage::parse(json).unwrap();
+        assert_eq!(
+            msg,
+            FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
+                mode: None,
+                handed: None,
+                club: Some(Club::Iron7),
+            })
+        );
+    }
+
+    #[test]
+    fn set_detection_mode_roundtrip_with_club() {
+        let msg = FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
+            mode: Some(DetectionMode::Chipping),
+            handed: Some(Handedness::Right),
+            club: Some(Club::SandWedge),
+        });
+        let json = msg.to_json().unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"set_detection_mode","mode":"chipping","handed":"rh","club":"SW"}"#
+        );
+        assert_eq!(FrpMessage::parse(&json).unwrap(), msg);
+
+        let msg = FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
+            mode: None,
+            handed: None,
+            club: Some(Club::Putter),
+        });
+        let json = msg.to_json().unwrap();
+        assert_eq!(json, r#"{"kind":"set_detection_mode","club":"PT"}"#);
+        assert_eq!(FrpMessage::parse(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn set_detection_mode_without_club_serializes_unchanged() {
+        let msg = FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
+            mode: Some(DetectionMode::Putting),
+            handed: None,
+            club: None,
+        });
+        assert_eq!(
+            msg.to_json().unwrap(),
+            r#"{"kind":"set_detection_mode","mode":"putting"}"#
+        );
+        let msg = FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
+            mode: Some(DetectionMode::Full),
+            handed: Some(Handedness::Left),
+            club: None,
+        });
+        assert_eq!(
+            msg.to_json().unwrap(),
+            r#"{"kind":"set_detection_mode","mode":"full","handed":"lh"}"#
+        );
+    }
+
+    #[test]
+    fn unknown_club_is_ignored_and_rest_applies() {
+        for club in [
+            r#""7i""#,
+            r#""XX""#,
+            r#""""#,
+            "7",
+            "null",
+            r#"{"code":"7I"}"#,
+            r#"["7I"]"#,
+        ] {
+            let json = format!(
+                r#"{{"kind":"set_detection_mode","mode":"putting","handed":"lh","club":{club}}}"#
+            );
+            let msg = FrpMessage::parse(&json).unwrap();
+            assert_eq!(
+                msg,
+                FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
+                    mode: Some(DetectionMode::Putting),
+                    handed: Some(Handedness::Left),
+                    club: None,
+                }),
+                "{club}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_mode_is_ignored_and_rest_applies() {
+        for mode in [
+            r#""range""#,
+            r#""Putting""#,
+            r#""""#,
+            "1",
+            "null",
+            r#"{"mode":"full"}"#,
+        ] {
+            let json = format!(
+                r#"{{"kind":"set_detection_mode","mode":{mode},"handed":"lh","club":"PT"}}"#
+            );
+            let msg = FrpMessage::parse(&json).unwrap();
+            assert_eq!(
+                msg,
+                FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
+                    mode: None,
+                    handed: Some(Handedness::Left),
+                    club: Some(Club::Putter),
+                }),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_handed_is_ignored_and_rest_applies() {
+        for handed in [r#""ambi""#, r#""RH""#, r#""""#, "true", "null", r#"["rh"]"#] {
+            let json = format!(
+                r#"{{"kind":"set_detection_mode","mode":"chipping","handed":{handed},"club":"SW"}}"#
+            );
+            let msg = FrpMessage::parse(&json).unwrap();
+            assert_eq!(
+                msg,
+                FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
+                    mode: Some(DetectionMode::Chipping),
+                    handed: None,
+                    club: Some(Club::SandWedge),
+                }),
+                "{handed}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_fields_unknown_still_parses() {
+        let json = r#"{"kind":"set_detection_mode","mode":"range","handed":"ambi","club":"XX"}"#;
+        assert_eq!(
+            FrpMessage::parse(json).unwrap(),
+            FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
+                mode: None,
+                handed: None,
+                club: None,
+            })
+        );
+    }
+
+    #[test]
+    fn clubs_order_by_bag() {
+        assert!(Club::ALL.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn every_club_code_round_trips() {
+        assert_eq!(Club::ALL.len(), 33);
+        for (i, &club) in Club::ALL.iter().enumerate() {
+            let code = club.to_string();
+            assert_eq!(code.parse::<Club>(), Ok(club), "{code}");
+            let json = serde_json::to_string(&club).unwrap();
+            assert_eq!(json, format!("\"{code}\""));
+            assert_eq!(serde_json::from_str::<Club>(&json).unwrap(), club);
+            assert!(
+                Club::ALL[..i].iter().all(|other| other.to_string() != code),
+                "duplicate code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn club_codes_are_case_sensitive() {
+        assert_eq!("PW".parse::<Club>(), Ok(Club::PitchingWedge));
+        assert!("pw".parse::<Club>().is_err());
+        assert!("I7".parse::<Club>().is_err());
+        assert!(" 7I".parse::<Club>().is_err());
+        assert!(serde_json::from_str::<Club>(r#""7i""#).is_err());
     }
 
     #[test]
