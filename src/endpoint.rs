@@ -108,12 +108,15 @@ pub struct EndpointConfig {
     pub transport: Transport,
     /// Human-readable identifier sent in `start`. Only used by [`Role::Controller`].
     pub name: String,
-    /// FRP versions this endpoint supports, highest preference first.
-    pub versions: Vec<String>,
+    /// Whether to ask the device for `raw_frame` events in `start`. Only used
+    /// by [`Role::Controller`].
+    pub raw_frames: bool,
 }
 
 impl EndpointConfig {
-    /// A config for `role` over `transport`, named `"anonymous"` and supporting
+    /// A config for `role` over `transport`, named `"anonymous"`.
+    ///
+    /// The handshake proposes and accepts only
     /// [`SPEC_VERSION`](crate::SPEC_VERSION).
     #[must_use]
     pub fn new(role: Role, transport: Transport) -> Self {
@@ -121,7 +124,7 @@ impl EndpointConfig {
             role,
             transport,
             name: "anonymous".to_owned(),
-            versions: vec![crate::SPEC_VERSION.to_owned()],
+            raw_frames: false,
         }
     }
 
@@ -132,10 +135,11 @@ impl EndpointConfig {
         self
     }
 
-    /// Set the supported FRP versions, highest preference first.
+    /// Set whether a controller asks the device for `raw_frame` events in
+    /// `start`.
     #[must_use]
-    pub fn with_versions(mut self, versions: &[&str]) -> Self {
-        self.versions = versions.iter().map(|&s| s.to_owned()).collect();
+    pub fn with_raw_frames(mut self, raw_frames: bool) -> Self {
+        self.raw_frames = raw_frames;
         self
     }
 }
@@ -219,15 +223,17 @@ impl FrpEndpoint {
 
         match self.config.role {
             Role::Controller => self.handshake_as_controller(socket),
-            Role::Device => self.handshake_as_device(socket),
+            Role::Device => Self::handshake_as_device(socket),
         }
     }
 
-    /// Send `start`, await `init`.
+    /// Send `start` proposing [`SPEC_VERSION`](crate::SPEC_VERSION), await
+    /// `init` confirming it.
     fn handshake_as_controller(&self, mut socket: Socket) -> Result<FrpConnection, FrpError> {
         let start = FrpProtocolMessage::Start {
-            version: self.config.versions.clone(),
+            version: vec![crate::SPEC_VERSION.to_owned()],
             name: Some(self.config.name.clone()),
+            raw_frames: self.config.raw_frames,
         };
         socket.send(Message::text(serde_json::to_string(&start)?))?;
 
@@ -235,11 +241,24 @@ impl FrpEndpoint {
             match socket.read()? {
                 Message::Text(text) => match FrpMessage::parse(&text) {
                     Ok(FrpMessage::Protocol(FrpProtocolMessage::Init { version })) => {
+                        if version != crate::SPEC_VERSION {
+                            let message = format!("Unsupported FRP version {version:?}");
+                            let alert = FrpProtocolMessage::Alert {
+                                severity: Severity::Critical,
+                                message: message.clone(),
+                            };
+                            // Best effort: the peer may already be gone, and the
+                            // caller needs to see the rejection either way.
+                            let _ = socket.send(Message::text(serde_json::to_string(&alert)?));
+                            let _ = socket.close(None);
+                            return Err(FrpError::Handshake(message));
+                        }
                         return Ok(FrpConnection {
                             socket,
                             role: Role::Controller,
                             version,
                             peer_name: None,
+                            raw_frames: self.config.raw_frames,
                         });
                     }
                     Ok(FrpMessage::Protocol(FrpProtocolMessage::Alert {
@@ -254,15 +273,19 @@ impl FrpEndpoint {
         }
     }
 
-    /// Await `start`, reply `init` with the highest mutually supported version.
-    fn handshake_as_device(&self, mut socket: Socket) -> Result<FrpConnection, FrpError> {
-        let (peer_versions, peer_name) = loop {
+    /// Await `start`, reply `init` with [`SPEC_VERSION`](crate::SPEC_VERSION)
+    /// when the controller proposed it.
+    fn handshake_as_device(mut socket: Socket) -> Result<FrpConnection, FrpError> {
+        let (peer_versions, peer_name, raw_frames) = loop {
             match socket.read()? {
                 Message::Text(text) => {
-                    if let Ok(FrpMessage::Protocol(FrpProtocolMessage::Start { version, name })) =
-                        FrpMessage::parse(&text)
+                    if let Ok(FrpMessage::Protocol(FrpProtocolMessage::Start {
+                        version,
+                        name,
+                        raw_frames,
+                    })) = FrpMessage::parse(&text)
                     {
-                        break (version, name);
+                        break (version, name, raw_frames);
                     }
                 }
                 Message::Close(_) => return Err(FrpError::Closed),
@@ -270,13 +293,15 @@ impl FrpEndpoint {
             }
         };
 
-        let Some(version) = select_version(&self.config.versions, &peer_versions) else {
+        let Some(version) = select_version(&peer_versions) else {
             let alert = FrpProtocolMessage::Alert {
                 severity: Severity::Critical,
                 message: "No compatible FRP version".into(),
             };
-            socket.send(Message::text(serde_json::to_string(&alert)?))?;
-            socket.close(None)?;
+            // Best effort: the peer may already be gone, and the caller needs
+            // to see the rejection either way.
+            let _ = socket.send(Message::text(serde_json::to_string(&alert)?));
+            let _ = socket.close(None);
             return Err(FrpError::Handshake("No compatible FRP version".into()));
         };
 
@@ -290,6 +315,7 @@ impl FrpEndpoint {
             role: Role::Device,
             version,
             peer_name,
+            raw_frames,
         })
     }
 }
@@ -314,6 +340,7 @@ pub struct FrpConnection {
     role: Role,
     version: String,
     peer_name: Option<String>,
+    raw_frames: bool,
 }
 
 impl FrpConnection {
@@ -335,6 +362,15 @@ impl FrpConnection {
         self.peer_name.as_deref()
     }
 
+    /// Whether the controller asked for `raw_frame` events with `raw_frames`
+    /// in its `start`. On the [`Role::Device`] side, send raw frames only
+    /// when this is `true`; on the [`Role::Controller`] side, it is what this
+    /// endpoint asked for.
+    #[must_use]
+    pub fn raw_frames_requested(&self) -> bool {
+        self.raw_frames
+    }
+
     /// Set the underlying TCP stream to non-blocking mode.
     ///
     /// # Errors
@@ -351,9 +387,16 @@ impl FrpConnection {
 
     /// Block until the next [`FrpMessage`] arrives.
     ///
+    /// An envelope whose event the spec has a controller ignore, such as a
+    /// `flight_result` without a recognized `basis`, arrives with an
+    /// [`FrpEvent::Unknown`](crate::FrpEvent::Unknown) event.
+    ///
     /// # Errors
     ///
-    /// Returns an error on connection failure or invalid JSON.
+    /// Returns [`FrpError::Json`] for a message that isn't valid FRP JSON.
+    /// That error is about the one message: the connection stays open, and
+    /// the next call reads the next message. Other errors mean the
+    /// connection failed or closed.
     pub fn recv(&mut self) -> Result<FrpMessage, FrpError> {
         loop {
             match self.socket.read()? {
@@ -371,7 +414,8 @@ impl FrpConnection {
     ///
     /// # Errors
     ///
-    /// Returns an error on connection failure or invalid JSON.
+    /// As for [`recv`](Self::recv): [`FrpError::Json`] is about the one
+    /// message and the connection stays open.
     pub fn try_recv(&mut self) -> Result<Option<FrpMessage>, FrpError> {
         loop {
             match self.socket.read() {
@@ -446,33 +490,54 @@ impl fmt::Debug for FrpConnection {
             .field("role", &self.role)
             .field("version", &self.version)
             .field("peer_name", &self.peer_name)
+            .field("raw_frames", &self.raw_frames)
             .finish_non_exhaustive()
     }
 }
 
-/// Select the highest version present in both lists.
-///
-/// `peer` is in preference order, highest first.
-fn select_version(local: &[String], peer: &[String]) -> Option<String> {
-    peer.iter().find(|v| local.contains(v)).cloned()
+/// [`SPEC_VERSION`](crate::SPEC_VERSION) if the controller proposed it. An
+/// endpoint implements exactly one FRP version.
+fn select_version(peer: &[String]) -> Option<String> {
+    peer.iter()
+        .any(|v| v == crate::SPEC_VERSION)
+        .then(|| crate::SPEC_VERSION.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn versions(list: &[&str]) -> Vec<String> {
+        list.iter().map(|&v| v.to_owned()).collect()
+    }
+
     #[test]
-    fn version_selection() {
-        let local = vec!["0.1.0".to_owned(), "0.2.0".to_owned()];
-        let peer = vec!["0.2.0".to_owned(), "0.1.0".to_owned()];
-        assert_eq!(select_version(&local, &peer), Some("0.2.0".to_owned()));
+    fn version_selection_accepts_only_the_spec_version() {
+        assert_eq!(crate::SPEC_VERSION, "0.2.0");
+        for peer in [
+            &["0.2.0"][..],
+            &["0.3.0", "0.2.0", "0.1.0"],
+            &["0.1.0", "0.2.0"],
+        ] {
+            assert_eq!(
+                select_version(&versions(peer)),
+                Some("0.2.0".to_owned()),
+                "{peer:?}"
+            );
+        }
     }
 
     #[test]
     fn version_selection_no_match() {
-        let local = vec!["0.1.0".to_owned()];
-        let peer = vec!["0.2.0".to_owned()];
-        assert_eq!(select_version(&local, &peer), None);
+        for peer in [
+            &["0.1.0"][..],
+            &["0.2.1"],
+            &["0.3.0", "1.0.0"],
+            &["0.2"],
+            &[],
+        ] {
+            assert_eq!(select_version(&versions(peer)), None, "{peer:?}");
+        }
     }
 
     #[test]
@@ -482,9 +547,15 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_to_spec_version() {
+    fn config_defaults_to_anonymous() {
         let cfg = EndpointConfig::new(Role::Device, Transport::listen("0.0.0.0:5880"));
-        assert_eq!(cfg.versions, vec![crate::SPEC_VERSION.to_owned()]);
         assert_eq!(cfg.name, "anonymous");
+    }
+
+    #[test]
+    fn config_asks_for_no_raw_frames_by_default() {
+        let cfg = EndpointConfig::new(Role::Controller, Transport::connect("ws://h:5880/frp"));
+        assert!(!cfg.raw_frames);
+        assert!(cfg.with_raw_frames(true).raw_frames);
     }
 }
