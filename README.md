@@ -17,6 +17,7 @@ This crate implements FRP 0.2.0 (`SPEC_VERSION`). Its handshake proposes and acc
 - **Raw frames** — optional `RawFrame` debug events carrying the protocol messages behind a device's events, sent only to a controller that asks for them in `start`
 - **Duplicate dropping for forwarders** — `ForwardFilter` drops repeated shot events, unchanged telemetry, repeated alerts and repeated raw frames before a bridge or hub forwards them, so an event that loops back dies out
 - **WebSocket transport** — `FrpEndpoint` handles the FRP handshake for either role, in either transport direction, and yields `FrpConnection`s with synchronous send/recv
+- **Device drivers** — a `DeviceDriver` trait for a launch monitor, `FrpServer` to serve one to FRP controllers, `run` for a complete `main`, and a simulated `MockDriver`
 
 ## Features
 
@@ -26,8 +27,13 @@ This crate implements FRP 0.2.0 (`SPEC_VERSION`). Its handshake proposes and acc
 | `controller` | `ShotAggregator` for accumulating shot lifecycle events |
 | `device` | `ForwardFilter` for endpoints that forward events |
 | `transport` | `FrpEndpoint` / `FrpConnection` — WebSocket transport for either role |
+| `config` | `DriverConfig`, `ConfigError`, `is_default` — serde settings for a driver |
+| `driver` | the `DeviceDriver` / `DeviceSession` traits, `Events`, `Stop`, `Backoff`, `ShotIds`, `Live`, `connect_tcp` (implies `config`) |
+| `server` | `FrpServer` (implies `driver`, `device` and `transport`) |
+| `main` | `run`, `run_with`, `run_args` (implies `server`) |
+| `mock` | `MockDriver`, a simulated launch monitor (implies `driver`) |
 
-The `transport` feature adds a dependency on `tungstenite`.
+The `transport` feature adds a dependency on `tungstenite`, and `main` adds `toml` and `ctrlc`. `config` and `driver` add no dependencies, and `config` builds for `wasm32-unknown-unknown`.
 
 ## Roles and transport direction
 
@@ -292,6 +298,79 @@ if conn.raw_frames_requested() && !carries_identity(&bytes) {
 ```
 
 Raw frames never affect a shot: `ShotAggregator` ignores them, even with a key. A `raw_frame` whose `dir`, `seq` or `data` is invalid (e.g. an odd number of hex digits) arrives as `FrpEvent::Unknown`. A forwarder may drop raw frames; one that forwards them passes them unchanged, only to a controller that asked for them.
+
+### Device drivers
+
+A driver connects one launch monitor to a host. The host here is either `FrpServer`, which turns a driver's events into FRP for controllers, or an application that runs the driver itself.
+
+A driver is built in two steps. `DeviceDriver::new(config)` validates a config and builds the driver, with no I/O, and the driver keeps whatever outlives one connection (a shot counter, a retry clock). `connect(&mut ctx)` opens one `DeviceSession`: transport, handshake, identity. The host then calls `poll(timeout, &mut events)` until it fails or the host stops, and `close` to release the device. The host owns the reconnect loop and asks the driver for the delay (`retry_delay`). Everything is synchronous and caller-driven.
+
+```rust
+use std::time::Duration;
+use flightrelay::driver::{
+    ConfigError, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events,
+    NoAction, ShotIds, Stopped,
+};
+use flightrelay::{Source, config::DriverConfig};
+
+// `Config` is a serde struct that implements `DriverConfig`; `Error` converts from `Stopped`.
+impl DeviceDriver for Beacon {
+    type Config = Config;
+    type Error = Error;
+    type Action = NoAction;
+    type Session = BeaconSession;
+
+    fn info(_: &Config) -> DriverInfo {
+        DriverInfo::new("beacon", "Beacon", Source::Virtual)
+    }
+    fn new(config: Config) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self { config, ids: ShotIds::new() })
+    }
+    fn config(&self) -> &Config { &self.config }
+    fn apply_config(&mut self, new: &Config) { self.config = new.clone(); }
+    fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<BeaconSession, Error> {
+        ctx.tick()?; // between steps; `Err(Stopped)` after a stop
+        Ok(BeaconSession { /* ... */ })
+    }
+}
+```
+
+A driver emits `DeviceEvent`s into the `Events` sink: FRP events (shots, telemetry, alerts, raw frames) and three host-only kinds (a phase, a log line, a discarded shot). It sends each shot event once, when it has it, and leaves out any value the device does not have. `ConnectCtx::tick()` lets the host serve its own inputs while a long connect blocks, and `ConnectCtx::latched()` shows the mode, hand and club the host has latched, live.
+
+To serve a driver to controllers, give it to `FrpServer`:
+
+```rust
+use flightrelay::driver::Stop;
+use flightrelay::{FrpServer, ServerConfig, Transport};
+
+let driver = Beacon::new(Config::default())?;
+let stop = Stop::new();
+FrpServer::new(driver, ServerConfig::new(Transport::listen("0.0.0.0:5880")))
+    .on_event(|event| eprintln!("{event:?}"))
+    .run(&stop)?;
+```
+
+The server accepts any number of controllers (`Transport::Connect` dials one instead), replays the device's telemetry to a controller that joins late, stamps `source` on every `device_telemetry`, drops duplicate events, finishes a shot a lost session left open, and passes a controller's `set_detection_mode` to the session as a `DeviceCommand`. A network thread owns every connection, so controllers are served while a connect blocks, and a controller that reads slowly is queued, then dropped alone once it passes `write_buffer_limit`.
+
+`run` is a whole `main`:
+
+```rust
+fn main() -> std::process::ExitCode {
+    flightrelay::run::<Beacon>()
+}
+```
+
+Its command line is named flags, in any order: `--config <path>` (a TOML file with the driver's config), `--target <listen-addr | ws://host:port/frp>`, repeatable `--set key=value` over the file, `--log <info|debug|trace>`, and `--help`, which lists every config key with its default. A `--set` key the config does not have, and a `wss://` target, are refused with exit 2. Ctrl-C closes the session and exits.
+
+`MockDriver` (feature `mock`) is a virtual launch monitor that fires a shot at an interval, for testing a host without hardware:
+
+```rust
+use flightrelay::driver::DeviceDriver;
+use flightrelay::mock::{MockConfig, MockDriver};
+
+let driver = MockDriver::new(MockConfig::default())?;
+```
 
 ### Messages only (no WebSocket)
 
