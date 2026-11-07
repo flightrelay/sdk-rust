@@ -224,10 +224,13 @@ impl DeviceDriver for Fake {
 
     fn retry_delay(
         &mut self,
-        _: &SessionEnd<'_, FakeError>,
+        ended: &SessionEnd<'_, FakeError>,
         _: &mut Backoff,
-        _: &mut Events<'_>,
+        out: &mut Events<'_>,
     ) -> Option<Duration> {
+        if let Some(error) = ended.error {
+            out.alert(Severity::Warn, error.to_string());
+        }
         if self.inner.give_up.load(Ordering::SeqCst) {
             None
         } else {
@@ -706,11 +709,7 @@ fn a_shot_left_open_by_a_lost_session_is_finished_then_the_device_is_marked_lost
     });
     peer.until(|v| kind(v) == "launch");
     h.control.fail("cable pulled");
-    let seen = peer.until(|v| {
-        v["event"]["message"]
-            .as_str()
-            .is_some_and(|m| m.starts_with("Connection lost"))
-    });
+    let seen = peer.until(|v| v["message"] == "failed: cable pulled");
     let order = kinds(&seen);
     let finished = order
         .iter()
@@ -726,12 +725,12 @@ fn a_shot_left_open_by_a_lost_session_is_finished_then_the_device_is_marked_lost
         finished < not_ready,
         "the shot is closed before the device is marked lost: {order:?}"
     );
+    // The driver's alert is the only one: the server adds none of its own.
+    // It comes after the session ended, so it is protocol-level.
     let alert = seen.last().unwrap();
-    assert_eq!(alert["event"]["severity"], "warn");
-    assert_eq!(
-        alert["event"]["message"],
-        "Connection lost: failed: cable pulled"
-    );
+    assert_eq!(alert["severity"], "warn");
+    assert!(alert["device"].is_null(), "{alert}");
+    assert_eq!(kinds(&seen).iter().filter(|k| **k == "alert").count(), 1);
     // The log shows the loss, and the driver reconnects.
     h.wait_for("lost ");
     h.wait_for_nth("device+ ", 2);
@@ -1326,11 +1325,7 @@ fn what_a_driver_emits_while_reconnecting_is_not_the_old_devices() {
         alert: "from the new unit",
     });
     h.control.fail("swapped");
-    peer.until(|v| {
-        v["event"]["message"]
-            .as_str()
-            .is_some_and(|m| m.starts_with("Connection lost"))
-    });
+    peer.until(|v| v["message"] == "failed: swapped");
     release.store(true, Ordering::SeqCst);
     let seen = peer
         .until(|v| v["device"] == "EagleTwo-Q7Z9" && v["event"]["telemetry"]["phase"] == "pairing");
