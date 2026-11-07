@@ -38,7 +38,9 @@
 //! - A `shot_finished` for every shot a lost session left open, and for any
 //!   shot still open after [`ServerConfig::shot_timeout`] (default
 //!   [`DEFAULT_SHOT_TIMEOUT`]).
-//! - On device loss, `ready=false` and a warn alert ("Connection lost: …").
+//! - On device loss, `ready=false`. The alert about the loss is the driver's
+//!   (from [`retry_delay`](crate::driver::DeviceDriver::retry_delay)); the
+//!   server adds none of its own.
 //! - `raw_frame` events, numbered per device id across sessions, only to
 //!   controllers that asked for them.
 //! - A controller's `set_detection_mode` reaches the driver as a
@@ -224,7 +226,7 @@ impl<D: DeviceDriver> fmt::Debug for FrpServer<D> {
 enum ToNet {
     Event(FrpEvent),
     Identified(DeviceIdentity),
-    SessionEnded { error: Option<String> },
+    SessionEnded,
     Shutdown,
 }
 
@@ -420,12 +422,7 @@ impl<D: DeviceDriver> FrpServer<D> {
                             format!("closing the device: {e}"),
                         ));
                     }
-                    push(
-                        &to_net,
-                        ToNet::SessionEnded {
-                            error: error.as_ref().map(ToString::to_string),
-                        },
-                    );
+                    push(&to_net, ToNet::SessionEnded);
                     (error, Some(started.elapsed()))
                 }
                 Err(e) => {
@@ -814,7 +811,7 @@ impl Net {
         match msg {
             ToNet::Event(event) => self.on_event(event),
             ToNet::Identified(identity) => self.on_identified(&identity),
-            ToNet::SessionEnded { error } => self.on_session_ended(error.as_deref()),
+            ToNet::SessionEnded => self.on_session_ended(),
             ToNet::Shutdown => return true,
         }
         false
@@ -873,17 +870,11 @@ impl Net {
         self.broadcast_event(event);
     }
 
-    fn on_session_ended(&mut self, error: Option<&str>) {
+    fn on_session_ended(&mut self) {
         self.connecting = true;
         self.finish_open_shots("the session ended");
         if self.device.is_some() {
             self.broadcast_event(not_ready());
-            if let Some(error) = error {
-                self.broadcast_event(FrpEvent::Alert {
-                    severity: Severity::Warn,
-                    message: format!("Connection lost: {error}"),
-                });
-            }
         }
     }
 
