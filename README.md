@@ -2,7 +2,7 @@
 
 Rust SDK for the [Flight Relay Protocol (FRP)](https://github.com/flightrelay/spec) — golf launch monitor event streaming over WebSocket.
 
-This crate implements FRP 0.2.0 (`SPEC_VERSION`). Its handshake proposes and accepts only that version, so it does not connect to FRP 0.1.0 peers.
+This crate implements FRP 0.2.0 (`SPEC_VERSION`).
 
 [![CI](https://github.com/flightrelay/sdk-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/flightrelay/sdk-rust/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/flightrelay.svg)](https://crates.io/crates/flightrelay)
