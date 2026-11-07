@@ -10,6 +10,16 @@
 //! - **`device`** — [`ForwardFilter`], which drops duplicate events before an
 //!   endpoint forwards them
 //! - **`transport`** — [`FrpEndpoint`] / [`FrpConnection`] WebSocket transport for either role
+//! - **`config`** — [`config::DriverConfig`], the serde settings of a device driver
+//! - **`driver`** — the [`driver::DeviceDriver`] contract between a launch
+//!   monitor and its host (implies `config`)
+//! - **`server`** — [`FrpServer`], which serves a driver's events to FRP
+//!   controllers (implies `driver`, `device` and `transport`)
+//! - **`main`** — [`run`], a complete `main` for a driver: config file,
+//!   `--set` overrides, `--help`, Ctrl-C (implies `server`; adds `toml` and
+//!   `ctrlc`)
+//! - **`mock`** — [`mock::MockDriver`], a simulated launch monitor (implies
+//!   `driver`)
 //!
 //! # Measured values and flight results
 //!
@@ -47,6 +57,11 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "main")]
+mod cli;
+#[cfg(any(feature = "driver", feature = "transport"))]
+mod net;
+
 pub mod error;
 pub mod message;
 pub mod types;
@@ -60,6 +75,18 @@ pub mod forward;
 
 #[cfg(feature = "transport")]
 pub mod endpoint;
+
+#[cfg(feature = "config")]
+pub mod config;
+
+#[cfg(feature = "driver")]
+pub mod driver;
+
+#[cfg(feature = "server")]
+pub mod server;
+
+#[cfg(feature = "mock")]
+pub mod mock;
 
 pub use error::FrpError;
 pub use message::{
@@ -79,6 +106,12 @@ pub use forward::ForwardFilter;
 
 #[cfg(feature = "transport")]
 pub use endpoint::{EndpointConfig, FrpConnection, FrpEndpoint, Role, Transport};
+
+#[cfg(feature = "server")]
+pub use server::{FrpServer, ServerConfig, ServerError, ServerEvent};
+
+#[cfg(feature = "main")]
+pub use cli::{RunOptions, run, run_args, run_with};
 
 /// Recommended default port for standalone FRP connections.
 pub const DEFAULT_PORT: u16 = 5880;

@@ -35,10 +35,13 @@
 //! ```
 
 use std::fmt;
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tungstenite::Message;
-use tungstenite::protocol::WebSocket;
+use tungstenite::client::IntoClientRequest;
+use tungstenite::protocol::{WebSocket, WebSocketConfig};
 use tungstenite::stream::MaybeTlsStream;
 
 use crate::error::FrpError;
@@ -111,7 +114,26 @@ pub struct EndpointConfig {
     /// Whether to ask the device for `raw_frame` events in `start`. Only used
     /// by [`Role::Controller`].
     pub raw_frames: bool,
+    /// How long a handshake may take, from the connection opening to the
+    /// last handshake message. `None` waits as long as the peer does.
+    pub handshake_timeout: Option<Duration>,
+    /// How many bytes a connection may queue for a peer that reads slowly
+    /// before a send fails with a write-buffer-full error. Only a
+    /// non-blocking connection queues. A single message larger than this
+    /// cannot be sent.
+    pub write_buffer_limit: usize,
 }
+
+/// The default [`EndpointConfig::write_buffer_limit`].
+pub const DEFAULT_WRITE_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
+
+/// How often [`FrpEndpoint::establish_until`] looks for a connection and for
+/// a stop.
+const ACCEPT_POLL: Duration = Duration::from_millis(100);
+
+/// How long a connect may take when a stop token is given but no
+/// `handshake_timeout`.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl EndpointConfig {
     /// A config for `role` over `transport`, named `"anonymous"`.
@@ -125,6 +147,8 @@ impl EndpointConfig {
             transport,
             name: "anonymous".to_owned(),
             raw_frames: false,
+            handshake_timeout: None,
+            write_buffer_limit: DEFAULT_WRITE_BUFFER_LIMIT,
         }
     }
 
@@ -141,6 +165,27 @@ impl EndpointConfig {
     pub fn with_raw_frames(mut self, raw_frames: bool) -> Self {
         self.raw_frames = raw_frames;
         self
+    }
+
+    /// Limit how long a handshake may take, so a peer that connects and says
+    /// nothing cannot hold the endpoint.
+    #[must_use]
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the most bytes a non-blocking connection queues for a slow peer.
+    #[must_use]
+    pub fn with_write_buffer_limit(mut self, bytes: usize) -> Self {
+        self.write_buffer_limit = bytes;
+        self
+    }
+
+    fn ws_config(&self) -> WebSocketConfig {
+        let base = WebSocketConfig::default();
+        let write = base.write_buffer_size;
+        base.max_write_buffer_size(self.write_buffer_limit.max(write + 1))
     }
 }
 
@@ -197,39 +242,119 @@ impl FrpEndpoint {
     ///
     /// Blocks accepting an inbound connection ([`Transport::Listen`]) or dials
     /// the configured URL ([`Transport::Connect`]), then performs the FRP
-    /// handshake in the direction determined by [`Role`].
+    /// handshake in the direction determined by [`Role`]. The handshake is
+    /// bounded by [`EndpointConfig::handshake_timeout`] when one is set.
     ///
     /// # Errors
     ///
     /// Returns an error if the connection or the FRP handshake fails.
     pub fn establish(&mut self) -> Result<FrpConnection, FrpError> {
-        let socket = match (&self.config.transport, &self.listener) {
-            (Transport::Listen(_), Some(listener)) => {
-                let (stream, _addr) = listener
-                    .accept()
-                    .map_err(|e| FrpError::WebSocket(Box::new(tungstenite::Error::Io(e))))?;
-                tungstenite::accept(MaybeTlsStream::Plain(stream)).map_err(|e| match e {
-                    tungstenite::HandshakeError::Failure(e) => FrpError::WebSocket(Box::new(e)),
-                    tungstenite::HandshakeError::Interrupted(_) => {
-                        FrpError::Handshake("WebSocket handshake interrupted".into())
-                    }
-                })?
-            }
-            (Transport::Connect(url), _) => tungstenite::connect(url)?.0,
-            (Transport::Listen(_), None) => {
-                return Err(FrpError::Handshake("listener not bound".into()));
-            }
-        };
-
-        match self.config.role {
-            Role::Controller => self.handshake_as_controller(socket),
-            Role::Device => Self::handshake_as_device(socket),
+        let never = AtomicBool::new(false);
+        match self.establish_inner(&never, false)? {
+            Some(conn) => Ok(conn),
+            None => Err(FrpError::Closed),
         }
+    }
+
+    /// Like [`establish`](Self::establish), but returns `Ok(None)` as soon as
+    /// `stop` is set, so a thread that serves or dials in a loop can end.
+    ///
+    /// A listening endpoint polls its listener every 100 ms; a dialing one
+    /// connects on a thread of its own and gives up the wait on a stop (and
+    /// does not follow HTTP redirects, which [`establish`](Self::establish)
+    /// does when nothing bounds or cancels the dial). Once a peer has
+    /// connected, only [`EndpointConfig::handshake_timeout`] bounds the
+    /// handshake, so set one to keep a peer that connects and says nothing
+    /// from holding the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection or the FRP handshake fails.
+    pub fn establish_until(
+        &mut self,
+        stop: &AtomicBool,
+    ) -> Result<Option<FrpConnection>, FrpError> {
+        self.establish_inner(stop, true)
+    }
+
+    fn establish_inner(
+        &mut self,
+        stop: &AtomicBool,
+        cancelable: bool,
+    ) -> Result<Option<FrpConnection>, FrpError> {
+        let ws = self.config.ws_config();
+        match (&self.config.transport, &self.listener) {
+            (Transport::Listen(_), Some(listener)) => {
+                let stream = if cancelable {
+                    match accept_until(listener, stop)? {
+                        Some(stream) => stream,
+                        None => return Ok(None),
+                    }
+                } else {
+                    listener.accept().map_err(io_error)?.0
+                };
+                // The handshake clock starts when the peer connects.
+                let deadline = self.config.handshake_timeout.map(|t| Instant::now() + t);
+                stream.set_nonblocking(false).map_err(io_error)?;
+                arm(&stream, deadline)?;
+                let socket =
+                    tungstenite::accept_with_config(MaybeTlsStream::Plain(stream), Some(ws))
+                        .map_err(|e| handshake_error(e, deadline))?;
+                self.finish(socket, deadline).map(Some)
+            }
+            (Transport::Connect(url), _)
+                if !cancelable && self.config.handshake_timeout.is_none() =>
+            {
+                // Nothing to bound or cancel: the plain blocking connect, which
+                // follows HTTP redirects.
+                let socket = tungstenite::client::connect_with_config(url.as_str(), Some(ws), 3)?.0;
+                self.finish(socket, None).map(Some)
+            }
+            (Transport::Connect(url), _) => {
+                let deadline = self.config.handshake_timeout.map(|t| Instant::now() + t);
+                let Some(stream) = dial(
+                    url,
+                    self.config.handshake_timeout,
+                    cancelable.then_some(stop),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let request = url.as_str().into_client_request()?;
+                arm(&stream, deadline)?;
+                let socket = tungstenite::client::client_with_config(
+                    request,
+                    MaybeTlsStream::Plain(stream),
+                    Some(ws),
+                )
+                .map_err(|e| handshake_error(e, deadline))?
+                .0;
+                self.finish(socket, deadline).map(Some)
+            }
+            (Transport::Listen(_), None) => Err(FrpError::Handshake("listener not bound".into())),
+        }
+    }
+
+    fn finish(&self, socket: Socket, deadline: Option<Instant>) -> Result<FrpConnection, FrpError> {
+        let conn = match self.config.role {
+            Role::Controller => self.handshake_as_controller(socket, deadline),
+            Role::Device => Self::handshake_as_device(socket, deadline),
+        }?;
+        // The handshake's timeouts do not apply to the connection's life.
+        if let MaybeTlsStream::Plain(tcp) = conn.socket.get_ref() {
+            tcp.set_read_timeout(None).map_err(io_error)?;
+            tcp.set_write_timeout(None).map_err(io_error)?;
+        }
+        Ok(conn)
     }
 
     /// Send `start` proposing [`SPEC_VERSION`](crate::SPEC_VERSION), await
     /// `init` confirming it.
-    fn handshake_as_controller(&self, mut socket: Socket) -> Result<FrpConnection, FrpError> {
+    fn handshake_as_controller(
+        &self,
+        mut socket: Socket,
+        deadline: Option<Instant>,
+    ) -> Result<FrpConnection, FrpError> {
         let start = FrpProtocolMessage::Start {
             version: vec![crate::SPEC_VERSION.to_owned()],
             name: Some(self.config.name.clone()),
@@ -238,7 +363,7 @@ impl FrpEndpoint {
         socket.send(Message::text(serde_json::to_string(&start)?))?;
 
         loop {
-            match socket.read()? {
+            match read_by(&mut socket, deadline)? {
                 Message::Text(text) => match FrpMessage::parse(&text) {
                     Ok(FrpMessage::Protocol(FrpProtocolMessage::Init { version })) => {
                         if version != crate::SPEC_VERSION {
@@ -275,9 +400,12 @@ impl FrpEndpoint {
 
     /// Await `start`, reply `init` with [`SPEC_VERSION`](crate::SPEC_VERSION)
     /// when the controller proposed it.
-    fn handshake_as_device(mut socket: Socket) -> Result<FrpConnection, FrpError> {
+    fn handshake_as_device(
+        mut socket: Socket,
+        deadline: Option<Instant>,
+    ) -> Result<FrpConnection, FrpError> {
         let (peer_versions, peer_name, raw_frames) = loop {
-            match socket.read()? {
+            match read_by(&mut socket, deadline)? {
                 Message::Text(text) => {
                     if let Ok(FrpMessage::Protocol(FrpProtocolMessage::Start {
                         version,
@@ -317,6 +445,120 @@ impl FrpEndpoint {
             peer_name,
             raw_frames,
         })
+    }
+}
+
+fn io_error(e: std::io::Error) -> FrpError {
+    FrpError::WebSocket(Box::new(tungstenite::Error::Io(e)))
+}
+
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Accepts a connection, polling the listener until `stop` is set.
+fn accept_until(listener: &TcpListener, stop: &AtomicBool) -> Result<Option<TcpStream>, FrpError> {
+    listener.set_nonblocking(true).map_err(io_error)?;
+    let result = loop {
+        if stop.load(Ordering::SeqCst) {
+            break Ok(None);
+        }
+        match listener.accept() {
+            Ok((stream, _)) => break Ok(Some(stream)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL);
+            }
+            Err(e) => break Err(io_error(e)),
+        }
+    };
+    listener.set_nonblocking(false).map_err(io_error)?;
+    result
+}
+
+/// Opens the TCP connection to a `ws://` URL for a bounded or cancelable
+/// dial. `Ok(None)` when `stop` is set first.
+fn dial(
+    url: &str,
+    timeout: Option<Duration>,
+    stop: Option<&AtomicBool>,
+) -> Result<Option<TcpStream>, FrpError> {
+    let request = url.into_client_request()?;
+    let uri = request.uri();
+    if uri.scheme_str() != Some("ws") {
+        return Err(FrpError::Handshake(format!(
+            "cannot connect to {url:?}: only ws:// is supported"
+        )));
+    }
+    let port = uri.port_u16().unwrap_or(80);
+    let host = uri
+        .host()
+        .ok_or_else(|| FrpError::Handshake(format!("no host in {url:?}")))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let mut last = None;
+    for addr in (host, port).to_socket_addrs().map_err(io_error)? {
+        let attempt = crate::net::connect_cancelable(addr, timeout.unwrap_or(DIAL_TIMEOUT), || {
+            stop.is_none_or(|s| !s.load(Ordering::SeqCst))
+        });
+        match attempt {
+            Ok(Some(stream)) => return Ok(Some(stream)),
+            Ok(None) => return Ok(None),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.map_or_else(
+        || FrpError::Handshake(format!("{host} resolved to no address")),
+        io_error,
+    ))
+}
+
+/// Limits the next socket wait to what is left of the handshake deadline.
+fn arm(stream: &TcpStream, deadline: Option<Instant>) -> Result<(), FrpError> {
+    let Some(deadline) = deadline else {
+        return Ok(());
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(FrpError::Handshake("handshake timed out".into()));
+    }
+    stream.set_read_timeout(Some(left)).map_err(io_error)?;
+    stream.set_write_timeout(Some(left)).map_err(io_error)
+}
+
+/// One handshake read, limited by the deadline.
+fn read_by(socket: &mut Socket, deadline: Option<Instant>) -> Result<Message, FrpError> {
+    if deadline.is_some()
+        && let MaybeTlsStream::Plain(tcp) = socket.get_ref()
+    {
+        arm(tcp, deadline)?;
+    }
+    match socket.read() {
+        Err(tungstenite::Error::Io(e)) if deadline.is_some() && is_timeout(&e) => {
+            Err(FrpError::Handshake("handshake timed out".into()))
+        }
+        other => Ok(other?),
+    }
+}
+
+fn handshake_error<R: tungstenite::handshake::HandshakeRole>(
+    e: tungstenite::HandshakeError<R>,
+    deadline: Option<Instant>,
+) -> FrpError {
+    match e {
+        tungstenite::HandshakeError::Failure(tungstenite::Error::Io(e))
+            if deadline.is_some() && is_timeout(&e) =>
+        {
+            FrpError::Handshake("handshake timed out".into())
+        }
+        tungstenite::HandshakeError::Failure(e) => FrpError::WebSocket(Box::new(e)),
+        tungstenite::HandshakeError::Interrupted(_) if deadline.is_some() => {
+            FrpError::Handshake("handshake timed out".into())
+        }
+        tungstenite::HandshakeError::Interrupted(_) => {
+            FrpError::Handshake("WebSocket handshake interrupted".into())
+        }
     }
 }
 
@@ -434,53 +676,102 @@ impl FrpConnection {
 
     /// Send an [`FrpMessage`] to the peer.
     ///
+    /// On a non-blocking connection a full socket is not an error: the
+    /// message is queued, and it leaves with a later [`flush`](Self::flush)
+    /// or send. Call [`flush`](Self::flush) regularly (e.g. on each poll of
+    /// the connection): a queued message is otherwise delayed until the next
+    /// send.
+    ///
     /// # Errors
     ///
     /// Returns an error if the message cannot be serialized or sent.
     pub fn send(&mut self, msg: &FrpMessage) -> Result<(), FrpError> {
-        self.socket.send(Message::text(msg.to_json()?))?;
-        Ok(())
+        queued(self.socket.send(Message::text(msg.to_json()?)))
     }
 
     /// Send an [`FrpEnvelope`] to the peer.
+    ///
+    /// On a non-blocking connection a full socket is not an error: the
+    /// message is queued, and it leaves with a later [`flush`](Self::flush)
+    /// or send. Call [`flush`](Self::flush) regularly (e.g. on each poll of
+    /// the connection): a queued message is otherwise delayed until the next
+    /// send.
     ///
     /// # Errors
     ///
     /// Returns an error if the envelope cannot be serialized or sent.
     pub fn send_envelope(&mut self, env: &FrpEnvelope) -> Result<(), FrpError> {
-        self.socket
-            .send(Message::text(serde_json::to_string(env)?))?;
-        Ok(())
+        queued(self.socket.send(Message::text(serde_json::to_string(env)?)))
     }
 
     /// Send a bare [`FrpProtocolMessage`] to the peer.
+    ///
+    /// On a non-blocking connection a full socket is not an error: the
+    /// message is queued, and it leaves with a later [`flush`](Self::flush)
+    /// or send. Call [`flush`](Self::flush) regularly (e.g. on each poll of
+    /// the connection): a queued message is otherwise delayed until the next
+    /// send.
     ///
     /// # Errors
     ///
     /// Returns an error if the message cannot be serialized or sent.
     pub fn send_protocol(&mut self, msg: &FrpProtocolMessage) -> Result<(), FrpError> {
-        self.socket
-            .send(Message::text(serde_json::to_string(msg)?))?;
-        Ok(())
+        queued(self.socket.send(Message::text(serde_json::to_string(msg)?)))
+    }
+
+    /// Push queued messages out to the peer. Returns `Ok` when the socket
+    /// cannot take more yet; call it again later. A non-blocking connection
+    /// calls it regularly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection failed or closed.
+    pub fn flush(&mut self) -> Result<(), FrpError> {
+        match self.socket.flush() {
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                Err(FrpError::Closed)
+            }
+            other => queued(other),
+        }
     }
 
     /// Cleanly close the WebSocket connection.
+    ///
+    /// On a non-blocking connection the close frame is queued and the call
+    /// returns without waiting for the peer's answer; [`flush`](Self::flush)
+    /// first to get queued messages out.
     ///
     /// # Errors
     ///
     /// Returns an error if the close handshake fails.
     pub fn close(mut self) -> Result<(), FrpError> {
-        self.socket.close(None)?;
+        queued(self.socket.close(None))?;
         loop {
             match self.socket.read() {
                 Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => {
                     return Ok(());
                 }
                 Err(tungstenite::Error::AlreadyClosed) => return Ok(()),
+                Err(tungstenite::Error::Io(ref e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    return Ok(());
+                }
                 Err(e) => return Err(e.into()),
                 _ => {}
             }
         }
+    }
+}
+
+/// Turns a send that found the socket full into success: tungstenite keeps
+/// the message in its write buffer and [`FrpConnection::flush`] pushes it out
+/// later. [`tungstenite::Error::WriteBufferFull`] still fails, once the
+/// buffer passes [`EndpointConfig::write_buffer_limit`].
+fn queued(result: Result<(), tungstenite::Error>) -> Result<(), FrpError> {
+    match result {
+        Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        other => Ok(other?),
     }
 }
 

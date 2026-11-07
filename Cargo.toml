@@ -11,11 +11,22 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tungstenite = { version = "0.26", optional = true }
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse", "display"], optional = true }
+ctrlc = { version = "3", features = ["termination"], optional = true }
 
 [features]
 controller = []
 device = []
 transport = ["dep:tungstenite"]
+config = []
+driver = ["config"]
+server = ["driver", "device", "transport"]
+main = ["server", "dep:toml", "dep:ctrlc"]
+mock = ["driver"]
+
+[[example]]
+name = "frp-mock"
+required-features = ["main", "mock"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
