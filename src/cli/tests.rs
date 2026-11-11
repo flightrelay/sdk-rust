@@ -805,6 +805,80 @@ fn a_crlf_config_file_stays_crlf() {
 }
 
 #[test]
+fn config_actor_id_generates_saves_and_then_reads_the_id() {
+    let text = "count = 3\n[frp]\nraw_frames = true\nmine = \"kept\"\n";
+    let file = temp_file("helper.toml", text);
+    let first = config_actor_id(&file).unwrap();
+    assert_eq!(first.origin, ActorIdOrigin::Saved);
+    assert_eq!(first.id.len(), 16);
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(actor_id_in(&saved).as_deref(), Some(first.id.as_str()));
+    assert!(
+        saved.starts_with("count = 3\n[frp]\nactor_id = \""),
+        "{saved}"
+    );
+    assert!(
+        saved.ends_with("raw_frames = true\nmine = \"kept\"\n"),
+        "{saved}"
+    );
+
+    let again = config_actor_id(&file).unwrap();
+    assert_eq!(again.origin, ActorIdOrigin::Read);
+    assert_eq!(again.id, first.id);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), saved, "untouched");
+}
+
+#[test]
+fn config_actor_id_reads_an_id_the_runner_saved() {
+    let file = temp_file("shared.toml", "count = 3\n");
+    let run = go_stopped(&["--config", file.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    let saved = actor_id_in(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let kept = config_actor_id(&file).unwrap();
+    assert_eq!((kept.id, kept.origin), (saved, ActorIdOrigin::Read));
+}
+
+#[test]
+fn config_actor_id_leaves_a_table_of_another_shape_untouched() {
+    let text = "count = 3\nfrp = { raw_frames = true }\n";
+    let file = temp_file("helper-inline.toml", text);
+    let kept = config_actor_id(&file).unwrap();
+    assert_eq!(kept.origin, ActorIdOrigin::NotSaved);
+    assert_eq!(kept.id.len(), 16);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+}
+
+#[test]
+fn config_actor_id_refuses_a_bad_file() {
+    let missing = std::env::temp_dir().join("flightrelay-cli-no-such-dir/none.toml");
+    assert!(
+        config_actor_id(&missing)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot read")
+    );
+    for (name, text, needle) in [
+        ("helper-bad.toml", "count = = 3\n", "helper-bad.toml"),
+        ("helper-frp-int.toml", "frp = 3\n", "frp"),
+        (
+            "helper-empty-id.toml",
+            "[frp]\nactor_id = \"\"\n",
+            "frp.actor_id",
+        ),
+        (
+            "helper-int-id.toml",
+            "[frp]\nactor_id = 7\n",
+            "frp.actor_id",
+        ),
+    ] {
+        let file = temp_file(name, text);
+        let err = config_actor_id(&file).unwrap_err().to_string();
+        assert!(err.contains(needle), "{name}: {err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text, "{name}");
+    }
+}
+
+#[test]
 fn without_a_config_file_the_actor_id_lasts_for_the_run() {
     let run = go_stopped(&["--set", "frp.raw_frames=true"]);
     assert_eq!(run.code, 0, "{}", run.err);

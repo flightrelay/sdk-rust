@@ -1,4 +1,5 @@
-//! [`run`]: a complete `main` for a [`DeviceDriver`].
+//! [`run`]: a complete `main` for a [`DeviceDriver`], and
+//! [`config_actor_id`] for a binary that builds its own [`FrpServer`].
 //!
 //! Requires the `main` feature. A binary is one line:
 //!
@@ -306,6 +307,106 @@ fn resolve<C: DriverConfig>(base: &C, args: &Args) -> Result<(C, Runner), Config
     Ok((C::from_map(map)?, runner))
 }
 
+/// The launch monitor actor id kept in a config file, from
+/// [`config_actor_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConfigActorId {
+    /// The actor id.
+    pub id: String,
+    /// Whether it was read, or generated and saved or not.
+    pub origin: ActorIdOrigin,
+}
+
+/// Where a [`ConfigActorId`] came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ActorIdOrigin {
+    /// The file's `[frp]` table had it.
+    Read,
+    /// The file had none: the id is new and is now in the file's `[frp]`
+    /// table.
+    Saved,
+    /// The file had none: the id is new, and the file was left untouched
+    /// because its `[frp]` table is in a shape the edit does not handle
+    /// (dotted `frp.` keys, an inline `frp = { .. }`, a `[ frp ]` header).
+    /// The id lasts until the program adds `actor_id = "<id>"` to the table
+    /// itself.
+    NotSaved,
+    /// The file had none: the id is new, and writing it failed for this
+    /// reason; the file is as it was.
+    SaveFailed(String),
+}
+
+/// The launch monitor actor id in the `[frp]` table (`frp.actor_id`) of the
+/// TOML config file at `path`, for a binary that builds its own
+/// [`FrpServer`] instead of calling [`run`].
+///
+/// When the file has none, a new id ([`new_actor_id`](crate::new_actor_id))
+/// is written into its `[frp]` table by the same rules [`run`] follows: the
+/// file is changed only when the edit reads back as the same config plus
+/// `actor_id`, and it is replaced through a temporary file in the same
+/// directory, so a failed write leaves the old file whole. The other keys of
+/// the `[frp]` table are not checked.
+///
+/// ```no_run
+/// use flightrelay::{ActorIdOrigin, ServerConfig, Transport, config_actor_id};
+///
+/// let kept = config_actor_id("launch-monitor.toml")?;
+/// if !matches!(kept.origin, ActorIdOrigin::Read | ActorIdOrigin::Saved) {
+///     eprintln!("new actor id {} for this run only", kept.id);
+/// }
+/// let config = ServerConfig::new(Transport::listen("0.0.0.0:5880"), kept.id);
+/// # Ok::<(), flightrelay::config::ConfigError>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns a [`ConfigError`] when the file cannot be read or is not TOML,
+/// when `frp` is not a table, or when `frp.actor_id` is not a non-empty
+/// string.
+pub fn config_actor_id(path: impl AsRef<std::path::Path>) -> Result<ConfigActorId, ConfigError> {
+    let path = path.as_ref();
+    let shown = path.display();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| ConfigError::new(format!("cannot read {shown}: {e}")))?;
+    let table: toml::Table =
+        toml::from_str(&text).map_err(|e| ConfigError::new(format!("{shown}: {}", e.message())))?;
+    let id = match table.get(RUNNER_TABLE) {
+        None => None,
+        Some(toml::Value::Table(frp)) => match frp.get("actor_id") {
+            None => None,
+            Some(toml::Value::String(id)) if !id.is_empty() => Some(id.clone()),
+            Some(_) => {
+                return Err(ConfigError::field(
+                    "frp.actor_id",
+                    "must be a non-empty string",
+                ));
+            }
+        },
+        Some(_) => return Err(ConfigError::field(RUNNER_TABLE, "must be a table")),
+    };
+    Ok(match id {
+        Some(id) => ConfigActorId {
+            id,
+            origin: ActorIdOrigin::Read,
+        },
+        None => generate_and_save(path),
+    })
+}
+
+/// A new actor id, written into the `[frp]` table of the file at `path`
+/// when that is safe ([`save_actor_id`]).
+fn generate_and_save(path: &std::path::Path) -> ConfigActorId {
+    let id = crate::new_actor_id();
+    let origin = match save_actor_id(path, &id) {
+        Ok(true) => ActorIdOrigin::Saved,
+        Ok(false) => ActorIdOrigin::NotSaved,
+        Err(e) => ActorIdOrigin::SaveFailed(e.to_string()),
+    };
+    ConfigActorId { id, origin }
+}
+
 /// Writes `actor_id` into the `[frp]` table of the TOML file at `path`: on
 /// the line after the table's `[frp]` header, or in a new table at the end.
 /// The rest of the file is kept as it is, line endings included.
@@ -316,12 +417,12 @@ fn resolve<C: DriverConfig>(base: &C, args: &Args) -> Result<(C, Runner), Config
 /// edit does not handle), the file is left untouched and this returns
 /// `Ok(false)`. The file is replaced through a temporary file in the same
 /// directory, so a failed write leaves the old file whole.
-fn save_actor_id(path: &str, actor_id: &str) -> std::io::Result<bool> {
+fn save_actor_id(path: &std::path::Path, actor_id: &str) -> std::io::Result<bool> {
     let text = std::fs::read_to_string(path)?;
     let Some(out) = with_actor_id(&text, actor_id) else {
         return Ok(false);
     };
-    replace_file(std::path::Path::new(path), &out)?;
+    replace_file(path, &out)?;
     Ok(true)
 }
 
@@ -664,20 +765,27 @@ fn execute<D: DeviceDriver>(
 
 /// A new actor id, saved to the config file at `path` when there is one.
 fn new_actor_id(program: &str, path: Option<&str>, stderr: &Stream) -> String {
-    let id = crate::new_actor_id();
-    let line = match path {
-        Some(path) => match save_actor_id(path, &id) {
-            Ok(true) => format!("{program}: new actor id {id}, saved to {path}"),
-            Ok(false) => format!(
-                "{program}: new actor id {id} for this run; {path} was left as it is: \
-                 add actor_id = \"{id}\" to its [frp] table to keep it"
-            ),
-            Err(e) => format!(
-                "{program}: new actor id {id} for this run; cannot save it to {path} ({e}): \
-                 add actor_id = \"{id}\" to its [frp] table to keep it"
-            ),
-        },
-        None => format!("{program}: new actor id {id} for this run; use --config to keep one"),
+    let Some(path) = path else {
+        let id = crate::new_actor_id();
+        say(
+            stderr,
+            &format!("{program}: new actor id {id} for this run; use --config to keep one"),
+        );
+        return id;
+    };
+    let ConfigActorId { id, origin } = generate_and_save(std::path::Path::new(path));
+    let line = match origin {
+        ActorIdOrigin::Read | ActorIdOrigin::Saved => {
+            format!("{program}: new actor id {id}, saved to {path}")
+        }
+        ActorIdOrigin::NotSaved => format!(
+            "{program}: new actor id {id} for this run; {path} was left as it is: \
+             add actor_id = \"{id}\" to its [frp] table to keep it"
+        ),
+        ActorIdOrigin::SaveFailed(e) => format!(
+            "{program}: new actor id {id} for this run; cannot save it to {path} ({e}): \
+             add actor_id = \"{id}\" to its [frp] table to keep it"
+        ),
     };
     say(stderr, &line);
     id

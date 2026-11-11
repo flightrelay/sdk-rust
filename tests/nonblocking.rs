@@ -1,5 +1,6 @@
 //! The endpoint and connection behavior the server relies on: stoppable
-//! establish, upgrade timeouts, and queued sends on a non-blocking socket.
+//! establish, upgrade timeouts, timed receives, and queued sends on a
+//! non-blocking socket.
 
 #![cfg(feature = "transport")]
 
@@ -216,5 +217,105 @@ fn closing_a_non_blocking_connection_does_not_wait_for_the_peer() {
     conn.set_nonblocking(true).unwrap();
     let at = Instant::now();
     conn.close().expect("close");
+    assert!(at.elapsed() < Duration::from_secs(1));
+}
+
+/// Connects a raw client to a fresh listener: the server's connection and
+/// the client.
+fn pair() -> (flightrelay::FrpConnection, Ws) {
+    let (mut ep, addr) = listener(|c| c);
+    let peer = thread::spawn(move || dial(&addr));
+    let conn = ep.establish().expect("upgrade");
+    (conn, peer.join().unwrap())
+}
+
+#[test]
+fn recv_timeout_returns_none_in_time_and_then_the_next_message() {
+    let (mut conn, mut ws) = pair();
+    let at = Instant::now();
+    assert!(
+        conn.recv_timeout(Duration::from_millis(100))
+            .unwrap()
+            .is_none()
+    );
+    let took = at.elapsed();
+    assert!(
+        took >= Duration::from_millis(90) && took < Duration::from_secs(2),
+        "{took:?}"
+    );
+    assert!(conn.recv_timeout(Duration::ZERO).unwrap().is_none());
+
+    ws.send(Message::text(SYNC)).expect("send");
+    let msg = conn
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .expect("the message");
+    assert_eq!(msg.kind(), "bus.sync");
+
+    // A plain `recv` still blocks without a limit afterwards.
+    let sender = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        ws.send(Message::text(SYNC)).expect("send");
+        ws
+    });
+    assert_eq!(conn.recv().expect("recv").kind(), "bus.sync");
+    drop(sender.join().unwrap());
+}
+
+#[test]
+fn recv_timeout_keeps_a_message_that_arrives_in_parts() {
+    let (mut conn, mut ws) = pair();
+    // A masked text frame, written by hand in two parts. A zero mask key
+    // leaves the payload as it is.
+    let payload = SYNC.as_bytes();
+    let mut frame = vec![
+        0x81,
+        0x80 | u8::try_from(payload.len()).unwrap(),
+        0,
+        0,
+        0,
+        0,
+    ];
+    frame.extend_from_slice(payload);
+    let MaybeTlsStream::Plain(tcp) = ws.get_mut() else {
+        panic!("plain");
+    };
+    let (first, rest) = frame.split_at(10);
+    std::io::Write::write_all(tcp, first).unwrap();
+    assert!(
+        conn.recv_timeout(Duration::from_millis(100))
+            .unwrap()
+            .is_none()
+    );
+    std::io::Write::write_all(tcp, rest).unwrap();
+    let msg = conn
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .expect("the whole message");
+    assert_eq!(msg.kind(), "bus.sync");
+}
+
+#[test]
+fn recv_timeout_reports_a_bad_message_and_a_close() {
+    let (mut conn, mut ws) = pair();
+    ws.send(Message::text("not json")).expect("send");
+    assert!(matches!(
+        conn.recv_timeout(Duration::from_secs(5)),
+        Err(FrpError::Json(_))
+    ));
+    ws.close(None).expect("close");
+    let _ = ws.flush();
+    assert!(matches!(
+        conn.recv_timeout(Duration::from_secs(5)),
+        Err(FrpError::Closed)
+    ));
+}
+
+#[test]
+fn recv_timeout_returns_at_once_on_a_non_blocking_connection() {
+    let (mut conn, _ws) = pair();
+    conn.set_nonblocking(true).unwrap();
+    let at = Instant::now();
+    assert!(conn.recv_timeout(Duration::from_secs(5)).unwrap().is_none());
     assert!(at.elapsed() < Duration::from_secs(1));
 }

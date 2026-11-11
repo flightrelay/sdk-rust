@@ -4,7 +4,7 @@
 //! [`Source`] is [`Virtual`](Source::Virtual)) that arms, reports a ball
 //! ready and fires a shot at a fixed interval, with realistic values for the
 //! mode in play. It needs no hardware, so it serves for tests of a
-//! host, for [`FrpServer`](crate::FrpServer) in development, and for a demo.
+//! host, for `FrpServer` (feature `server`) in development, and for a demo.
 //!
 //! A shot carries the measured launch (`shot.launch`), the model-produced
 //! flight (`shot.flight`, [`Basis::Modeled`]) and the club (`shot.club`).
@@ -431,7 +431,7 @@ fn generate_shot(n: u32, mode: Mode) -> Shot {
 mod tests {
     use super::*;
     use crate::FrpBody;
-    use crate::driver::{ConnectHost, DeviceEvent, HostFlags, Stop};
+    use crate::driver::{ConnectHost, DeviceEvent, HostFlags, StatusChange, Stop};
 
     struct Host(TurnHints);
 
@@ -475,7 +475,10 @@ mod tests {
         while !done(&seen) {
             assert!(Instant::now() < give_up, "timed out; saw {seen:?}");
             let mut sink = |e: DeviceEvent| {
-                if matches!(e, DeviceEvent::Frp(_) | DeviceEvent::Status(_)) {
+                if matches!(
+                    e,
+                    DeviceEvent::Frp(_) | DeviceEvent::Status(_) | DeviceEvent::StatusChange(_)
+                ) {
                     seen.push(e);
                 }
             };
@@ -495,7 +498,7 @@ mod tests {
                 DeviceEvent::Frp(FrpBody::ShotFlight(_)) => "flight",
                 DeviceEvent::Frp(FrpBody::ShotClub(_)) => "club",
                 DeviceEvent::Frp(FrpBody::ShotFinished(_)) => "finished",
-                DeviceEvent::Status(_) => "status",
+                DeviceEvent::Status(_) | DeviceEvent::StatusChange(_) => "status",
                 _ => "other",
             })
             .collect()
@@ -506,7 +509,7 @@ mod tests {
         events
             .iter()
             .filter_map(|e| match e {
-                DeviceEvent::Status(s) => s.blockers.as_ref().map(|b| b.join(",")),
+                DeviceEvent::StatusChange(StatusChange::Blockers(b)) => Some(b.join(",")),
                 _ => None,
             })
             .collect()
@@ -553,7 +556,9 @@ mod tests {
         let tracking: Vec<&str> = seen
             .iter()
             .filter_map(|e| match e {
-                DeviceEvent::Status(s) => s.telemetry.get("tracking_mode").map(String::as_str),
+                DeviceEvent::StatusChange(StatusChange::Telemetry(t)) => {
+                    t.get("tracking_mode").and_then(Option::as_deref)
+                }
                 _ => None,
             })
             .collect();
@@ -677,7 +682,10 @@ mod tests {
             let mut seen = Vec::new();
             for _ in 0..20 {
                 let mut sink = |e: DeviceEvent| {
-                    if matches!(e, DeviceEvent::Frp(_) | DeviceEvent::Status(_)) {
+                    if matches!(
+                        e,
+                        DeviceEvent::Frp(_) | DeviceEvent::Status(_) | DeviceEvent::StatusChange(_)
+                    ) {
                         seen.push(e);
                     }
                 };

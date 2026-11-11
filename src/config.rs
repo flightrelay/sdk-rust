@@ -79,7 +79,7 @@ pub trait DriverConfig:
 
     /// Whether moving from `old` to `new` needs a new session. The default is
     /// any change. A driver that applies some fields live overrides this and
-    /// [`DeviceDriver::apply_config`](crate::driver::DeviceDriver::apply_config).
+    /// `DeviceDriver::apply_config` (feature `driver`).
     #[must_use]
     fn restart_needed(old: &Self, new: &Self) -> bool {
         old != new
@@ -189,8 +189,8 @@ pub trait DriverConfig:
 /// config's default.
 ///
 /// Returns `false` while a `--help` text is being generated (the
-/// [`DriverConfig::help_toml`] default method), so that text can list every
-/// key with its default.
+/// `DriverConfig::help_toml` default method, feature `main`), so that text
+/// can list every key with its default.
 #[must_use]
 pub fn is_default<T: Default + PartialEq>(v: &T) -> bool {
     !LIST_DEFAULTS.with(Cell::get) && *v == T::default()

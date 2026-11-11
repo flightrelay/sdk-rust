@@ -5,8 +5,8 @@
 //! with the actor id the host gives it ([`ServerConfig::actor_id`]). It
 //! listens for peers (listen mode, a hub of its own) or dials one (bridge
 //! mode), and reconnects the driver with the driver's advised delay, so a
-//! host's `main` is a driver, a config and one call; [`run`](crate::run) is
-//! that `main`.
+//! host's `main` is a driver, a config and one call; `run` (feature `main`)
+//! is that `main`.
 //!
 //! # Threads
 //!
@@ -29,9 +29,13 @@
 //!   a `device` block: manufacturer, model and firmware from the session's
 //!   identity, `source` from
 //!   [`DriverInfo::source`](crate::driver::DriverInfo::source), and the
-//!   battery and attitude the driver reports. Its `blockers` are the
-//!   driver's; they are `not_armed` before the first session and whenever a
-//!   session ends, when the battery, attitude and telemetry are cleared too. The device's own id and card label never go on the bus.
+//!   battery and attitude the driver reports. Its `blockers`, battery,
+//!   attitude and telemetry are exactly the driver's current
+//!   [`DeviceStatus`]: a value the driver takes off (`battery(None)`, a
+//!   whole status without it) is off the next `bus.actor`. Before the first
+//!   session and whenever a session ends the status is
+//!   [`DeviceStatus::not_armed`]. The device's own id and card label never
+//!   go on the bus.
 //! - What the driver emits goes out under the actor id: `shot.*` messages
 //!   and `bus.alert`. A `shot.raw` is numbered per actor, across sessions,
 //!   and goes out only while [`ServerConfig::raw_frames`] is on; drivers
@@ -98,10 +102,10 @@ use std::time::{Duration, Instant};
 
 use crate::driver::{
     Backoff, ConnectCtx, ConnectHost, DeviceDriver, DeviceEvent, DeviceIdentity, DeviceSession,
-    DeviceStatus, DriverInfo, Events, HostFlags, Level, SessionEnd, Stop, TurnHints,
+    DeviceStatus, DriverInfo, Events, HostFlags, Level, SessionEnd, StatusChange, Stop, TurnHints,
 };
 use crate::endpoint::DEFAULT_WRITE_BUFFER_LIMIT;
-use crate::types::{blockers, roles};
+use crate::types::roles;
 use crate::{
     BusActor, DEFAULT_HEARTBEAT, DEFAULT_SHOT_TIMEOUT, DeviceInfo, EndpointConfig, FrpBody,
     FrpConnection, FrpEndpoint, FrpError, FrpMessage, Hub, HubEvent, Removal, ShotFinished,
@@ -260,6 +264,7 @@ enum ToNet {
     /// Boxed: a body is large, and the queue holds many.
     Message(Box<FrpBody>),
     Status(DeviceStatus),
+    StatusChange(StatusChange),
     Identified(DeviceIdentity),
     SessionEnded,
     Shutdown,
@@ -389,6 +394,7 @@ impl<D: DeviceDriver> FrpServer<D> {
             match event {
                 DeviceEvent::Frp(body) => push(&to_net, ToNet::Message(Box::new(body))),
                 DeviceEvent::Status(status) => push(&to_net, ToNet::Status(status)),
+                DeviceEvent::StatusChange(change) => push(&to_net, ToNet::StatusChange(change)),
                 _ => {}
             }
         };
@@ -690,6 +696,8 @@ struct Net {
     max_peers: usize,
     actor_id: String,
     actor: BusActor,
+    /// The driver's current status, which the actor carries exactly.
+    status: DeviceStatus,
     /// The name from the config, which wins over any other.
     name: Option<String>,
     /// The driver's name, until a device is identified.
@@ -715,13 +723,15 @@ impl Net {
             source: Some(info.source),
             ..DeviceInfo::default()
         });
-        actor.blockers = vec![blockers::NOT_ARMED.to_owned()];
+        let status = DeviceStatus::not_armed();
+        actor.blockers.clone_from(&status.blockers);
         Self {
             links,
             hub: Hub::new(),
             max_peers: config.max_peers,
             actor_id: config.actor_id.clone(),
             actor,
+            status,
             name: config.name.clone(),
             fallback_name: info.name.to_owned(),
             heartbeat,
@@ -830,6 +840,11 @@ impl Net {
                     self.publish_actor();
                 }
             }
+            ToNet::StatusChange(change) => {
+                if self.apply_change(change) {
+                    self.publish_actor();
+                }
+            }
             ToNet::Identified(identity) => {
                 if self.apply_identity(&identity) {
                     self.publish_actor();
@@ -911,28 +926,30 @@ impl Net {
         self.publish(&msg);
     }
 
-    /// Merges a driver's status into the actor. Returns whether it changed.
+    /// Takes a driver's whole status. Returns whether the actor changed.
     fn apply_status(&mut self, status: DeviceStatus) -> bool {
+        self.status = status;
+        self.sync_status()
+    }
+
+    /// Applies a change to the driver's status. Returns whether the actor
+    /// changed.
+    fn apply_change(&mut self, change: StatusChange) -> bool {
+        self.status.apply(change);
+        self.sync_status()
+    }
+
+    /// Puts the driver's status on the actor, exactly: blockers, battery,
+    /// attitude and telemetry. Returns whether the actor changed.
+    fn sync_status(&mut self) -> bool {
         let before = self.actor.clone();
-        if let Some(list) = status.blockers {
-            self.actor.blockers = list;
-        }
+        let status = &self.status;
+        self.actor.blockers.clone_from(&status.blockers);
         let device = self.actor.device.get_or_insert_with(DeviceInfo::default);
-        if status.battery_pct.is_some() {
-            device.battery_pct = status.battery_pct;
-        }
-        if status.tilt.is_some() {
-            device.tilt = status.tilt;
-        }
-        if status.roll.is_some() {
-            device.roll = status.roll;
-        }
-        if !status.telemetry.is_empty() {
-            self.actor
-                .telemetry
-                .get_or_insert_with(Default::default)
-                .extend(status.telemetry);
-        }
+        device.battery_pct = status.battery_pct.map(|p| p.min(100));
+        device.tilt = status.tilt;
+        device.roll = status.roll;
+        self.actor.telemetry = (!status.telemetry.is_empty()).then(|| status.telemetry.clone());
         self.actor != before
     }
 
@@ -969,18 +986,10 @@ impl Net {
         }
     }
 
-    /// Sets the actor's blockers to `not_armed` and clears the battery,
-    /// tilt, roll and telemetry. Returns whether it changed.
+    /// Goes back to [`DeviceStatus::not_armed`]: blockers `not_armed`, no
+    /// battery, attitude or telemetry. Returns whether the actor changed.
     fn clear_session_status(&mut self) -> bool {
-        let before = self.actor.clone();
-        self.actor.blockers = vec![blockers::NOT_ARMED.to_owned()];
-        if let Some(device) = &mut self.actor.device {
-            device.battery_pct = None;
-            device.tilt = None;
-            device.roll = None;
-        }
-        self.actor.telemetry = None;
-        self.actor != before
+        self.apply_status(DeviceStatus::not_armed())
     }
 
     fn expire_shots(&mut self) {
@@ -1086,25 +1095,75 @@ mod tests {
     }
 
     #[test]
-    fn status_merges_and_reports_changes() {
+    fn changes_apply_to_the_status_and_report_whether_the_actor_changed() {
         let mut net = net(None);
-        assert!(net.apply_status(DeviceStatus {
-            blockers: Some(vec![]),
-            battery_pct: Some(80),
-            ..DeviceStatus::default()
-        }));
-        assert!(!net.apply_status(DeviceStatus {
-            battery_pct: Some(80),
-            ..DeviceStatus::default()
-        }));
-        let mut telemetry = DeviceStatus::default();
-        telemetry
-            .telemetry
-            .insert("radar_mode".into(), "armed".into());
-        assert!(net.apply_status(telemetry.clone()));
-        assert!(!net.apply_status(telemetry));
+        assert!(net.apply_change(StatusChange::Blockers(vec![])));
+        assert!(net.apply_change(StatusChange::Battery(Some(80))));
+        assert!(!net.apply_change(StatusChange::Battery(Some(80))));
+        let set =
+            StatusChange::Telemetry([("radar_mode".to_owned(), Some("armed".to_owned()))].into());
+        assert!(net.apply_change(set.clone()));
+        assert!(!net.apply_change(set));
         assert!(net.actor.is_clear());
         assert_eq!(net.actor.device.as_ref().unwrap().battery_pct, Some(80));
+        assert_eq!(net.actor.telemetry.as_ref().unwrap()["radar_mode"], "armed");
+    }
+
+    #[test]
+    fn a_driver_can_take_each_value_off_the_actor() {
+        let mut net = net(None);
+        net.apply_status(
+            DeviceStatus::new()
+                .with_blockers(["no_ball"])
+                .with_battery(80)
+                .with_attitude(0.4, -0.2)
+                .with_telemetry("radar_mode", "armed"),
+        );
+        assert!(net.apply_change(StatusChange::Battery(None)));
+        assert!(net.apply_change(StatusChange::Attitude {
+            tilt: None,
+            roll: None
+        }));
+        assert!(net.apply_change(StatusChange::Telemetry(
+            [("radar_mode".to_owned(), None)].into()
+        )));
+        assert!(net.apply_change(StatusChange::Blockers(vec![])));
+        let device = net.actor.device.as_ref().unwrap();
+        assert_eq!(
+            (device.battery_pct, device.tilt, device.roll),
+            (None, None, None)
+        );
+        assert_eq!(net.actor.telemetry, None, "no keys: no telemetry object");
+        assert!(net.actor.is_clear());
+        let json = net.actor_message().to_json().unwrap();
+        for gone in ["battery_pct", "tilt", "roll", "telemetry", "radar_mode"] {
+            assert!(!json.contains(gone), "{gone} is off the bus: {json}");
+        }
+    }
+
+    #[test]
+    fn a_whole_status_replaces_the_one_held() {
+        let mut net = net(None);
+        net.apply_status(
+            DeviceStatus::new()
+                .with_battery(80)
+                .with_attitude(0.4, -0.2)
+                .with_telemetry("radar_mode", "armed")
+                .with_telemetry("signal", "good"),
+        );
+        assert!(net.apply_status(DeviceStatus::new().with_telemetry("signal", "weak")));
+        let device = net.actor.device.as_ref().unwrap();
+        assert_eq!(
+            (device.battery_pct, device.tilt, device.roll),
+            (None, None, None),
+            "what the new status leaves out is gone"
+        );
+        assert_eq!(
+            net.actor.telemetry,
+            Some([("signal".to_owned(), "weak".to_owned())].into())
+        );
+        assert!(net.actor.is_clear());
+        assert!(!net.apply_status(DeviceStatus::new().with_telemetry("signal", "weak")));
     }
 
     #[test]
@@ -1165,14 +1224,10 @@ mod tests {
             .with_model("Eagle One")
             .with_firmware("2.4.1");
         net.apply_identity(&identity);
-        let mut status = DeviceStatus {
-            blockers: Some(vec![]),
-            battery_pct: Some(80),
-            tilt: Some(0.4),
-            roll: Some(-0.2),
-            ..DeviceStatus::default()
-        };
-        status.telemetry.insert("radar_mode".into(), "armed".into());
+        let status = DeviceStatus::new()
+            .with_battery(80)
+            .with_attitude(0.4, -0.2)
+            .with_telemetry("radar_mode", "armed");
         assert!(net.apply_status(status));
         net.on_session_ended();
         assert_eq!(net.actor.blockers, ["not_armed"]);
@@ -1184,5 +1239,6 @@ mod tests {
         );
         assert_eq!(device.model.as_deref(), Some("Eagle One"), "identity stays");
         assert!(!net.clear_session_status(), "a second end changes nothing");
+        assert_eq!(net.status, DeviceStatus::not_armed());
     }
 }

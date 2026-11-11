@@ -29,22 +29,78 @@
 //!
 //! # Features
 //!
-//! - **`controller`** — [`ShotAggregator`], which composes a shot from its
-//!   `shot.*` messages, and [`BusState`], the current state of the bus with
+//! - **`controller`** — `ShotAggregator`, which composes a shot from its
+//!   `shot.*` messages, and `BusState`, the current state of the bus with
 //!   removals and heartbeat expiry applied
-//! - **`transport`** — [`FrpEndpoint`] / [`FrpConnection`], the WebSocket
-//!   binding, and [`Hub`], which forwards every message to every other
+//! - **`transport`** — `FrpEndpoint` / `FrpConnection`, the WebSocket
+//!   binding, and `Hub`, which forwards every message to every other
 //!   connection
-//! - **`config`** — [`config::DriverConfig`], the serde settings of a device driver
-//! - **`driver`** — the [`driver::DeviceDriver`] contract between a launch
+//! - **`config`** — `config::DriverConfig`, the serde settings of a device
+//!   driver
+//! - **`driver`** — the `driver::DeviceDriver` contract between a launch
 //!   monitor and its host (implies `config`)
-//! - **`server`** — [`FrpServer`], which runs a driver as a launch monitor
+//! - **`server`** — `FrpServer`, which runs a driver as a launch monitor
 //!   actor on the bus (implies `driver` and `transport`)
-//! - **`main`** — [`run`], a complete `main` for a driver: config file,
-//!   `--set` overrides, `--help`, Ctrl-C (implies `server`; adds `toml` and
-//!   `ctrlc`)
-//! - **`mock`** — [`mock::MockDriver`], a simulated launch monitor (implies
+//! - **`main`** — `run`, a complete `main` for a driver: config file,
+//!   `--set` overrides, `--help`, Ctrl-C; and `config_actor_id`, the actor id
+//!   kept in a config file, for a binary that builds its own `FrpServer`
+//!   (implies `server`; adds `toml` and `ctrlc`)
+//! - **`mock`** — `mock::MockDriver`, a simulated launch monitor (implies
 //!   `driver`)
+//!
+//! # A collector
+//!
+//! A collector (a simulator, a shot log, an overlay) is an actor like any
+//! other: it greets with its `bus.actor`, answers `bus.sync` by republishing
+//! it, and republishes it every heartbeat so it is not taken for gone.
+//! `FrpConnection::recv_timeout` (feature `transport`) waits for the next
+//! message no longer than the next heartbeat is due:
+//!
+//! ```no_run
+//! # #[cfg(feature = "transport")]
+//! # fn main() -> Result<(), flightrelay::FrpError> {
+//! use std::time::Instant;
+//! use flightrelay::types::roles;
+//! use flightrelay::{
+//!     BusActor, DEFAULT_HEARTBEAT, EndpointConfig, FrpBody, FrpEndpoint, FrpError, FrpMessage,
+//!     Transport,
+//! };
+//!
+//! // Generate the id once and keep it across restarts.
+//! let me = FrpMessage::new(
+//!     "e4a7136b9f02cd58",
+//!     BusActor::new("Shot Log", DEFAULT_HEARTBEAT.as_secs_f64()).with_role(roles::COLLECTOR),
+//! );
+//! let mut ep = FrpEndpoint::open(EndpointConfig::new(Transport::connect(
+//!     "ws://localhost:5880/frp",
+//! )))?;
+//! let mut conn = ep.establish()?;
+//! conn.greet(&[me.clone()], &[])?; // `bus.actor`, then `bus.sync`
+//! let mut last_beat = Instant::now();
+//! loop {
+//!     let left = DEFAULT_HEARTBEAT.saturating_sub(last_beat.elapsed());
+//!     match conn.recv_timeout(left) {
+//!         Ok(Some(msg)) => match &msg.body {
+//!             FrpBody::BusSync(_) => conn.send(&me)?,
+//!             FrpBody::ShotLaunch(m) => println!("{}: launch {:?}", msg.from, m.launch),
+//!             _ => {}
+//!         },
+//!         Ok(None) => {}
+//!         Err(FrpError::Json(_)) => {} // one bad message; the connection stays
+//!         Err(e) => return Err(e),
+//!     }
+//!     if last_beat.elapsed() >= DEFAULT_HEARTBEAT {
+//!         conn.send(&me)?;
+//!         last_beat = Instant::now();
+//!     }
+//! }
+//! # }
+//! # #[cfg(not(feature = "transport"))]
+//! # fn main() {}
+//! ```
+//!
+//! A collector that owns state (a `golfer.turn`, say) republishes it the
+//! same way: on `bus.sync`, when it changes, and in its greeting.
 //!
 //! # Shots
 //!
@@ -142,7 +198,7 @@ pub use hub::{Hub, HubEvent, PeerId};
 pub use server::{FrpServer, MIN_HEARTBEAT, ServerConfig, ServerError, ServerEvent};
 
 #[cfg(feature = "main")]
-pub use cli::{RunOptions, run, run_args, run_with};
+pub use cli::{ActorIdOrigin, ConfigActorId, RunOptions, config_actor_id, run, run_args, run_with};
 
 /// Recommended default port for standalone FRP connections.
 pub const DEFAULT_PORT: u16 = 5880;

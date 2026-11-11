@@ -9,6 +9,11 @@
 //! Either side may open the socket. [`Transport`] picks whether an endpoint
 //! listens or dials; once connected, both sides are peers on the bus.
 //!
+//! An actor that stays connected republishes its `bus.actor` every heartbeat
+//! and in answer to `bus.sync`; [`FrpConnection::recv_timeout`] lets one
+//! blocking loop do that between messages (see the collector loop in the
+//! [crate docs](crate#a-collector)).
+//!
 //! ```no_run
 //! use flightrelay::{BusActor, EndpointConfig, FrpEndpoint, FrpMessage, Transport};
 //!
@@ -375,6 +380,10 @@ impl fmt::Debug for FrpEndpoint {
     }
 }
 
+/// The shortest wait of [`FrpConnection::recv_timeout`]: a socket read
+/// timeout cannot be zero.
+const MIN_RECV_TIMEOUT: Duration = Duration::from_millis(1);
+
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 /// One WebSocket connection carrying FRP messages, one per text frame.
@@ -449,6 +458,61 @@ impl FrpConnection {
                 Message::Close(_) => return Err(FrpError::Closed),
                 _ => {}
             }
+        }
+    }
+
+    /// Wait up to `timeout` for the next message, and parse it. Returns
+    /// `Ok(None)` when none arrived in time, so a loop can do timed work
+    /// (such as republishing its `bus.actor` every heartbeat) without
+    /// switching to non-blocking polling.
+    ///
+    /// Waits only on a blocking connection; on a non-blocking one it returns
+    /// at once, like [`try_recv`](Self::try_recv). A zero `timeout` waits
+    /// one millisecond. Part of a message that arrives before the timeout is
+    /// kept, and the next call goes on reading it.
+    ///
+    /// # Errors
+    ///
+    /// As for [`recv`](Self::recv): [`FrpError::Json`] is about the one
+    /// message and the connection stays open.
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Option<FrpMessage>, FrpError> {
+        self.recv_text_timeout(timeout)?
+            .map(|text| FrpMessage::parse(&text))
+            .transpose()
+    }
+
+    /// [`recv_timeout`](Self::recv_timeout) for the message's text.
+    fn recv_text_timeout(&mut self, timeout: Duration) -> Result<Option<String>, FrpError> {
+        let deadline = Instant::now() + timeout.max(MIN_RECV_TIMEOUT);
+        let result = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Ok(None);
+            }
+            if let Err(e) = self.set_read_timeout(Some(left)) {
+                break Err(e);
+            }
+            match self.socket.read() {
+                Ok(Message::Text(text)) => break Ok(Some(text.as_str().to_owned())),
+                Ok(Message::Close(_)) => break Err(FrpError::Closed),
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(ref e)) if is_timeout(e) => break Ok(None),
+                Err(e) => break Err(e.into()),
+            }
+        };
+        // Other reads block without a limit; a failure to reset is reported
+        // unless the read already failed.
+        let reset = self.set_read_timeout(None);
+        match result {
+            Ok(found) => reset.map(|()| found),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), FrpError> {
+        match self.socket.get_ref() {
+            MaybeTlsStream::Plain(tcp) => tcp.set_read_timeout(timeout).map_err(io_error),
+            _ => Ok(()),
         }
     }
 

@@ -24,6 +24,13 @@
 //! The host stamps every message with the actor's id and publishes the
 //! actor's `bus.actor`.
 //!
+//! The host holds the driver's current [`DeviceStatus`] and publishes exactly
+//! that: the driver sends it whole ([`Events::status`]) or one part at a time
+//! ([`Events::blockers`], [`Events::battery`], [`Events::attitude`],
+//! [`Events::telemetry`]), and takes a value off the actor the same way
+//! (`battery(None)`, [`Events::clear_telemetry`]). When a session ends the
+//! host goes back to [`DeviceStatus::not_armed`].
+//!
 //! The driver reads `golfer.turn` as [`TurnHints`]: each turn replaces all
 //! the hints (handedness, club, mode), and a field that is `null` or not
 //! recognized is no hint for that field. The host keeps the last complete
@@ -31,9 +38,8 @@
 //! field its device supports and ignores the rest, and decides for itself
 //! what the hardware does when a field is not given.
 //!
-//! A host that runs a driver on the bus is [`FrpServer`](crate::FrpServer)
-//! (feature `server`), and [`run`](crate::run) (feature `main`) is a complete
-//! `main` for it.
+//! A host that runs a driver on the bus is `FrpServer` (feature `server`),
+//! and `run` (feature `main`) is a complete `main` for it.
 //!
 //! # A minimal driver
 //!
@@ -132,7 +138,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 pub use crate::config::{ConfigError, DriverConfig};
-pub use events::{DeviceEvent, DeviceStatus, Events, HostFlags, Level};
+pub use events::{DeviceEvent, DeviceStatus, Events, HostFlags, Level, StatusChange};
 pub use util::{Backoff, Live, STABLE_SESSION, ShotIds, Stop, connect_tcp};
 
 use crate::{Club, GolferTurn, Handedness, Mode, RawFrame, Source};
