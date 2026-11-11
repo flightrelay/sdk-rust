@@ -57,7 +57,7 @@ A collector is an actor like any other: it greets with its `bus.actor`, answers 
 ```rust
 use std::time::Instant;
 use flightrelay::{BusActor, BusState, DEFAULT_HEARTBEAT, EndpointConfig, FrpBody, FrpEndpoint,
-                  FrpError, FrpMessage, ShotAggregator, ShotEvent, Transport};
+                  FrpMessage, ShotAggregator, ShotEvent, Transport};
 use flightrelay::types::roles;
 
 let me = FrpMessage::new(
@@ -75,7 +75,7 @@ loop {
     let left = DEFAULT_HEARTBEAT.saturating_sub(last_beat.elapsed());
     let msg = match conn.recv_timeout(left) {
         Ok(msg) => msg,
-        Err(FrpError::Json(_)) => None, // not FRP: ignore it and keep reading
+        Err(e) if !e.is_fatal() => None, // not FRP: ignore it and keep reading
         Err(e) => return Err(e.into()), // the connection is gone
     };
     if let Some(msg) = msg {

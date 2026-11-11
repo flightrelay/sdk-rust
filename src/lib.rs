@@ -62,7 +62,7 @@
 //! use std::time::Instant;
 //! use flightrelay::types::roles;
 //! use flightrelay::{
-//!     BusActor, DEFAULT_HEARTBEAT, EndpointConfig, FrpBody, FrpEndpoint, FrpError, FrpMessage,
+//!     BusActor, DEFAULT_HEARTBEAT, EndpointConfig, FrpBody, FrpEndpoint, FrpMessage,
 //!     Transport,
 //! };
 //!
@@ -86,7 +86,7 @@
 //!             _ => {}
 //!         },
 //!         Ok(None) => {}
-//!         Err(FrpError::Json(_)) => {} // one bad message; the connection stays
+//!         Err(e) if !e.is_fatal() => {} // one bad message; the connection stays
 //!         Err(e) => return Err(e),
 //!     }
 //!     if last_beat.elapsed() >= DEFAULT_HEARTBEAT {

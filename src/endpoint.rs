@@ -418,7 +418,7 @@ impl FrpConnection {
         for msg in actors.iter().chain(state) {
             self.send(msg)?;
         }
-        self.send(&FrpMessage::new(first.from.clone(), BusSync {}))
+        self.send(&FrpMessage::new(first.from.clone(), BusSync::new()))
     }
 
     /// Set the underlying TCP stream to non-blocking mode.

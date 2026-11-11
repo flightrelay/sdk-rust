@@ -199,6 +199,14 @@ fn battery<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BusSync {}
 
+impl BusSync {
+    /// A `bus.sync`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {}
+    }
+}
+
 /// `bus.reply` (occurrence, the owner of a command): the answer to a
 /// command. Everyone receives it; only [`to`](Self::to) acts on it. A
 /// successful reply follows the changed state.
