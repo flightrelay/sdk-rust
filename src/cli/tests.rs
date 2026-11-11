@@ -11,7 +11,7 @@ use crate::config::is_default;
 use crate::driver::{
     ConnectCtx, DeviceIdentity, DeviceSession, DriverInfo, Events, NoAction, Stopped,
 };
-use crate::{EndpointConfig, FrpEndpoint, Role, Source};
+use crate::{EndpointConfig, FrpEndpoint, FrpMessage, Source};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -458,6 +458,9 @@ fn help_lists_every_key_with_its_default_and_exits_0() {
         "[tuning]",
         "gain = 0.0",
         "quoted to be a string",
+        "[frp]",
+        "# actor_id = (unset",
+        "raw_frames = false",
     ] {
         assert!(run.out.contains(line), "missing {line:?} in:\n{}", run.out);
     }
@@ -538,19 +541,17 @@ fn a_driver_that_gives_up_exits_1() {
 
 #[test]
 fn a_ws_target_dials_and_anything_else_listens() {
-    // A controller that listens: the server dials it.
-    let mut controller = FrpEndpoint::open(EndpointConfig::new(
-        Role::Controller,
-        crate::Transport::listen("127.0.0.1:0"),
-    ))
-    .unwrap();
-    let addr = controller.local_addr().unwrap().unwrap();
+    // A hub that listens: the server dials it.
+    let mut hub =
+        FrpEndpoint::open(EndpointConfig::new(crate::Transport::listen("127.0.0.1:0"))).unwrap();
+    let addr = hub.local_addr().unwrap().unwrap();
     let stop = Stop::new();
     let runner_stop = stop.clone();
     let url = format!("ws://{addr}/frp");
     let runner = std::thread::spawn(move || go(&["--target", &url], &runner_stop));
-    let conn = controller.establish().expect("the server dialed in");
-    assert_eq!(conn.role(), Role::Controller);
+    let mut conn = hub.establish().expect("the server dialed in");
+    let hello = conn.recv().expect("greeting");
+    assert_eq!(hello.kind(), "bus.actor");
     stop.stop();
     let run = runner.join().unwrap();
     assert_eq!(run.code, 0, "{}", run.err);
@@ -627,23 +628,226 @@ fn delays_print_in_the_unit_that_keeps_them_visible() {
 
 #[test]
 fn output_lines_describe_shots_and_commands() {
-    use crate::{Club, DetectionMode, Launch, ShotKey, Velocity};
+    use crate::{Club, Launch, Mode, ShotKey, ShotLaunch, Velocity};
     let launch = Launch {
         launch_speed: Some(Velocity::MetersPerSecond(67.056)),
         launch_elevation: Some(14.25),
         total_spin_rpm: Some(3231),
         ..Launch::default()
     };
-    let event = DeviceEvent::Frp(FrpEvent::launch(ShotKey::new("id", 7), launch));
+    let event = DeviceEvent::Frp(FrpBody::ShotLaunch(ShotLaunch {
+        key: ShotKey::new("id", 7),
+        launch,
+    }));
     assert_eq!(
         describe(&ServerEvent::Device(&event), Level::Info).as_deref(),
         Some("shot 7: ball 150.0 mph, launch 14.2 deg, spin 3231 rpm")
     );
-    let cmd = crate::driver::DeviceCommand::default()
-        .with_mode(DetectionMode::Putting)
+    let hints = crate::driver::TurnHints::default()
+        .with_mode(Mode::Putting)
         .with_club(Club::Putter);
     assert_eq!(
-        describe(&ServerEvent::Command(&cmd), Level::Info).as_deref(),
-        Some("command: mode=putting hand=- club=PT")
+        describe(&ServerEvent::Hints(&hints), Level::Info).as_deref(),
+        Some("turn: hand=- club=PT mode=putting")
     );
+}
+
+#[test]
+fn a_generated_actor_id_is_saved_to_the_config_file_and_reused() {
+    let file = temp_file("id.toml", "count = 3");
+    let path = file.to_str().unwrap();
+    let run = go_stopped(&["--config", path]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert!(run.err.contains("new actor id "), "{}", run.err);
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        text.starts_with("count = 3\n\n[frp]\nactor_id = \""),
+        "{text}"
+    );
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    let id = table["frp"]["actor_id"].as_str().unwrap().to_owned();
+    assert_eq!(id.len(), 16);
+    assert_eq!(
+        run.built.unwrap().count,
+        3,
+        "the [frp] table is not the driver's"
+    );
+
+    let again = go_stopped(&["--config", path]);
+    assert_eq!(again.code, 0, "{}", again.err);
+    assert!(!again.err.contains("new actor id"), "{}", again.err);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        text,
+        "the file is left alone"
+    );
+}
+
+#[test]
+fn an_actor_id_goes_into_an_existing_frp_table() {
+    let file = temp_file(
+        "table.toml",
+        "# mine\n[frp] # runner\nraw_frames = true\n\n[tuning]\ngain = 1.5\n",
+    );
+    let run = go_stopped(&["--config", file.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    let text = std::fs::read_to_string(&file).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "# mine");
+    assert_eq!(lines[1], "[frp] # runner");
+    assert!(lines[2].starts_with("actor_id = "), "{text}");
+    assert_eq!(lines[3], "raw_frames = true");
+    let table: toml::Table = toml::from_str(&text).unwrap();
+    assert_eq!(table["tuning"]["gain"].as_float(), Some(1.5));
+    assert_eq!(run.built.unwrap().tuning.gain, 1.5);
+}
+
+const ID: &str = "a1b2c3d4e5f60718";
+
+/// The `frp.actor_id` of `text`, read as TOML.
+fn actor_id_in(text: &str) -> Option<String> {
+    let table: toml::Table = toml::from_str(text).ok()?;
+    table
+        .get("frp")?
+        .get("actor_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+#[test]
+fn an_actor_id_is_added_after_the_frp_header() {
+    let before = "count = 3\n[frp]\nraw_frames = true\n\n[tuning]\ngain = 1.5\n";
+    let after = with_actor_id(before, ID).unwrap();
+    assert_eq!(
+        after,
+        "count = 3\n[frp]\nactor_id = \"a1b2c3d4e5f60718\"\nraw_frames = true\n\n[tuning]\ngain = 1.5\n"
+    );
+}
+
+#[test]
+fn an_actor_id_gets_a_new_frp_table_when_there_is_none() {
+    assert_eq!(
+        with_actor_id("count = 3", ID).unwrap(),
+        "count = 3\n\n[frp]\nactor_id = \"a1b2c3d4e5f60718\"\n"
+    );
+    assert_eq!(
+        with_actor_id("", ID).unwrap(),
+        "[frp]\nactor_id = \"a1b2c3d4e5f60718\"\n"
+    );
+    let header_last = with_actor_id("count = 3\n[frp]", ID).unwrap();
+    assert_eq!(actor_id_in(&header_last).as_deref(), Some(ID));
+}
+
+#[test]
+fn an_actor_id_is_not_added_to_a_table_of_another_shape() {
+    for text in [
+        "count = 3\nfrp.raw_frames = true\n",
+        "count = 3\nfrp = { raw_frames = true }\n",
+        "count = 3\n[ frp ]\nraw_frames = true\n",
+        // A header inside a multi-line string is not a header.
+        "label = \"\"\"\n[frp]\n\"\"\"\n",
+    ] {
+        assert_eq!(with_actor_id(text, ID), None, "{text}");
+    }
+}
+
+#[test]
+fn an_actor_id_keeps_crlf_line_endings() {
+    let before = "count = 3\r\n[frp]\r\nraw_frames = true\r\n";
+    let after = with_actor_id(before, ID).unwrap();
+    assert_eq!(
+        after,
+        "count = 3\r\n[frp]\r\nactor_id = \"a1b2c3d4e5f60718\"\r\nraw_frames = true\r\n"
+    );
+    let appended = with_actor_id("count = 3\r\n", ID).unwrap();
+    assert_eq!(
+        appended,
+        "count = 3\r\n\r\n[frp]\r\nactor_id = \"a1b2c3d4e5f60718\"\r\n"
+    );
+    assert!(!appended.replace("\r\n", "").contains('\n'), "{appended:?}");
+}
+
+#[test]
+fn a_config_file_the_runner_cannot_edit_is_left_untouched() {
+    for (name, text) in [
+        ("dotted.toml", "count = 3\nfrp.raw_frames = true\n"),
+        ("inline.toml", "count = 3\nfrp = { raw_frames = true }\n"),
+        ("spaced.toml", "count = 3\n[ frp ]\nraw_frames = true\n"),
+    ] {
+        let file = temp_file(name, text);
+        let path = file.to_str().unwrap();
+        let run = go_stopped(&["--config", path]);
+        assert_eq!(run.code, 0, "{name}: {}", run.err);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text, "{name}");
+        assert!(run.err.contains("was left as it is"), "{name}: {}", run.err);
+        assert!(
+            run.err.contains("add actor_id = \""),
+            "{name}: the line to add is printed: {}",
+            run.err
+        );
+        assert_eq!(run.built.unwrap().count, 3, "{name}");
+    }
+}
+
+#[test]
+fn a_crlf_config_file_stays_crlf() {
+    let text = "count = 3\r\n[frp]\r\nraw_frames = false\r\n";
+    let file = temp_file("crlf.toml", text);
+    let run = go_stopped(&["--config", file.to_str().unwrap()]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        saved.starts_with("count = 3\r\n[frp]\r\nactor_id = \""),
+        "{saved:?}"
+    );
+    assert!(saved.ends_with("\"\r\nraw_frames = false\r\n"), "{saved:?}");
+    assert!(actor_id_in(&saved).is_some());
+}
+
+#[test]
+fn without_a_config_file_the_actor_id_lasts_for_the_run() {
+    let run = go_stopped(&["--set", "frp.raw_frames=true"]);
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert!(run.err.contains("for this run"), "{}", run.err);
+    let run = go_stopped(&["--set", "frp.actor_id=a1b2c3d4e5f60718"]);
+    assert!(!run.err.contains("new actor id"), "{}", run.err);
+}
+
+#[test]
+fn runner_keys_are_checked() {
+    for (set, field) in [
+        ("frp.actor_id=", "frp.actor_id"),
+        ("frp.actor_id=5", "frp.actor_id"),
+        ("frp.raw_frames=yes", "frp.raw_frames"),
+        ("frp.heartbeat=2", "frp.heartbeat"),
+    ] {
+        let run = go_stopped(&["--set", set]);
+        assert_eq!(run.code, 2, "{set}: {}", run.err);
+        assert!(run.err.contains(field), "{set}: {}", run.err);
+    }
+    let file = temp_file("frp-not-table.toml", "frp = 3\n");
+    let run = go_stopped(&["--config", file.to_str().unwrap()]);
+    assert_eq!(run.code, 2, "{}", run.err);
+}
+
+#[test]
+fn the_runner_publishes_with_the_configured_actor_id() {
+    let mut hub =
+        FrpEndpoint::open(EndpointConfig::new(crate::Transport::listen("127.0.0.1:0"))).unwrap();
+    let addr = hub.local_addr().unwrap().unwrap();
+    let stop = Stop::new();
+    let runner_stop = stop.clone();
+    let url = format!("ws://{addr}/frp");
+    let runner = std::thread::spawn(move || {
+        go(
+            &["--target", &url, "--set", "frp.actor_id=a1b2c3d4e5f60718"],
+            &runner_stop,
+        )
+    });
+    let mut conn = hub.establish().expect("dialed in");
+    let hello: FrpMessage = conn.recv().unwrap();
+    assert_eq!(hello.from, "a1b2c3d4e5f60718");
+    stop.stop();
+    let run = runner.join().unwrap();
+    assert_eq!(run.code, 0, "{}", run.err);
 }

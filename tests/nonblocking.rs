@@ -1,5 +1,5 @@
 //! The endpoint and connection behavior the server relies on: stoppable
-//! establish, handshake timeouts, and queued sends on a non-blocking socket.
+//! establish, upgrade timeouts, and queued sends on a non-blocking socket.
 
 #![cfg(feature = "transport")]
 
@@ -10,19 +10,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flightrelay::{
-    EndpointConfig, FrpEndpoint, FrpEnvelope, FrpError, FrpEvent, Role, Severity, Transport,
+    BusAlert, EndpointConfig, FrpEndpoint, FrpError, FrpMessage, Severity, Transport,
 };
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 
-fn listener(
-    role: Role,
-    tweak: impl FnOnce(EndpointConfig) -> EndpointConfig,
-) -> (FrpEndpoint, String) {
-    let ep = FrpEndpoint::open(tweak(EndpointConfig::new(
-        role,
-        Transport::listen("127.0.0.1:0"),
-    )))
-    .expect("bind");
+fn listener(tweak: impl FnOnce(EndpointConfig) -> EndpointConfig) -> (FrpEndpoint, String) {
+    let ep = FrpEndpoint::open(tweak(EndpointConfig::new(Transport::listen("127.0.0.1:0"))))
+        .expect("bind");
     let addr = ep
         .local_addr()
         .expect("addr")
@@ -33,18 +27,17 @@ fn listener(
 
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
 
-fn dial(addr: &str, start: bool) -> Ws {
-    let (mut ws, _) = tungstenite::connect(format!("ws://{addr}/frp")).expect("connect");
-    if start {
-        ws.send(Message::text(r#"{"kind":"start","version":["0.2.0"]}"#))
-            .expect("start");
-    }
-    ws
+fn dial(addr: &str) -> Ws {
+    tungstenite::connect(format!("ws://{addr}/frp"))
+        .expect("connect")
+        .0
 }
+
+const SYNC: &str = r#"{"kind":"bus.sync","from":"c19e04b7a2d5f318"}"#;
 
 #[test]
 fn establish_until_returns_none_on_a_stop_and_leaves_the_endpoint_usable() {
-    let (mut ep, addr) = listener(Role::Device, |c| c);
+    let (mut ep, addr) = listener(|c| c);
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     let waiter = thread::spawn(move || {
@@ -60,36 +53,39 @@ fn establish_until_returns_none_on_a_stop_and_leaves_the_endpoint_usable() {
 
     // The listener is blocking again, so `establish` serves a connection.
     let peer = thread::spawn(move || {
-        let mut ws = dial(&addr, true);
-        ws.read().expect("init")
+        let mut ws = dial(&addr);
+        ws.send(Message::text(SYNC)).expect("send");
+        ws
     });
-    let conn = ep.establish().expect("establish after a stop");
-    assert_eq!(conn.role(), Role::Device);
-    assert!(peer.join().unwrap().is_text());
+    let mut conn = ep.establish().expect("establish after a stop");
+    assert_eq!(conn.recv().expect("recv").kind(), "bus.sync");
+    drop(peer.join().unwrap());
 }
 
 #[test]
 fn establish_until_serves_a_connection_that_arrives() {
-    let (mut ep, addr) = listener(Role::Device, |c| c);
+    let (mut ep, addr) = listener(|c| c);
     let stop = AtomicBool::new(false);
     let peer = thread::spawn(move || {
         thread::sleep(Duration::from_millis(150));
-        dial(&addr, true).read().expect("init")
+        let mut ws = dial(&addr);
+        ws.send(Message::text(SYNC)).expect("send");
+        ws
     });
-    let conn = ep
+    let mut conn = ep
         .establish_until(&stop)
         .expect("no error")
         .expect("a connection");
-    assert_eq!(conn.version(), flightrelay::SPEC_VERSION);
-    assert!(peer.join().unwrap().is_text());
+    assert!(conn.peer_addr().is_some());
+    assert_eq!(conn.recv().expect("recv").kind(), "bus.sync");
+    drop(peer.join().unwrap());
 }
 
 #[test]
 fn a_stopped_dial_gives_up_at_once() {
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("ws://{}/frp", taken.local_addr().unwrap());
-    let mut ep =
-        FrpEndpoint::open(EndpointConfig::new(Role::Device, Transport::connect(url))).unwrap();
+    let mut ep = FrpEndpoint::open(EndpointConfig::new(Transport::connect(url))).unwrap();
     let stop = AtomicBool::new(true);
     let at = Instant::now();
     assert!(matches!(ep.establish_until(&stop), Ok(None)));
@@ -98,10 +94,9 @@ fn a_stopped_dial_gives_up_at_once() {
 
 #[test]
 fn only_ws_urls_can_be_dialed() {
-    let mut ep = FrpEndpoint::open(EndpointConfig::new(
-        Role::Device,
-        Transport::connect("wss://127.0.0.1:1/frp"),
-    ))
+    let mut ep = FrpEndpoint::open(EndpointConfig::new(Transport::connect(
+        "wss://127.0.0.1:1/frp",
+    )))
     .unwrap();
     let stop = AtomicBool::new(false);
     assert!(
@@ -114,10 +109,8 @@ fn timed_out(result: &Result<flightrelay::FrpConnection, FrpError>) -> bool {
 }
 
 #[test]
-fn a_silent_client_times_out_the_handshake() {
-    let (mut ep, addr) = listener(Role::Device, |c| {
-        c.with_handshake_timeout(Duration::from_millis(300))
-    });
+fn a_silent_client_times_out_the_upgrade() {
+    let (mut ep, addr) = listener(|c| c.with_handshake_timeout(Duration::from_millis(300)));
     let _silent = TcpStream::connect(&addr).unwrap();
     let at = Instant::now();
     assert!(timed_out(&ep.establish()));
@@ -125,27 +118,11 @@ fn a_silent_client_times_out_the_handshake() {
 }
 
 #[test]
-fn a_client_that_upgrades_and_never_sends_start_times_out_too() {
-    let (mut ep, addr) = listener(Role::Device, |c| {
-        c.with_handshake_timeout(Duration::from_millis(300))
-    });
-    let upgraded = thread::spawn(move || {
-        let ws = dial(&addr, false);
-        thread::sleep(Duration::from_secs(2)); // holds the upgraded socket open
-        drop(ws);
-    });
-    let at = Instant::now();
-    assert!(timed_out(&ep.establish()));
-    assert!(at.elapsed() < Duration::from_secs(3), "{:?}", at.elapsed());
-    upgraded.join().unwrap();
-}
-
-#[test]
-fn a_peer_that_never_answers_times_out_a_dialing_controller() {
+fn a_peer_that_never_answers_times_out_a_dial() {
     let silent = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("ws://{}/frp", silent.local_addr().unwrap());
     let mut ep = FrpEndpoint::open(
-        EndpointConfig::new(Role::Controller, Transport::connect(url))
+        EndpointConfig::new(Transport::connect(url))
             .with_handshake_timeout(Duration::from_millis(300)),
     )
     .unwrap();
@@ -155,53 +132,40 @@ fn a_peer_that_never_answers_times_out_a_dialing_controller() {
 }
 
 #[test]
-fn the_handshake_timeout_does_not_limit_the_connection() {
-    let (mut ep, addr) = listener(Role::Device, |c| {
-        c.with_handshake_timeout(Duration::from_millis(200))
-    });
+fn the_upgrade_timeout_does_not_limit_the_connection() {
+    let (mut ep, addr) = listener(|c| c.with_handshake_timeout(Duration::from_millis(200)));
     let peer = thread::spawn(move || {
-        let mut ws = dial(&addr, true);
-        let _init = ws.read().expect("init");
+        let mut ws = dial(&addr);
         thread::sleep(Duration::from_millis(500));
-        ws.send(Message::text(
-            r#"{"kind":"set_detection_mode","club":"PW"}"#,
-        ))
-        .unwrap();
+        ws.send(Message::text(SYNC)).unwrap();
         ws
     });
-    let mut conn = ep.establish().expect("handshake");
+    let mut conn = ep.establish().expect("upgrade");
     thread::sleep(Duration::from_millis(100));
-    // Blocks for longer than the handshake timeout and still succeeds.
+    // Blocks for longer than the upgrade timeout and still succeeds.
     let msg = conn.recv().expect("recv after the timeout window");
-    assert!(matches!(msg, flightrelay::FrpMessage::Protocol(_)));
+    assert_eq!(msg.kind(), "bus.sync");
     drop(peer.join().unwrap());
 }
 
-fn big_alert(i: usize) -> FrpEnvelope {
-    FrpEnvelope::new(
-        "EagleOne-X4K2",
-        FrpEvent::Alert {
-            severity: Severity::Warn,
-            message: format!("{i}:{}", "x".repeat(100_000)),
-        },
+fn big_alert(i: usize) -> FrpMessage {
+    FrpMessage::new(
+        "7d2f9a41c03be856",
+        BusAlert::new(Severity::Warn, format!("{i}:{}", "x".repeat(100_000))),
     )
 }
 
 #[test]
 fn a_full_socket_queues_sends_until_the_write_buffer_limit() {
-    let (mut ep, addr) = listener(Role::Device, |c| c.with_write_buffer_limit(512 * 1024));
-    let peer = thread::spawn(move || {
-        let mut ws = dial(&addr, true);
-        let _init = ws.read().expect("init");
-        ws // does not read again
-    });
-    let mut conn = ep.establish().expect("handshake");
+    let (mut ep, addr) = listener(|c| c.with_write_buffer_limit(512 * 1024));
+    let peer = thread::spawn(move || dial(&addr)); // never reads
+    let mut conn = ep.establish().expect("upgrade");
     let mut peer_ws = peer.join().unwrap();
     conn.set_nonblocking(true).unwrap();
 
     let mut sent = 0;
     let failure = loop {
-        match conn.send_envelope(&big_alert(sent)) {
+        match conn.send(&big_alert(sent)) {
             Ok(()) => sent += 1,
             Err(e) => break e,
         }
@@ -245,13 +209,9 @@ fn a_full_socket_queues_sends_until_the_write_buffer_limit() {
 
 #[test]
 fn closing_a_non_blocking_connection_does_not_wait_for_the_peer() {
-    let (mut ep, addr) = listener(Role::Device, |c| c);
-    let peer = thread::spawn(move || {
-        let mut ws = dial(&addr, true);
-        let _init = ws.read().expect("init");
-        ws
-    });
-    let conn = ep.establish().expect("handshake");
+    let (mut ep, addr) = listener(|c| c);
+    let peer = thread::spawn(move || dial(&addr));
+    let conn = ep.establish().expect("upgrade");
     let _ws = peer.join().unwrap();
     conn.set_nonblocking(true).unwrap();
     let at = Instant::now();

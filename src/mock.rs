@@ -3,19 +3,25 @@
 //! Requires the `mock` feature. The mock is a virtual device (its
 //! [`Source`] is [`Virtual`](Source::Virtual)) that arms, reports a ball
 //! ready and fires a shot at a fixed interval, with realistic values for the
-//! detection mode in play. It needs no hardware, so it serves for tests of a
+//! mode in play. It needs no hardware, so it serves for tests of a
 //! host, for [`FrpServer`](crate::FrpServer) in development, and for a demo.
 //!
-//! A shot carries the measured launch (`launch`), the model-produced flight
-//! (`flight_result`, [`Basis::Modeled`]) and the club (`club_path`). Values
-//! follow the mode that is latched when the shot fires: full swing, chipping
-//! or putting. The mode comes from the host's latched command at connect and
-//! from [`command`](DeviceSession::command) afterwards.
+//! A shot carries the measured launch (`shot.launch`), the model-produced
+//! flight (`shot.flight`, [`Basis::Modeled`]) and the club (`shot.club`).
+//! Values follow the mode in the hints when the shot fires: full swing,
+//! chipping or putting. The mode comes from the host's `golfer.turn` hints
+//! at connect and from [`hints`](DeviceSession::hints) afterwards; no mode
+//! hint means a full swing, as before any turn. The mock ignores handedness
+//! and club.
+//!
+//! Its blockers follow the simulated device: `not_armed` from connecting
+//! until it arms and again right after a shot, `no_ball` while armed with no
+//! ball, none while the ball is ready.
 //!
 //! A host can hold shots back, e.g. between rounds: the mock asks
-//! [`Events::shots_allowed`] before it numbers a shot or reports
-//! `ready=false`, and asks again on the next poll, so a held shot takes no
-//! number and fires as soon as shots are allowed again.
+//! [`Events::shots_allowed`] before it numbers a shot or raises a blocker for
+//! it, and asks again on the next poll, so a held shot takes no number and
+//! fires as soon as shots are allowed again.
 //!
 //! ```
 //! use flightrelay::driver::DeviceDriver;
@@ -28,8 +34,8 @@
 //! # Ok::<(), flightrelay::config::ConfigError>(())
 //! ```
 //!
-//! With the `server` feature, `FrpServer::new(driver, config)` serves it to
-//! FRP controllers.
+//! With the `server` feature, `FrpServer::new(driver, config)` runs it as a
+//! launch monitor actor on the bus.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,10 +43,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigError, DriverConfig, is_default_value};
 use crate::driver::{
-    ConnectCtx, DeviceCommand, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events,
-    Level, NoAction, ShotIds, Stopped,
+    ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events, Level, NoAction,
+    ShotIds, Stopped, TurnHints,
 };
-use crate::{Basis, ClubData, DetectionMode, Distance, FlightResult, Launch, Source, Velocity};
+use crate::types::blockers;
+use crate::{Basis, ClubData, Distance, FlightResult, Launch, Mode, Source, Velocity};
 
 const DEFAULT_SHOT_INTERVAL_S: f64 = 30.0;
 const DEFAULT_ARM_DELAY_S: f64 = 2.0;
@@ -183,7 +190,7 @@ impl DeviceDriver for MockDriver {
 
     fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<MockSession, MockError> {
         ctx.tick()?;
-        let mode = ctx.latched().mode.unwrap_or(DetectionMode::Full);
+        let mode = ctx.hints().mode.unwrap_or(Mode::Full);
         Ok(MockSession {
             identity: DeviceIdentity::new(format!(
                 "MockLM-{}",
@@ -223,7 +230,7 @@ pub struct MockSession {
     identity: DeviceIdentity,
     config: MockConfig,
     ids: ShotIds,
-    mode: DetectionMode,
+    mode: Mode,
     phase: Phase,
 }
 
@@ -248,7 +255,7 @@ impl MockSession {
                 shot.flight.carry_distance.map_or(0.0, Distance::as_yards),
             ),
         );
-        out.ready(false);
+        out.blockers([blockers::NOT_ARMED]);
         self.mode_telemetry(out, "idle");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -259,8 +266,8 @@ impl MockSession {
             None => out.shot_trigger(key.clone()),
         }
         out.launch(key.clone(), shot.launch);
-        out.flight_result(key.clone(), shot.flight);
-        out.club_path(key.clone(), shot.club);
+        out.flight(key.clone(), shot.flight);
+        out.club(key.clone(), shot.club);
         out.shot_finished(key);
     }
 }
@@ -272,7 +279,7 @@ impl DeviceSession for MockSession {
         let c = self.config.clone();
         match self.phase {
             Phase::Start => {
-                out.ready(false);
+                out.blockers([blockers::NOT_ARMED]);
                 self.mode_telemetry(out, "idle");
                 out.log(Level::Info, "mock: connected");
                 self.phase = Phase::Idle {
@@ -280,7 +287,7 @@ impl DeviceSession for MockSession {
                 };
             }
             Phase::Idle { since } if since.elapsed() >= MockConfig::secs(c.arm_delay_s) => {
-                out.ready(false);
+                out.blockers([blockers::NO_BALL]);
                 self.mode_telemetry(out, "armed");
                 self.phase = Phase::Armed {
                     since: Instant::now(),
@@ -314,12 +321,10 @@ impl DeviceSession for MockSession {
         Ok(())
     }
 
-    fn command(&mut self, cmd: &DeviceCommand) -> Result<(), MockError> {
+    fn hints(&mut self, hints: &TurnHints) -> Result<(), MockError> {
         // The new mode shows in the telemetry of the next arm; a mode change
-        // leaves the timers alone.
-        if let Some(mode) = cmd.mode {
-            self.mode = mode;
-        }
+        // leaves the timers alone. No mode hint is a full swing.
+        self.mode = hints.mode.unwrap_or(Mode::Full);
         Ok(())
     }
 
@@ -328,7 +333,7 @@ impl DeviceSession for MockSession {
     }
 
     fn close(self, out: &mut Events<'_>) -> Result<(), MockError> {
-        out.ready(false);
+        out.blockers([blockers::NOT_ARMED]);
         Ok(())
     }
 }
@@ -342,12 +347,12 @@ struct Shot {
 
 /// A shot for shot number `n` in `mode`: values vary smoothly with `n`.
 #[allow(clippy::many_single_char_names, clippy::cast_possible_truncation)]
-fn generate_shot(n: u32, mode: DetectionMode) -> Shot {
+fn generate_shot(n: u32, mode: Mode) -> Shot {
     let v = (f64::from(n) * 0.7).sin(); // -1..1 variation seed
 
     let (ball_speed, vla, hla, carry, height, backspin, sidespin, club_speed, aoa, loft) =
         match mode {
-            DetectionMode::Full => (
+            Mode::Full => (
                 53.0 + 3.0 * v,
                 17.0 + 1.5 * v,
                 0.8 * v,
@@ -359,7 +364,7 @@ fn generate_shot(n: u32, mode: DetectionMode) -> Shot {
                 -4.0 + 0.8 * v,
                 22.0 + 1.0 * v,
             ),
-            DetectionMode::Chipping => (
+            Mode::Chipping => (
                 18.0 + 2.0 * v,
                 35.0 + 3.0 * v,
                 0.5 * v,
@@ -371,7 +376,7 @@ fn generate_shot(n: u32, mode: DetectionMode) -> Shot {
                 -5.0 + 1.0 * v,
                 38.0 + 2.0 * v,
             ),
-            DetectionMode::Putting => (
+            Mode::Putting => (
                 3.5 + 0.5 * v,
                 2.0 + 0.3 * v,
                 0.3 * v,
@@ -425,14 +430,14 @@ fn generate_shot(n: u32, mode: DetectionMode) -> Shot {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
-    use crate::FrpEvent;
+    use crate::FrpBody;
     use crate::driver::{ConnectHost, DeviceEvent, HostFlags, Stop};
 
-    struct Host(DeviceCommand);
+    struct Host(TurnHints);
 
     impl ConnectHost for Host {
         fn tick(&mut self) {}
-        fn latched(&self) -> &DeviceCommand {
+        fn hints(&self) -> &TurnHints {
             &self.0
         }
     }
@@ -447,31 +452,31 @@ mod tests {
         }
     }
 
-    fn connect(driver: &mut MockDriver, mode: Option<DetectionMode>) -> MockSession {
+    fn connect(driver: &mut MockDriver, mode: Option<Mode>) -> MockSession {
         let stop = Stop::new();
         let flags = HostFlags::new();
         let mut sink = |_| {};
-        let mut host = Host(DeviceCommand {
+        let mut host = Host(TurnHints {
             mode,
-            ..DeviceCommand::default()
+            ..TurnHints::default()
         });
         let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &flags), &mut host);
         driver.connect(&mut ctx).expect("connect")
     }
 
-    /// Polls until `done` says so, collecting the FRP events.
+    /// Polls until `done` says so, collecting the messages and status.
     fn drive(
         session: &mut MockSession,
         flags: &HostFlags,
-        done: impl Fn(&[FrpEvent]) -> bool,
-    ) -> Vec<FrpEvent> {
-        let mut seen: Vec<FrpEvent> = Vec::new();
+        done: impl Fn(&[DeviceEvent]) -> bool,
+    ) -> Vec<DeviceEvent> {
+        let mut seen: Vec<DeviceEvent> = Vec::new();
         let give_up = Instant::now() + Duration::from_secs(5);
         while !done(&seen) {
             assert!(Instant::now() < give_up, "timed out; saw {seen:?}");
             let mut sink = |e: DeviceEvent| {
-                if let DeviceEvent::Frp(f) = e {
-                    seen.push(f);
+                if matches!(e, DeviceEvent::Frp(_) | DeviceEvent::Status(_)) {
+                    seen.push(e);
                 }
             };
             session
@@ -481,31 +486,37 @@ mod tests {
         seen
     }
 
-    fn kinds(events: &[FrpEvent]) -> Vec<&'static str> {
+    fn kinds(events: &[DeviceEvent]) -> Vec<&'static str> {
         events
             .iter()
             .map(|e| match e {
-                FrpEvent::ShotTrigger { .. } => "trigger",
-                FrpEvent::Launch { .. } => "launch",
-                FrpEvent::FlightResult { .. } => "flight",
-                FrpEvent::ClubPath { .. } => "club",
-                FrpEvent::ShotFinished { .. } => "finished",
-                FrpEvent::DeviceTelemetry { .. } => "telemetry",
+                DeviceEvent::Frp(FrpBody::ShotTrigger(_)) => "trigger",
+                DeviceEvent::Frp(FrpBody::ShotLaunch(_)) => "launch",
+                DeviceEvent::Frp(FrpBody::ShotFlight(_)) => "flight",
+                DeviceEvent::Frp(FrpBody::ShotClub(_)) => "club",
+                DeviceEvent::Frp(FrpBody::ShotFinished(_)) => "finished",
+                DeviceEvent::Status(_) => "status",
                 _ => "other",
             })
             .collect()
     }
 
-    fn ready_values(events: &[FrpEvent]) -> Vec<String> {
+    /// Each blocker list the driver set, joined; `""` for none.
+    fn blocker_values(events: &[DeviceEvent]) -> Vec<String> {
         events
             .iter()
             .filter_map(|e| match e {
-                FrpEvent::DeviceTelemetry {
-                    telemetry: Some(t), ..
-                } => t.get("ready").cloned(),
+                DeviceEvent::Status(s) => s.blockers.as_ref().map(|b| b.join(",")),
                 _ => None,
             })
             .collect()
+    }
+
+    fn bodies(events: &[DeviceEvent]) -> impl Iterator<Item = &FrpBody> {
+        events.iter().filter_map(|e| match e {
+            DeviceEvent::Frp(b) => Some(b),
+            _ => None,
+        })
     }
 
     #[test]
@@ -524,28 +535,25 @@ mod tests {
     #[test]
     fn a_session_arms_signals_ready_and_fires_a_complete_shot() {
         let mut driver = MockDriver::new(fast()).unwrap();
-        let mut session = connect(&mut driver, Some(DetectionMode::Chipping));
+        let mut session = connect(&mut driver, Some(Mode::Chipping));
         let flags = HostFlags::new();
         let seen = drive(&mut session, &flags, |s| kinds(s).contains(&"finished"));
 
-        // ready=false on connect and when armed, ready=true for the ball, then
-        // ready=false again as the shot goes out.
-        assert_eq!(ready_values(&seen), ["false", "false", "true", "false"]);
+        // Not armed on connect, no ball once armed, nothing in the way with
+        // the ball ready, then not armed again as the shot goes out.
+        assert_eq!(
+            blocker_values(&seen),
+            ["not_armed", "no_ball", "", "not_armed"]
+        );
         let order = kinds(&seen);
-        let shot: Vec<&str> = order
-            .iter()
-            .copied()
-            .filter(|k| *k != "telemetry")
-            .collect();
+        let shot: Vec<&str> = order.iter().copied().filter(|k| *k != "status").collect();
         assert_eq!(shot, ["trigger", "launch", "flight", "club", "finished"]);
 
-        // The card keys come from the driver, in the mode the host latched.
+        // The telemetry keys come from the driver, in the mode the host gave.
         let tracking: Vec<&str> = seen
             .iter()
             .filter_map(|e| match e {
-                FrpEvent::DeviceTelemetry {
-                    telemetry: Some(t), ..
-                } => t.get("tracking_mode").map(String::as_str),
+                DeviceEvent::Status(s) => s.telemetry.get("tracking_mode").map(String::as_str),
                 _ => None,
             })
             .collect();
@@ -555,21 +563,12 @@ mod tests {
         );
 
         // One key throughout; the flight is modeled and carries the distances.
-        let keys: Vec<_> = seen
-            .iter()
-            .filter_map(|e| match e {
-                FrpEvent::ShotTrigger { key, .. }
-                | FrpEvent::Launch { key, .. }
-                | FrpEvent::FlightResult { key, .. }
-                | FrpEvent::ClubPath { key, .. }
-                | FrpEvent::ShotFinished { key } => Some(key),
-                _ => None,
-            })
-            .collect();
+        let keys: Vec<_> = bodies(&seen).filter_map(FrpBody::shot_key).collect();
+        assert_eq!(keys.len(), 5);
         assert!(keys.iter().all(|k| *k == keys[0]));
         assert_eq!(keys[0].shot_number, 1);
-        let flight = seen.iter().find_map(|e| match e {
-            FrpEvent::FlightResult { flight, .. } => Some(flight),
+        let flight = bodies(&seen).find_map(|b| match b {
+            FrpBody::ShotFlight(m) => Some(&m.flight),
             _ => None,
         });
         let flight = flight.unwrap();
@@ -577,21 +576,15 @@ mod tests {
         assert!(flight.carry_distance.is_some() && flight.total_distance.is_some());
         assert!(flight.max_height.is_some() && flight.flight_time.is_some());
         assert!(flight.roll_distance.is_some());
-        let launch = seen.iter().find_map(|e| match e {
-            FrpEvent::Launch { launch, .. } => Some(launch),
+        let launch = bodies(&seen).find_map(|b| match b {
+            FrpBody::ShotLaunch(m) => Some(&m.launch),
             _ => None,
         });
         let launch = launch.unwrap();
         assert!(launch.launch_speed.is_some() && launch.launch_elevation.is_some());
         assert!(launch.backspin_rpm.is_some() && launch.sidespin_rpm.is_some());
         assert!(
-            seen.iter().any(|e| matches!(
-                e,
-                FrpEvent::ShotTrigger {
-                    timestamp: Some(_),
-                    ..
-                }
-            )),
+            bodies(&seen).any(|b| matches!(b, FrpBody::ShotTrigger(t) if t.timestamp.is_some())),
             "the trigger carries the clock"
         );
     }
@@ -607,17 +600,17 @@ mod tests {
                 .map(Velocity::as_mps)
                 .unwrap()
         };
-        assert!(speed(DetectionMode::Full) > speed(DetectionMode::Chipping));
-        assert!(speed(DetectionMode::Chipping) > speed(DetectionMode::Putting));
+        assert!(speed(Mode::Full) > speed(Mode::Chipping));
+        assert!(speed(Mode::Chipping) > speed(Mode::Putting));
 
         let mut first = connect(&mut driver, None);
         let seen = drive(&mut first, &flags, |s| kinds(s).contains(&"finished"));
         drop(first);
-        let mut second = connect(&mut driver, Some(DetectionMode::Putting));
+        let mut second = connect(&mut driver, Some(Mode::Putting));
         let again = drive(&mut second, &flags, |s| kinds(s).contains(&"finished"));
-        let number = |events: &[FrpEvent]| {
-            events.iter().find_map(|e| match e {
-                FrpEvent::ShotTrigger { key, .. } => Some(key.shot_number),
+        let number = |events: &[DeviceEvent]| {
+            bodies(events).find_map(|b| match b {
+                FrpBody::ShotTrigger(t) => Some(t.key.shot_number),
                 _ => None,
             })
         };
@@ -625,25 +618,49 @@ mod tests {
     }
 
     #[test]
-    fn a_command_changes_the_mode_of_the_next_shot() {
+    fn hints_change_the_mode_of_the_next_shot() {
         let mut driver = MockDriver::new(MockConfig {
             shot_interval_s: 0.2,
             ..fast()
         })
         .unwrap();
-        let mut session = connect(&mut driver, Some(DetectionMode::Full));
+        let mut session = connect(&mut driver, Some(Mode::Full));
         let flags = HostFlags::new();
-        let _ = drive(&mut session, &flags, |s| ready_values(s).len() >= 2);
+        let _ = drive(&mut session, &flags, |s| blocker_values(s).len() >= 2);
         session
-            .command(&DeviceCommand::default().with_mode(DetectionMode::Putting))
+            .hints(
+                &TurnHints::default()
+                    .with_mode(Mode::Putting)
+                    .with_handedness(crate::Handedness::Left),
+            )
             .unwrap();
         let seen = drive(&mut session, &flags, |s| kinds(s).contains(&"finished"));
-        let launch = seen.iter().find_map(|e| match e {
-            FrpEvent::Launch { launch, .. } => Some(launch),
+        let launch = bodies(&seen).find_map(|b| match b {
+            FrpBody::ShotLaunch(m) => Some(&m.launch),
             _ => None,
         });
         let speed = launch.unwrap().launch_speed.unwrap().as_mps();
         assert!(speed < 5.0, "a putt: {speed}");
+    }
+
+    #[test]
+    fn no_mode_hint_is_a_full_swing() {
+        let mut driver = MockDriver::new(MockConfig {
+            shot_interval_s: 0.2,
+            ..fast()
+        })
+        .unwrap();
+        let mut session = connect(&mut driver, Some(Mode::Putting));
+        let flags = HostFlags::new();
+        let _ = drive(&mut session, &flags, |s| blocker_values(s).len() >= 2);
+        session.hints(&TurnHints::default()).unwrap();
+        let seen = drive(&mut session, &flags, |s| kinds(s).contains(&"finished"));
+        let launch = bodies(&seen).find_map(|b| match b {
+            FrpBody::ShotLaunch(m) => Some(&m.launch),
+            _ => None,
+        });
+        let speed = launch.unwrap().launch_speed.unwrap().as_mps();
+        assert!(speed > 5.0, "a full swing: {speed}");
     }
 
     #[test]
@@ -652,16 +669,16 @@ mod tests {
         let mut session = connect(&mut driver, None);
         let flags = HostFlags::new();
         flags.set_shots_allowed(false);
-        // Ready and past the interval, but held: no trigger, no ready=false.
+        // Ready and past the interval, but held: no trigger, no new blocker.
         let held = drive(&mut session, &flags, |s| {
-            ready_values(s).contains(&"true".to_owned())
+            blocker_values(s).contains(&String::new())
         });
         let more = {
             let mut seen = Vec::new();
             for _ in 0..20 {
                 let mut sink = |e: DeviceEvent| {
-                    if let DeviceEvent::Frp(f) = e {
-                        seen.push(f);
+                    if matches!(e, DeviceEvent::Frp(_) | DeviceEvent::Status(_)) {
+                        seen.push(e);
                     }
                 };
                 session
@@ -674,31 +691,27 @@ mod tests {
             seen
         };
         assert!(!kinds(&held).contains(&"trigger") && !kinds(&more).contains(&"trigger"));
-        assert!(ready_values(&more).is_empty(), "no ready=false while held");
+        assert!(blocker_values(&more).is_empty(), "no blocker while held");
         assert_eq!(session.ids.count(), 0, "no shot number taken");
 
         flags.set_shots_allowed(true);
         let seen = drive(&mut session, &flags, |s| kinds(s).contains(&"finished"));
-        let trigger = seen.iter().find_map(|e| match e {
-            FrpEvent::ShotTrigger { key, .. } => Some(key.shot_number),
+        let trigger = bodies(&seen).find_map(|b| match b {
+            FrpBody::ShotTrigger(t) => Some(t.key.shot_number),
             _ => None,
         });
         assert_eq!(trigger, Some(1));
     }
 
     #[test]
-    fn close_reports_not_ready() {
+    fn close_reports_not_armed() {
         let mut driver = MockDriver::new(MockConfig::default()).unwrap();
         let session = connect(&mut driver, None);
         let flags = HostFlags::new();
         let mut seen = Vec::new();
-        let mut sink = |e: DeviceEvent| {
-            if let DeviceEvent::Frp(f) = e {
-                seen.push(f);
-            }
-        };
+        let mut sink = |e: DeviceEvent| seen.push(e);
         session.close(&mut Events::new(&mut sink, &flags)).unwrap();
-        assert_eq!(ready_values(&seen), ["false"]);
+        assert_eq!(blocker_values(&seen), ["not_armed"]);
     }
 
     #[test]

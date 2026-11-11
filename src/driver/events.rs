@@ -1,11 +1,14 @@
 //! What a driver emits: [`DeviceEvent`] and the [`Events`] sink.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::types::blockers;
 use crate::{
-    ClubData, FaceImpact, FlightResult, FrpEvent, Launch, RawDir, RawFrame, Severity, ShotKey,
+    BusAlert, ClubData, FaceImpact, FlightResult, FrpBody, Launch, RawDir, RawFrame, Severity,
+    ShotClub, ShotFinished, ShotFlight, ShotImpact, ShotKey, ShotLaunch, ShotTrigger,
 };
 
 /// Log severity of a [`DeviceEvent::Log`] line, lowest first.
@@ -54,10 +57,14 @@ impl fmt::Display for Level {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum DeviceEvent {
-    /// An FRP event of this device: shot lifecycle, `device_telemetry`, a
-    /// device `alert` or a `raw_frame`. The host wraps it in an envelope
-    /// with the session's [`identity().device`](crate::driver::DeviceIdentity::device).
-    Frp(FrpEvent),
+    /// A message body of this launch monitor: a `shot.*` message or a
+    /// `bus.alert`. The host publishes it with the actor's id as `from`;
+    /// other kinds are not the driver's to send, and the host drops them.
+    Frp(FrpBody),
+    /// A change to the status in the actor's `bus.actor`: blockers, battery,
+    /// attitude, telemetry. The host merges it and republishes `bus.actor`
+    /// when something changed.
+    Status(DeviceStatus),
     /// Where a connect or a (re)configure is, for status displays:
     /// `"discovering"`, `"connecting"`, `"handshaking"`, `"configuring"`,
     /// `"arming"`, `"measuring"`. Host-only.
@@ -70,6 +77,26 @@ pub enum DeviceEvent {
     ShotDiscarded,
 }
 
+/// A change to a launch monitor's status, as a driver reports it. Each field
+/// that is set replaces the host's value; `telemetry` keys merge into the
+/// host's. Build one with [`Default`] and struct update syntax, or use the
+/// [`Events`] helpers.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct DeviceStatus {
+    /// The device's reasons a shot shouldn't be taken now, all of them;
+    /// empty when it sees none. See [`blockers`].
+    pub blockers: Option<Vec<String>>,
+    /// Battery charge, 0 to 100 percent.
+    pub battery_pct: Option<u8>,
+    /// Device attitude, degrees.
+    pub tilt: Option<f64>,
+    /// Device attitude, degrees.
+    pub roll: Option<f64>,
+    /// Free key/value pairs, for display only.
+    pub telemetry: BTreeMap<String, String>,
+}
+
 /// Flags and limits the host keeps live for a driver to read through
 /// [`Events`].
 #[derive(Debug)]
@@ -80,7 +107,7 @@ pub struct HostFlags {
 }
 
 impl Default for HostFlags {
-    /// No one wants raw frames, shots are allowed, every log level is on.
+    /// Raw frames off, shots allowed, every log level on.
     fn default() -> Self {
         Self {
             wants_raw: AtomicBool::new(false),
@@ -97,7 +124,7 @@ impl HostFlags {
         Self::default()
     }
 
-    /// Whether any consumer wants `raw_frame` events right now.
+    /// Whether the actor's configuration turns raw frames on.
     pub fn set_wants_raw(&self, wanted: bool) {
         self.wants_raw.store(wanted, Ordering::SeqCst);
     }
@@ -113,7 +140,7 @@ impl HostFlags {
         self.min_level.store(level.to_u8(), Ordering::SeqCst);
     }
 
-    /// Whether any consumer wants `raw_frame` events right now.
+    /// Whether the actor's configuration turns raw frames on.
     #[must_use]
     pub fn wants_raw(&self) -> bool {
         self.wants_raw.load(Ordering::SeqCst)
@@ -164,21 +191,25 @@ impl<'a> Events<'a> {
         (self.sink)(event);
     }
 
-    /// Push an FRP event.
-    pub fn frp(&mut self, event: FrpEvent) {
-        self.emit(DeviceEvent::Frp(event));
+    /// Push a message body.
+    pub fn frp(&mut self, body: impl Into<FrpBody>) {
+        self.emit(DeviceEvent::Frp(body.into()));
     }
 
-    /// Whether any consumer wants `raw_frame` events right now. Live: a
-    /// controller can ask for them, or stop, at any time. Skip building
-    /// frames while it is `false`.
+    /// Push a status change.
+    pub fn status(&mut self, status: DeviceStatus) {
+        self.emit(DeviceEvent::Status(status));
+    }
+
+    /// Whether raw frames are on: the host's configuration for the actor
+    /// decides. Skip building frames while it is `false`.
     #[must_use]
     pub fn wants_raw(&self) -> bool {
         self.flags.wants_raw()
     }
 
     /// Whether a virtual driver may start a shot now. Check it before
-    /// numbering a shot or sending `ready=false`, and ask again later when
+    /// numbering a shot or raising a blocker for it, and ask again later when
     /// it is `false`.
     #[must_use]
     pub fn shots_allowed(&self) -> bool {
@@ -192,72 +223,97 @@ impl<'a> Events<'a> {
         level >= self.flags.min_level()
     }
 
-    /// `shot_trigger` without a timestamp.
+    /// `shot.trigger` without a timestamp.
     pub fn shot_trigger(&mut self, key: ShotKey) {
-        self.frp(FrpEvent::shot_trigger(key));
+        self.frp(ShotTrigger::new(key));
     }
 
-    /// `shot_trigger` with the strike time in milliseconds since the Unix
+    /// `shot.trigger` with the strike time in milliseconds since the Unix
     /// epoch (UTC).
     pub fn shot_trigger_at(&mut self, key: ShotKey, timestamp_ms: u64) {
-        self.frp(FrpEvent::shot_trigger_at(key, timestamp_ms));
+        self.frp(ShotTrigger::at(key, timestamp_ms));
     }
 
-    /// `launch`.
+    /// `shot.launch`.
     pub fn launch(&mut self, key: ShotKey, launch: Launch) {
-        self.frp(FrpEvent::launch(key, launch));
+        self.frp(ShotLaunch { key, launch });
     }
 
-    /// `flight_result`.
-    pub fn flight_result(&mut self, key: ShotKey, flight: FlightResult) {
-        self.frp(FrpEvent::flight_result(key, flight));
+    /// `shot.flight`: the launch monitor's own flight result, at most one per
+    /// shot.
+    pub fn flight(&mut self, key: ShotKey, flight: FlightResult) {
+        self.frp(ShotFlight { key, flight });
     }
 
-    /// `club_path`.
-    pub fn club_path(&mut self, key: ShotKey, club: ClubData) {
-        self.frp(FrpEvent::club_path(key, club));
+    /// `shot.club`.
+    pub fn club(&mut self, key: ShotKey, club: ClubData) {
+        self.frp(ShotClub { key, club });
     }
 
-    /// `face_impact`.
-    pub fn face_impact(&mut self, key: ShotKey, impact: FaceImpact) {
-        self.frp(FrpEvent::face_impact(key, impact));
+    /// `shot.impact`.
+    pub fn impact(&mut self, key: ShotKey, impact: FaceImpact) {
+        self.frp(ShotImpact { key, impact });
     }
 
-    /// `shot_finished`.
+    /// `shot.finished`.
     pub fn shot_finished(&mut self, key: ShotKey) {
-        self.frp(FrpEvent::shot_finished(key));
+        self.frp(ShotFinished { key });
     }
 
-    /// `device_telemetry` with these keys. Send only what changed: the host
-    /// merges, and stamps `source`.
+    /// Replace the device's blockers with `list` (empty: nothing in the
+    /// way). Standard names are in [`blockers`].
+    pub fn blockers<S: Into<String>>(&mut self, list: impl IntoIterator<Item = S>) {
+        self.status(DeviceStatus {
+            blockers: Some(list.into_iter().map(Into::into).collect()),
+            ..DeviceStatus::default()
+        });
+    }
+
+    /// `ready(true)` clears the blockers; `ready(false)` sets them to
+    /// [`blockers::NOT_ARMED`].
+    pub fn ready(&mut self, ready: bool) {
+        if ready {
+            self.blockers(Vec::<String>::new());
+        } else {
+            self.blockers([blockers::NOT_ARMED]);
+        }
+    }
+
+    /// The battery charge, 0 to 100 percent (more is read as 100).
+    pub fn battery(&mut self, pct: u8) {
+        self.status(DeviceStatus {
+            battery_pct: Some(pct.min(100)),
+            ..DeviceStatus::default()
+        });
+    }
+
+    /// The device attitude, degrees.
+    pub fn attitude(&mut self, tilt: f64, roll: f64) {
+        self.status(DeviceStatus {
+            tilt: Some(tilt),
+            roll: Some(roll),
+            ..DeviceStatus::default()
+        });
+    }
+
+    /// Free telemetry keys, for display only. Send only what changed: the
+    /// host merges.
     pub fn telemetry<K: Into<String>, V: Into<String>>(
         &mut self,
         pairs: impl IntoIterator<Item = (K, V)>,
     ) {
-        let telemetry = pairs
-            .into_iter()
-            .map(|(k, v)| (k.into(), v.into()))
-            .collect();
-        self.frp(FrpEvent::DeviceTelemetry {
-            manufacturer: None,
-            model: None,
-            firmware: None,
-            source: None,
-            telemetry: Some(telemetry),
+        self.status(DeviceStatus {
+            telemetry: pairs
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+            ..DeviceStatus::default()
         });
     }
 
-    /// The standard `ready` telemetry key.
-    pub fn ready(&mut self, ready: bool) {
-        self.telemetry([("ready", ready.to_string())]);
-    }
-
-    /// A device `alert`.
+    /// A `bus.alert`.
     pub fn alert(&mut self, severity: Severity, message: impl Into<String>) {
-        self.frp(FrpEvent::Alert {
-            severity,
-            message: message.into(),
-        });
+        self.frp(BusAlert::new(severity, message));
     }
 
     /// A [`DeviceEvent::Phase`].
@@ -277,10 +333,10 @@ impl<'a> Events<'a> {
         self.emit(DeviceEvent::ShotDiscarded);
     }
 
-    /// A `raw_frame` of one protocol message, stamped with the current time,
-    /// with `seq` left at 0 for the host to number. Does nothing while
-    /// nobody [`wants_raw`](Self::wants_raw). The caller makes sure the
-    /// message carries no device or user identity; those go to
+    /// A `shot.raw` of one protocol message, stamped with the current time,
+    /// with `seq` left at 0 for the host to number. Does nothing while raw
+    /// frames are off ([`wants_raw`](Self::wants_raw)). The caller makes sure
+    /// the message carries no device or user identity; those go to
     /// [`audit`](Self::audit).
     pub fn raw(&mut self, dir: RawDir, label: impl Into<String>, data: &[u8]) {
         if !self.wants_raw() {
@@ -291,10 +347,10 @@ impl<'a> Events<'a> {
             label: Some(label.into()),
             ..RawFrame::new(dir, 0, data.to_vec())
         };
-        self.frp(FrpEvent::raw_frame(frame));
+        self.frp(FrpBody::ShotRaw(frame));
     }
 
-    /// A message that must not leave the machine as a `raw_frame`, such as
+    /// A message that must not leave the machine as a `shot.raw`, such as
     /// one that carries identity: a trace log line with the hex, only when
     /// the host shows trace lines.
     pub fn audit(&mut self, dir: RawDir, label: &str, data: &[u8]) {
@@ -338,13 +394,13 @@ mod tests {
     }
 
     #[test]
-    fn builders_make_the_matching_frp_events() {
+    fn builders_make_the_matching_messages() {
         let flags = HostFlags::new();
         let key = ShotKey::new("id", 1);
         let seen = collect(&flags, |out| {
             out.shot_trigger(key.clone());
             out.shot_finished(key.clone());
-            out.ready(true);
+            out.ready(false);
             out.alert(Severity::Warn, "careful");
         });
         let [trigger, finished, ready, alert] = &seen[..] else {
@@ -352,31 +408,57 @@ mod tests {
         };
         assert!(matches!(
             trigger,
-            DeviceEvent::Frp(FrpEvent::ShotTrigger {
+            DeviceEvent::Frp(FrpBody::ShotTrigger(ShotTrigger {
                 timestamp: None,
                 ..
-            })
+            }))
         ));
         assert!(matches!(
             finished,
-            DeviceEvent::Frp(FrpEvent::ShotFinished { .. })
+            DeviceEvent::Frp(FrpBody::ShotFinished(_))
         ));
-        let DeviceEvent::Frp(FrpEvent::DeviceTelemetry {
-            telemetry: Some(t),
-            source: None,
-            ..
-        }) = ready
-        else {
+        let DeviceEvent::Status(status) = ready else {
             panic!("{ready:?}");
         };
-        assert_eq!(t.get("ready").map(String::as_str), Some("true"));
+        assert_eq!(
+            status.blockers.as_deref(),
+            Some(&["not_armed".to_owned()][..])
+        );
         assert!(matches!(
             alert,
-            DeviceEvent::Frp(FrpEvent::Alert {
+            DeviceEvent::Frp(FrpBody::BusAlert(BusAlert {
                 severity: Severity::Warn,
                 ..
-            })
+            }))
         ));
+    }
+
+    #[test]
+    fn status_helpers_set_one_field_each() {
+        let flags = HostFlags::new();
+        let seen = collect(&flags, |out| {
+            out.ready(true);
+            out.blockers(["no_ball"]);
+            out.battery(140);
+            out.attitude(0.4, -0.2);
+            out.telemetry([("radar_mode", "armed")]);
+        });
+        let statuses: Vec<&DeviceStatus> = seen
+            .iter()
+            .map(|e| match e {
+                DeviceEvent::Status(s) => s,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(statuses[0].blockers, Some(vec![]));
+        assert_eq!(statuses[1].blockers, Some(vec!["no_ball".to_owned()]));
+        assert_eq!(statuses[2].battery_pct, Some(100));
+        assert_eq!(
+            (statuses[3].tilt, statuses[3].roll),
+            (Some(0.4), Some(-0.2))
+        );
+        assert_eq!(statuses[4].telemetry["radar_mode"], "armed");
+        assert_eq!(statuses[4].blockers, None, "untouched fields stay unset");
     }
 
     #[test]
@@ -387,7 +469,7 @@ mod tests {
         let seen = collect(&flags, |out| {
             out.raw(RawDir::Tx, "tx result", &[0xde, 0xad]);
         });
-        let [DeviceEvent::Frp(FrpEvent::RawFrame(frame))] = &seen[..] else {
+        let [DeviceEvent::Frp(FrpBody::ShotRaw(frame))] = &seen[..] else {
             panic!("{seen:?}");
         };
         assert_eq!(frame.dir, RawDir::Tx);

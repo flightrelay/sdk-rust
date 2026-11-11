@@ -1,41 +1,30 @@
-//! Role- and direction-agnostic FRP transport.
+//! The WebSocket binding of FRP.
 //!
-//! Requires the `transport` feature.
+//! Requires the `transport` feature. One message per text frame; the default
+//! URL is `ws://localhost:5880/frp`. There is no handshake beyond the
+//! WebSocket upgrade: on connecting, each side sends `bus.actor` for each
+//! actor it hosts, then the state those actors own, then `bus.sync`
+//! ([`FrpConnection::greet`]).
 //!
-//! FRP roles are entity names, not directions: a **device** emits shot data and
-//! accepts commands, a **controller** receives shot data and sends commands.
-//! Either role may open the WebSocket or accept it. [`FrpEndpoint`] separates
-//! these two axes — [`Role`] decides the handshake direction, [`Transport`]
-//! decides who opens the socket.
-//!
-//! # Device serving controllers
-//!
-//! ```no_run
-//! use flightrelay::{EndpointConfig, FrpEndpoint, Role, Transport};
-//!
-//! let mut ep = FrpEndpoint::open(
-//!     EndpointConfig::new(Role::Device, Transport::listen("0.0.0.0:5880")),
-//! )?;
-//! let mut conn = ep.establish()?;
-//! println!("controller connected: {:?}", conn.peer_name());
-//! # Ok::<(), flightrelay::FrpError>(())
-//! ```
-//!
-//! # Device bridging out to a central controller
+//! Either side may open the socket. [`Transport`] picks whether an endpoint
+//! listens or dials; once connected, both sides are peers on the bus.
 //!
 //! ```no_run
-//! use flightrelay::{EndpointConfig, FrpEndpoint, Role, Transport};
+//! use flightrelay::{BusActor, EndpointConfig, FrpEndpoint, FrpMessage, Transport};
 //!
-//! let mut ep = FrpEndpoint::open(
-//!     EndpointConfig::new(Role::Device, Transport::connect("ws://flighthook:5880/frp"))
-//!         .with_name("ironsight"),
-//! )?;
+//! let mut ep = FrpEndpoint::open(EndpointConfig::new(Transport::connect("ws://hub:5880/frp")))?;
 //! let mut conn = ep.establish()?;
+//! let me = FrpMessage::new("e4a7136b9f02cd58", BusActor::new("Fairway Physics", 2.0));
+//! conn.greet(&[me], &[])?; // `bus.actor`, no state of its own, then `bus.sync`
+//! loop {
+//!     let msg = conn.recv()?;
+//!     println!("{} from {}", msg.kind(), msg.from);
+//! }
 //! # Ok::<(), flightrelay::FrpError>(())
 //! ```
 
 use std::fmt;
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -45,39 +34,8 @@ use tungstenite::protocol::{WebSocket, WebSocketConfig};
 use tungstenite::stream::MaybeTlsStream;
 
 use crate::error::FrpError;
-use crate::message::{FrpEnvelope, FrpMessage, FrpProtocolMessage, Severity};
-
-/// The FRP role this endpoint plays.
-///
-/// Roles are independent of transport direction — either role may open or
-/// accept the WebSocket connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    /// Emits shot data and accepts commands. Answers `start` with `init`.
-    Device,
-    /// Receives shot data and sends commands. Initiates the `start` handshake.
-    Controller,
-}
-
-impl Role {
-    /// The role of the peer on the other end of the connection.
-    #[must_use]
-    pub fn peer(self) -> Self {
-        match self {
-            Self::Device => Self::Controller,
-            Self::Controller => Self::Device,
-        }
-    }
-}
-
-impl fmt::Display for Role {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Device => f.write_str("device"),
-            Self::Controller => f.write_str("controller"),
-        }
-    }
-}
+use crate::kinds::BusSync;
+use crate::message::FrpMessage;
 
 /// How this endpoint obtains a WebSocket connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,17 +63,10 @@ impl Transport {
 /// Configuration for an [`FrpEndpoint`].
 #[derive(Debug, Clone)]
 pub struct EndpointConfig {
-    /// The FRP role this endpoint plays.
-    pub role: Role,
     /// How this endpoint obtains a connection.
     pub transport: Transport,
-    /// Human-readable identifier sent in `start`. Only used by [`Role::Controller`].
-    pub name: String,
-    /// Whether to ask the device for `raw_frame` events in `start`. Only used
-    /// by [`Role::Controller`].
-    pub raw_frames: bool,
-    /// How long a handshake may take, from the connection opening to the
-    /// last handshake message. `None` waits as long as the peer does.
+    /// How long the WebSocket upgrade may take, from the connection opening
+    /// to the upgrade's answer. `None` waits as long as the peer does.
     pub handshake_timeout: Option<Duration>,
     /// How many bytes a connection may queue for a peer that reads slowly
     /// before a send fails with a write-buffer-full error. Only a
@@ -136,39 +87,19 @@ const ACCEPT_POLL: Duration = Duration::from_millis(100);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl EndpointConfig {
-    /// A config for `role` over `transport`, named `"anonymous"`.
-    ///
-    /// The handshake proposes and accepts only
-    /// [`SPEC_VERSION`](crate::SPEC_VERSION).
+    /// A config over `transport`, with no upgrade timeout and the
+    /// [`DEFAULT_WRITE_BUFFER_LIMIT`].
     #[must_use]
-    pub fn new(role: Role, transport: Transport) -> Self {
+    pub fn new(transport: Transport) -> Self {
         Self {
-            role,
             transport,
-            name: "anonymous".to_owned(),
-            raw_frames: false,
             handshake_timeout: None,
             write_buffer_limit: DEFAULT_WRITE_BUFFER_LIMIT,
         }
     }
 
-    /// Set the human-readable identifier sent in `start`.
-    #[must_use]
-    pub fn with_name(mut self, name: impl Into<String>) -> Self {
-        self.name = name.into();
-        self
-    }
-
-    /// Set whether a controller asks the device for `raw_frame` events in
-    /// `start`.
-    #[must_use]
-    pub fn with_raw_frames(mut self, raw_frames: bool) -> Self {
-        self.raw_frames = raw_frames;
-        self
-    }
-
-    /// Limit how long a handshake may take, so a peer that connects and says
-    /// nothing cannot hold the endpoint.
+    /// Limit how long the WebSocket upgrade may take, so a peer that connects
+    /// and says nothing cannot hold the endpoint.
     #[must_use]
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = Some(timeout);
@@ -189,7 +120,7 @@ impl EndpointConfig {
     }
 }
 
-/// An FRP participant: a role plus a way of obtaining connections.
+/// A way of obtaining FRP connections: a listener, or a URL to dial.
 ///
 /// An endpoint is long-lived and outlives the connections it produces. Call
 /// [`establish`](Self::establish) again to reconnect — the caller owns any
@@ -208,19 +139,10 @@ impl FrpEndpoint {
     /// Returns an error if the TCP listener cannot bind.
     pub fn open(config: EndpointConfig) -> Result<Self, FrpError> {
         let listener = match &config.transport {
-            Transport::Listen(addr) => Some(
-                TcpListener::bind(addr)
-                    .map_err(|e| FrpError::WebSocket(Box::new(tungstenite::Error::Io(e))))?,
-            ),
+            Transport::Listen(addr) => Some(TcpListener::bind(addr).map_err(io_error)?),
             Transport::Connect(_) => None,
         };
         Ok(Self { config, listener })
-    }
-
-    /// The role this endpoint plays.
-    #[must_use]
-    pub fn role(&self) -> Role {
-        self.config.role
     }
 
     /// The local address of the bound listener, for [`Transport::Listen`].
@@ -230,24 +152,20 @@ impl FrpEndpoint {
     /// Returns an error if the address cannot be read.
     pub fn local_addr(&self) -> Result<Option<std::net::SocketAddr>, FrpError> {
         match &self.listener {
-            Some(l) => l
-                .local_addr()
-                .map(Some)
-                .map_err(|e| FrpError::WebSocket(Box::new(tungstenite::Error::Io(e)))),
+            Some(l) => l.local_addr().map(Some).map_err(io_error),
             None => Ok(None),
         }
     }
 
-    /// Obtain a handshake-complete [`FrpConnection`].
-    ///
-    /// Blocks accepting an inbound connection ([`Transport::Listen`]) or dials
-    /// the configured URL ([`Transport::Connect`]), then performs the FRP
-    /// handshake in the direction determined by [`Role`]. The handshake is
-    /// bounded by [`EndpointConfig::handshake_timeout`] when one is set.
+    /// Obtain a connection: accept an inbound one ([`Transport::Listen`]) or
+    /// dial the configured URL ([`Transport::Connect`]), and complete the
+    /// WebSocket upgrade, bounded by [`EndpointConfig::handshake_timeout`]
+    /// when one is set. Nothing is sent on the new connection; call
+    /// [`FrpConnection::greet`] next.
     ///
     /// # Errors
     ///
-    /// Returns an error if the connection or the FRP handshake fails.
+    /// Returns an error if the connection or the WebSocket upgrade fails.
     pub fn establish(&mut self) -> Result<FrpConnection, FrpError> {
         let never = AtomicBool::new(false);
         match self.establish_inner(&never, false)? {
@@ -264,12 +182,12 @@ impl FrpEndpoint {
     /// does not follow HTTP redirects, which [`establish`](Self::establish)
     /// does when nothing bounds or cancels the dial). Once a peer has
     /// connected, only [`EndpointConfig::handshake_timeout`] bounds the
-    /// handshake, so set one to keep a peer that connects and says nothing
+    /// upgrade, so set one to keep a peer that connects and says nothing
     /// from holding the call.
     ///
     /// # Errors
     ///
-    /// Returns an error if the connection or the FRP handshake fails.
+    /// Returns an error if the connection or the WebSocket upgrade fails.
     pub fn establish_until(
         &mut self,
         stop: &AtomicBool,
@@ -293,14 +211,14 @@ impl FrpEndpoint {
                 } else {
                     listener.accept().map_err(io_error)?.0
                 };
-                // The handshake clock starts when the peer connects.
+                // The upgrade clock starts when the peer connects.
                 let deadline = self.config.handshake_timeout.map(|t| Instant::now() + t);
                 stream.set_nonblocking(false).map_err(io_error)?;
                 arm(&stream, deadline)?;
                 let socket =
                     tungstenite::accept_with_config(MaybeTlsStream::Plain(stream), Some(ws))
                         .map_err(|e| handshake_error(e, deadline))?;
-                self.finish(socket, deadline).map(Some)
+                finish(socket).map(Some)
             }
             (Transport::Connect(url), _)
                 if !cancelable && self.config.handshake_timeout.is_none() =>
@@ -308,7 +226,7 @@ impl FrpEndpoint {
                 // Nothing to bound or cancel: the plain blocking connect, which
                 // follows HTTP redirects.
                 let socket = tungstenite::client::connect_with_config(url.as_str(), Some(ws), 3)?.0;
-                self.finish(socket, None).map(Some)
+                finish(socket).map(Some)
             }
             (Transport::Connect(url), _) => {
                 let deadline = self.config.handshake_timeout.map(|t| Instant::now() + t);
@@ -329,123 +247,25 @@ impl FrpEndpoint {
                 )
                 .map_err(|e| handshake_error(e, deadline))?
                 .0;
-                self.finish(socket, deadline).map(Some)
+                finish(socket).map(Some)
             }
             (Transport::Listen(_), None) => Err(FrpError::Handshake("listener not bound".into())),
         }
     }
+}
 
-    fn finish(&self, socket: Socket, deadline: Option<Instant>) -> Result<FrpConnection, FrpError> {
-        let conn = match self.config.role {
-            Role::Controller => self.handshake_as_controller(socket, deadline),
-            Role::Device => Self::handshake_as_device(socket, deadline),
-        }?;
-        // The handshake's timeouts do not apply to the connection's life.
-        if let MaybeTlsStream::Plain(tcp) = conn.socket.get_ref() {
+/// A connection out of the upgrade: the upgrade's timeouts do not apply to
+/// the connection's life.
+fn finish(socket: Socket) -> Result<FrpConnection, FrpError> {
+    let peer = match socket.get_ref() {
+        MaybeTlsStream::Plain(tcp) => {
             tcp.set_read_timeout(None).map_err(io_error)?;
             tcp.set_write_timeout(None).map_err(io_error)?;
+            tcp.peer_addr().ok()
         }
-        Ok(conn)
-    }
-
-    /// Send `start` proposing [`SPEC_VERSION`](crate::SPEC_VERSION), await
-    /// `init` confirming it.
-    fn handshake_as_controller(
-        &self,
-        mut socket: Socket,
-        deadline: Option<Instant>,
-    ) -> Result<FrpConnection, FrpError> {
-        let start = FrpProtocolMessage::Start {
-            version: vec![crate::SPEC_VERSION.to_owned()],
-            name: Some(self.config.name.clone()),
-            raw_frames: self.config.raw_frames,
-        };
-        socket.send(Message::text(serde_json::to_string(&start)?))?;
-
-        loop {
-            match read_by(&mut socket, deadline)? {
-                Message::Text(text) => match FrpMessage::parse(&text) {
-                    Ok(FrpMessage::Protocol(FrpProtocolMessage::Init { version })) => {
-                        if version != crate::SPEC_VERSION {
-                            let message = format!("Unsupported FRP version {version:?}");
-                            let alert = FrpProtocolMessage::Alert {
-                                severity: Severity::Critical,
-                                message: message.clone(),
-                            };
-                            // Best effort: the peer may already be gone, and the
-                            // caller needs to see the rejection either way.
-                            let _ = socket.send(Message::text(serde_json::to_string(&alert)?));
-                            let _ = socket.close(None);
-                            return Err(FrpError::Handshake(message));
-                        }
-                        return Ok(FrpConnection {
-                            socket,
-                            role: Role::Controller,
-                            version,
-                            peer_name: None,
-                            raw_frames: self.config.raw_frames,
-                        });
-                    }
-                    Ok(FrpMessage::Protocol(FrpProtocolMessage::Alert {
-                        severity: Severity::Critical,
-                        message,
-                    })) => return Err(FrpError::Handshake(message)),
-                    _ => {}
-                },
-                Message::Close(_) => return Err(FrpError::Closed),
-                _ => {}
-            }
-        }
-    }
-
-    /// Await `start`, reply `init` with [`SPEC_VERSION`](crate::SPEC_VERSION)
-    /// when the controller proposed it.
-    fn handshake_as_device(
-        mut socket: Socket,
-        deadline: Option<Instant>,
-    ) -> Result<FrpConnection, FrpError> {
-        let (peer_versions, peer_name, raw_frames) = loop {
-            match read_by(&mut socket, deadline)? {
-                Message::Text(text) => {
-                    if let Ok(FrpMessage::Protocol(FrpProtocolMessage::Start {
-                        version,
-                        name,
-                        raw_frames,
-                    })) = FrpMessage::parse(&text)
-                    {
-                        break (version, name, raw_frames);
-                    }
-                }
-                Message::Close(_) => return Err(FrpError::Closed),
-                _ => {}
-            }
-        };
-
-        let Some(version) = select_version(&peer_versions) else {
-            let alert = FrpProtocolMessage::Alert {
-                severity: Severity::Critical,
-                message: "No compatible FRP version".into(),
-            };
-            // Best effort: the peer may already be gone, and the caller needs
-            // to see the rejection either way.
-            let _ = socket.send(Message::text(serde_json::to_string(&alert)?));
-            let _ = socket.close(None);
-            return Err(FrpError::Handshake("No compatible FRP version".into()));
-        };
-
-        let init = FrpProtocolMessage::Init {
-            version: version.clone(),
-        };
-        socket.send(Message::text(serde_json::to_string(&init)?))?;
-
-        Ok(FrpConnection {
-            socket,
-            role: Role::Device,
-            version,
-            peer_name,
-            raw_frames,
-        })
-    }
+        _ => None,
+    };
+    Ok(FrpConnection { socket, peer })
 }
 
 fn io_error(e: std::io::Error) -> FrpError {
@@ -527,21 +347,6 @@ fn arm(stream: &TcpStream, deadline: Option<Instant>) -> Result<(), FrpError> {
     stream.set_write_timeout(Some(left)).map_err(io_error)
 }
 
-/// One handshake read, limited by the deadline.
-fn read_by(socket: &mut Socket, deadline: Option<Instant>) -> Result<Message, FrpError> {
-    if deadline.is_some()
-        && let MaybeTlsStream::Plain(tcp) = socket.get_ref()
-    {
-        arm(tcp, deadline)?;
-    }
-    match socket.read() {
-        Err(tungstenite::Error::Io(e)) if deadline.is_some() && is_timeout(&e) => {
-            Err(FrpError::Handshake("handshake timed out".into()))
-        }
-        other => Ok(other?),
-    }
-}
-
 fn handshake_error<R: tungstenite::handshake::HandshakeRole>(
     e: tungstenite::HandshakeError<R>,
     deadline: Option<Instant>,
@@ -565,7 +370,6 @@ fn handshake_error<R: tungstenite::handshake::HandshakeRole>(
 impl fmt::Debug for FrpEndpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrpEndpoint")
-            .field("role", &self.config.role)
             .field("transport", &self.config.transport)
             .finish_non_exhaustive()
     }
@@ -573,44 +377,39 @@ impl fmt::Debug for FrpEndpoint {
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
-/// A handshake-complete FRP connection.
-///
-/// Both roles send and receive: devices emit envelopes and accept commands,
-/// controllers send commands and receive envelopes.
+/// One WebSocket connection carrying FRP messages, one per text frame.
 pub struct FrpConnection {
     socket: Socket,
-    role: Role,
-    version: String,
-    peer_name: Option<String>,
-    raw_frames: bool,
+    peer: Option<SocketAddr>,
 }
 
 impl FrpConnection {
-    /// The role of this side of the connection.
+    /// The peer's address, when known.
     #[must_use]
-    pub fn role(&self) -> Role {
-        self.role
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer
     }
 
-    /// The FRP version negotiated during the handshake.
-    #[must_use]
-    pub fn version(&self) -> &str {
-        &self.version
-    }
-
-    /// The peer's `name` from `start`, when this side is the [`Role::Device`].
-    #[must_use]
-    pub fn peer_name(&self) -> Option<&str> {
-        self.peer_name.as_deref()
-    }
-
-    /// Whether the controller asked for `raw_frame` events with `raw_frames`
-    /// in its `start`. On the [`Role::Device`] side, send raw frames only
-    /// when this is `true`; on the [`Role::Controller`] side, it is what this
-    /// endpoint asked for.
-    #[must_use]
-    pub fn raw_frames_requested(&self) -> bool {
-        self.raw_frames
+    /// What a side sends on connecting, in the order the spec gives: each
+    /// message of `actors` (the `bus.actor` of each actor it hosts), then
+    /// each message of `state` (the current state those actors own, e.g. a
+    /// `golfer.turn`), then one `bus.sync` from the first actor, so the other
+    /// side's actors republish their state. Every `bus.actor` goes before any
+    /// state, so a receiver knows each state's actor when the state arrives.
+    /// Sends nothing when `actors` is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a message cannot be serialized or sent; what was
+    /// sent before it stays sent.
+    pub fn greet(&mut self, actors: &[FrpMessage], state: &[FrpMessage]) -> Result<(), FrpError> {
+        let Some(first) = actors.first() else {
+            return Ok(());
+        };
+        for msg in actors.iter().chain(state) {
+            self.send(msg)?;
+        }
+        self.send(&FrpMessage::new(first.from.clone(), BusSync {}))
     }
 
     /// Set the underlying TCP stream to non-blocking mode.
@@ -620,36 +419,40 @@ impl FrpConnection {
     /// Returns an error if the TCP stream mode cannot be set.
     pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), FrpError> {
         match self.socket.get_ref() {
-            MaybeTlsStream::Plain(tcp) => tcp
-                .set_nonblocking(nonblocking)
-                .map_err(|e| FrpError::WebSocket(Box::new(tungstenite::Error::Io(e)))),
+            MaybeTlsStream::Plain(tcp) => tcp.set_nonblocking(nonblocking).map_err(io_error),
             _ => Ok(()),
         }
     }
 
-    /// Block until the next [`FrpMessage`] arrives.
-    ///
-    /// An envelope whose event the spec has a controller ignore, such as a
-    /// `flight_result` without a recognized `basis`, arrives with an
-    /// [`FrpEvent::Unknown`](crate::FrpEvent::Unknown) event.
+    /// Block until the next message arrives, and parse it.
     ///
     /// # Errors
     ///
-    /// Returns [`FrpError::Json`] for a message that isn't valid FRP JSON.
-    /// That error is about the one message: the connection stays open, and
-    /// the next call reads the next message. Other errors mean the
-    /// connection failed or closed.
+    /// Returns [`FrpError::Json`] for a message that isn't an FRP message
+    /// (see [`FrpMessage::parse`]). That error is about the one message: the
+    /// connection stays open, and the next call reads the next message.
+    /// Other errors mean the connection failed or closed.
     pub fn recv(&mut self) -> Result<FrpMessage, FrpError> {
+        FrpMessage::parse(&self.recv_text()?)
+    }
+
+    /// Block until the next message arrives, and return its text as it came,
+    /// e.g. to forward it unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection failed or closed.
+    pub fn recv_text(&mut self) -> Result<String, FrpError> {
         loop {
             match self.socket.read()? {
-                Message::Text(text) => return FrpMessage::parse(&text),
+                Message::Text(text) => return Ok(text.as_str().to_owned()),
                 Message::Close(_) => return Err(FrpError::Closed),
                 _ => {}
             }
         }
     }
 
-    /// Poll for the next message without blocking.
+    /// Poll for the next message without blocking, and parse it.
     ///
     /// Returns `Ok(None)` when no message is immediately available (requires
     /// [`set_nonblocking(true)`](Self::set_nonblocking)).
@@ -659,9 +462,20 @@ impl FrpConnection {
     /// As for [`recv`](Self::recv): [`FrpError::Json`] is about the one
     /// message and the connection stays open.
     pub fn try_recv(&mut self) -> Result<Option<FrpMessage>, FrpError> {
+        self.try_recv_text()?
+            .map(|text| FrpMessage::parse(&text))
+            .transpose()
+    }
+
+    /// Poll for the next message's text without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection failed or closed.
+    pub fn try_recv_text(&mut self) -> Result<Option<String>, FrpError> {
         loop {
             match self.socket.read() {
-                Ok(Message::Text(text)) => return Ok(Some(FrpMessage::parse(&text)?)),
+                Ok(Message::Text(text)) => return Ok(Some(text.as_str().to_owned())),
                 Ok(Message::Close(_)) => return Err(FrpError::Closed),
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(ref e))
@@ -674,7 +488,7 @@ impl FrpConnection {
         }
     }
 
-    /// Send an [`FrpMessage`] to the peer.
+    /// Send a message.
     ///
     /// On a non-blocking connection a full socket is not an error: the
     /// message is queued, and it leaves with a later [`flush`](Self::flush)
@@ -686,37 +500,17 @@ impl FrpConnection {
     ///
     /// Returns an error if the message cannot be serialized or sent.
     pub fn send(&mut self, msg: &FrpMessage) -> Result<(), FrpError> {
-        queued(self.socket.send(Message::text(msg.to_json()?)))
+        self.send_text(&msg.to_json()?)
     }
 
-    /// Send an [`FrpEnvelope`] to the peer.
-    ///
-    /// On a non-blocking connection a full socket is not an error: the
-    /// message is queued, and it leaves with a later [`flush`](Self::flush)
-    /// or send. Call [`flush`](Self::flush) regularly (e.g. on each poll of
-    /// the connection): a queued message is otherwise delayed until the next
-    /// send.
+    /// Send message text as it is, e.g. one received on another connection.
+    /// Queues like [`send`](Self::send).
     ///
     /// # Errors
     ///
-    /// Returns an error if the envelope cannot be serialized or sent.
-    pub fn send_envelope(&mut self, env: &FrpEnvelope) -> Result<(), FrpError> {
-        queued(self.socket.send(Message::text(serde_json::to_string(env)?)))
-    }
-
-    /// Send a bare [`FrpProtocolMessage`] to the peer.
-    ///
-    /// On a non-blocking connection a full socket is not an error: the
-    /// message is queued, and it leaves with a later [`flush`](Self::flush)
-    /// or send. Call [`flush`](Self::flush) regularly (e.g. on each poll of
-    /// the connection): a queued message is otherwise delayed until the next
-    /// send.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the message cannot be serialized or sent.
-    pub fn send_protocol(&mut self, msg: &FrpProtocolMessage) -> Result<(), FrpError> {
-        queued(self.socket.send(Message::text(serde_json::to_string(msg)?)))
+    /// Returns an error if the text cannot be sent.
+    pub fn send_text(&mut self, text: &str) -> Result<(), FrpError> {
+        queued(self.socket.send(Message::text(text)))
     }
 
     /// Push queued messages out to the peer. Returns `Ok` when the socket
@@ -778,75 +572,21 @@ fn queued(result: Result<(), tungstenite::Error>) -> Result<(), FrpError> {
 impl fmt::Debug for FrpConnection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrpConnection")
-            .field("role", &self.role)
-            .field("version", &self.version)
-            .field("peer_name", &self.peer_name)
-            .field("raw_frames", &self.raw_frames)
+            .field("peer", &self.peer)
             .finish_non_exhaustive()
     }
-}
-
-/// [`SPEC_VERSION`](crate::SPEC_VERSION) if the controller proposed it. An
-/// endpoint implements exactly one FRP version.
-fn select_version(peer: &[String]) -> Option<String> {
-    peer.iter()
-        .any(|v| v == crate::SPEC_VERSION)
-        .then(|| crate::SPEC_VERSION.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn versions(list: &[&str]) -> Vec<String> {
-        list.iter().map(|&v| v.to_owned()).collect()
-    }
-
     #[test]
-    fn version_selection_accepts_only_the_spec_version() {
-        assert_eq!(crate::SPEC_VERSION, "0.2.0");
-        for peer in [
-            &["0.2.0"][..],
-            &["0.3.0", "0.2.0", "0.1.0"],
-            &["0.1.0", "0.2.0"],
-        ] {
-            assert_eq!(
-                select_version(&versions(peer)),
-                Some("0.2.0".to_owned()),
-                "{peer:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn version_selection_no_match() {
-        for peer in [
-            &["0.1.0"][..],
-            &["0.2.1"],
-            &["0.3.0", "1.0.0"],
-            &["0.2"],
-            &[],
-        ] {
-            assert_eq!(select_version(&versions(peer)), None, "{peer:?}");
-        }
-    }
-
-    #[test]
-    fn roles_are_reciprocal() {
-        assert_eq!(Role::Device.peer(), Role::Controller);
-        assert_eq!(Role::Controller.peer(), Role::Device);
-    }
-
-    #[test]
-    fn config_defaults_to_anonymous() {
-        let cfg = EndpointConfig::new(Role::Device, Transport::listen("0.0.0.0:5880"));
-        assert_eq!(cfg.name, "anonymous");
-    }
-
-    #[test]
-    fn config_asks_for_no_raw_frames_by_default() {
-        let cfg = EndpointConfig::new(Role::Controller, Transport::connect("ws://h:5880/frp"));
-        assert!(!cfg.raw_frames);
-        assert!(cfg.with_raw_frames(true).raw_frames);
+    fn config_defaults() {
+        let cfg = EndpointConfig::new(Transport::listen("0.0.0.0:5880"));
+        assert_eq!(cfg.handshake_timeout, None);
+        assert_eq!(cfg.write_buffer_limit, DEFAULT_WRITE_BUFFER_LIMIT);
+        let cfg = cfg.with_handshake_timeout(Duration::from_secs(1));
+        assert_eq!(cfg.handshake_timeout, Some(Duration::from_secs(1)));
     }
 }

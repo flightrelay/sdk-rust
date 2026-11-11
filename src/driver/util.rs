@@ -1,14 +1,13 @@
 //! Small helpers every driver host and driver shares: [`Stop`], [`Backoff`],
 //! [`Live`], [`ShotIds`] and [`connect_tcp`].
 
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::ShotKey;
+use crate::rand::Rng;
 
 /// A cloneable stop request. The host calls [`stop`](Self::stop) from any
 /// thread; a driver checks it between steps and in long waits.
@@ -174,30 +173,26 @@ pub struct ShotIds(Arc<IdState>);
 #[derive(Debug)]
 struct IdState {
     number: AtomicU32,
-    rng: Mutex<[u64; 2]>,
+    rng: Mutex<Rng>,
 }
 
 impl ShotIds {
     /// A generator with a random seed.
     #[must_use]
     pub fn new() -> Self {
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u8(1);
-        let a = hasher.finish();
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u8(2);
-        let b = hasher.finish();
-        Self::from_seed([a, b])
+        Self::with_rng(Rng::random())
     }
 
     /// A generator with a fixed seed, for tests that want repeatable ids.
     #[must_use]
     pub fn from_seed(seed: [u64; 2]) -> Self {
-        // xorshift128+ must not start at all zeros.
-        let seed = if seed == [0, 0] { [1, 2] } else { seed };
+        Self::with_rng(Rng::from_seed(seed))
+    }
+
+    fn with_rng(rng: Rng) -> Self {
         Self(Arc::new(IdState {
             number: AtomicU32::new(0),
-            rng: Mutex::new(seed),
+            rng: Mutex::new(rng),
         }))
     }
 
@@ -210,7 +205,7 @@ impl ShotIds {
         {
             let mut rng = self.0.rng.lock().unwrap_or_else(PoisonError::into_inner);
             for half in bytes.chunks_mut(8) {
-                half.copy_from_slice(&xorshift128plus(&mut rng).to_be_bytes());
+                half.copy_from_slice(&rng.next_u64().to_be_bytes());
             }
         }
         bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
@@ -229,15 +224,6 @@ impl Default for ShotIds {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn xorshift128plus(state: &mut [u64; 2]) -> u64 {
-    let mut s1 = state[0];
-    let s0 = state[1];
-    state[0] = s0;
-    s1 ^= s1 << 23;
-    state[1] = s1 ^ s0 ^ (s1 >> 18) ^ (s0 >> 5);
-    state[1].wrapping_add(s0)
 }
 
 fn uuid_string(b: &[u8; 16]) -> String {

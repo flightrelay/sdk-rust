@@ -16,12 +16,22 @@
 //! ([`DeviceDriver::retry_delay`]). A session may be `!Send`, and the driver
 //! is `Send`; both are used on one thread.
 //!
-//! A driver emits [`DeviceEvent`]s into an [`Events`] sink: FRP events
-//! (shots, telemetry, alerts, raw frames) and three host-only kinds (phase,
-//! log, shot discarded). It sends each shot lifecycle event once, when it has
-//! it, and leaves out any value the device does not have.
+//! A driver is a launch monitor actor on the bus. It emits [`DeviceEvent`]s
+//! into an [`Events`] sink: `shot.*` messages and alerts, its status (the
+//! `blockers`, battery, attitude and telemetry of its `bus.actor`), and three
+//! host-only kinds (phase, log, shot discarded). It sends each shot message
+//! once, when it has it, and leaves out any value the device does not have.
+//! The host stamps every message with the actor's id and publishes the
+//! actor's `bus.actor`.
 //!
-//! A host that serves FRP controllers is [`FrpServer`](crate::FrpServer)
+//! The driver reads `golfer.turn` as [`TurnHints`]: each turn replaces all
+//! the hints (handedness, club, mode), and a field that is `null` or not
+//! recognized is no hint for that field. The host keeps the last complete
+//! turn's hints when the session actor goes away; the driver applies each
+//! field its device supports and ignores the rest, and decides for itself
+//! what the hardware does when a field is not given.
+//!
+//! A host that runs a driver on the bus is [`FrpServer`](crate::FrpServer)
 //! (feature `server`), and [`run`](crate::run) (feature `main`) is a complete
 //! `main` for it.
 //!
@@ -99,7 +109,7 @@
 //!     fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), Error> {
 //!         if !self.armed {
 //!             self.armed = true;
-//!             out.ready(true);
+//!             out.ready(true); // no blockers
 //!         }
 //!         std::thread::sleep(timeout);
 //!         Ok(())
@@ -122,10 +132,10 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 pub use crate::config::{ConfigError, DriverConfig};
-pub use events::{DeviceEvent, Events, HostFlags, Level};
+pub use events::{DeviceEvent, DeviceStatus, Events, HostFlags, Level};
 pub use util::{Backoff, Live, STABLE_SESSION, ShotIds, Stop, connect_tcp};
 
-use crate::{Club, DetectionMode, Handedness, RawFrame, Source};
+use crate::{Club, GolferTurn, Handedness, Mode, RawFrame, Source};
 
 /// The default [`DeviceDriver::STOP_WAIT`].
 pub const DEFAULT_STOP_WAIT: Duration = Duration::from_secs(3);
@@ -223,14 +233,16 @@ pub trait DeviceSession: Sized {
         out: &mut Events<'_>,
     ) -> Result<(), DriverError<Self::Driver>>;
 
-    /// Latch the fields present in `cmd` and ignore what the device does not
-    /// support (the FRP rules). A driver acts only when a field differs from
-    /// what it has latched. The default ignores the command.
+    /// The tracking hints of a new `golfer.turn`: the complete set, which
+    /// replaces every earlier one. A field that is `None` is no hint for
+    /// that field. Apply each field the device supports and ignore the
+    /// rest; act only when a field differs from what the device has. The
+    /// host calls this whenever the hints change. The default ignores them.
     ///
     /// # Errors
     ///
     /// Returns what ended the session.
-    fn command(&mut self, _cmd: &DeviceCommand) -> Result<(), DriverError<Self::Driver>> {
+    fn hints(&mut self, _hints: &TurnHints) -> Result<(), DriverError<Self::Driver>> {
         Ok(())
     }
 
@@ -291,14 +303,13 @@ pub struct SessionEnd<'a, E> {
 }
 
 /// The host side of a connect: what [`ConnectCtx::tick`] and
-/// [`ConnectCtx::latched`] ask of it.
+/// [`ConnectCtx::hints`] ask of it.
 pub trait ConnectHost {
-    /// Drain the host's inputs (a bus, a controller's commands) and refresh
-    /// the latched command.
+    /// Drain the host's inputs (the bus) and refresh the hints.
     fn tick(&mut self);
 
-    /// The mode, hand and club as currently latched.
-    fn latched(&self) -> &DeviceCommand;
+    /// The hints of the last complete `golfer.turn`.
+    fn hints(&self) -> &TurnHints;
 }
 
 /// What [`DeviceDriver::connect`] gets from its host.
@@ -318,16 +329,17 @@ impl<'a> ConnectCtx<'a> {
         Self { stop, out, host }
     }
 
-    /// Mode, hand and club as currently latched. Live: a command that arrives
-    /// during a long connect shows up after the next [`tick`](Self::tick).
+    /// The hints of the last complete `golfer.turn`; empty before any turn.
+    /// Live: a `golfer.turn` that arrives during a long connect shows up
+    /// after the next [`tick`](Self::tick).
     #[must_use]
-    pub fn latched(&self) -> &DeviceCommand {
-        self.host.latched()
+    pub fn hints(&self) -> &TurnHints {
+        self.host.hints()
     }
 
     /// Call between steps and between slices of a long wait, at most about
     /// 250 ms apart. The host drains its inputs and refreshes
-    /// [`latched`](Self::latched).
+    /// [`hints`](Self::hints).
     ///
     /// # Errors
     ///
@@ -370,41 +382,58 @@ impl fmt::Debug for ConnectCtx<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConnectCtx")
             .field("stopped", &self.stop.is_stopped())
-            .field("latched", &self.host.latched())
+            .field("hints", &self.host.hints())
             .finish_non_exhaustive()
     }
 }
 
-/// Player context a host hands to a device: the detection mode, the hand
-/// and the club in play. Each field is independent; `None` means "not
-/// given".
+/// The tracking hints a launch monitor takes from `golfer.turn`: the
+/// golfer's handedness, the club and the mode. A turn is complete, so each
+/// one replaces the hints before it; `None` means "no hint for that field"
+/// (a `null` club, or a value that was not recognized), the same as never
+/// having been told.
+///
+/// `club` never implies `mode`, and `mode` wins if they conflict. A device
+/// that can't select a club uses its nearest or none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct DeviceCommand {
-    /// The detection mode.
-    pub mode: Option<DetectionMode>,
-    /// The player's hand.
-    pub handed: Option<Handedness>,
+pub struct TurnHints {
+    /// The golfer's handedness.
+    pub handedness: Option<Handedness>,
     /// The club in play.
     pub club: Option<Club>,
+    /// The mode.
+    pub mode: Option<Mode>,
 }
 
-impl DeviceCommand {
-    /// A command carrying only `mode`.
+impl TurnHints {
+    /// The hints a `golfer.turn` carries. A `null` or unrecognized value in
+    /// any field is `None` for that field; nothing is carried over from an
+    /// earlier turn.
     #[must_use]
-    pub fn with_mode(mut self, mode: DetectionMode) -> Self {
+    pub fn from_turn(turn: &GolferTurn) -> Self {
+        Self {
+            handedness: turn.handedness,
+            club: turn.club,
+            mode: turn.mode,
+        }
+    }
+
+    /// These hints with `mode` too.
+    #[must_use]
+    pub fn with_mode(mut self, mode: Mode) -> Self {
         self.mode = Some(mode);
         self
     }
 
-    /// A command carrying `handed` too.
+    /// These hints with `handedness` too.
     #[must_use]
-    pub fn with_handed(mut self, handed: Handedness) -> Self {
-        self.handed = Some(handed);
+    pub fn with_handedness(mut self, handedness: Handedness) -> Self {
+        self.handedness = Some(handedness);
         self
     }
 
-    /// A command carrying `club` too.
+    /// These hints with `club` too.
     #[must_use]
     pub fn with_club(mut self, club: Club) -> Self {
         self.club = Some(club);
@@ -416,22 +445,6 @@ impl DeviceCommand {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
-
-    /// Latch the fields present in `other` into this one, each independently.
-    /// Returns whether anything changed.
-    pub fn merge(&mut self, other: &Self) -> bool {
-        let before = *self;
-        if other.mode.is_some() {
-            self.mode = other.mode;
-        }
-        if other.handed.is_some() {
-            self.handed = other.handed;
-        }
-        if other.club.is_some() {
-            self.club = other.club;
-        }
-        *self != before
-    }
 }
 
 /// Static facts about a driver, known before any I/O.
@@ -441,7 +454,8 @@ pub struct DriverInfo {
     /// Stable kind for logs, config tables and export labels, e.g.
     /// `"beacon"`.
     pub kind: &'static str,
-    /// Display name, e.g. `"Eagle One launch monitor"`.
+    /// Display name, e.g. `"Eagle One launch monitor"`. The name of the
+    /// actor's `bus.actor` until a device is identified.
     pub name: &'static str,
     /// The device's manufacturer, when known up front.
     pub manufacturer: Option<&'static str>,
@@ -451,8 +465,8 @@ pub struct DriverInfo {
     /// client), so a new session must wait until the old one has closed.
     pub exclusive: bool,
     /// The device has one mode (a putting mat): a host that simulates the
-    /// ball flight uses this mode whatever the game's mode is.
-    pub fixed_mode: Option<DetectionMode>,
+    /// ball flight uses this mode whatever the turn's mode is.
+    pub fixed_mode: Option<Mode>,
     /// How a host captures this device's raw frames; `None` for a device
     /// with no wire protocol.
     pub raw: Option<RawProfile>,
@@ -490,7 +504,7 @@ impl DriverInfo {
 
     /// Set the device's only mode.
     #[must_use]
-    pub fn with_fixed_mode(mut self, mode: DetectionMode) -> Self {
+    pub fn with_fixed_mode(mut self, mode: Mode) -> Self {
         self.fixed_mode = Some(mode);
         self
     }
@@ -548,8 +562,9 @@ impl RawProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DeviceIdentity {
-    /// The FRP `device` id. May hold a serial, SSID or BLE address, so a
-    /// host does not publish it beyond FRP.
+    /// The device's own id, e.g. a serial, SSID or BLE address, for the
+    /// host's logs and displays. It identifies the machine, so a host never
+    /// puts it on the bus; the actor id does that job.
     pub device: String,
     /// The manufacturer.
     pub manufacturer: Option<String>,
@@ -557,8 +572,9 @@ pub struct DeviceIdentity {
     pub model: Option<String>,
     /// The firmware version.
     pub firmware: Option<String>,
-    /// Card text, e.g. `"Eagle One (F5:D1:…)"`. Defaults to manufacturer plus
-    /// model; see [`label`](Self::label).
+    /// Card text for the host's own display, e.g. `"Eagle One (F5:D1:…)"`.
+    /// Defaults to manufacturer plus model; see [`label`](Self::label). It
+    /// may hold the device's id, so a host never puts it on the bus.
     pub label: Option<String>,
 }
 
@@ -627,23 +643,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn commands_merge_each_field_on_its_own() {
-        let mut latched = DeviceCommand::default();
-        assert!(latched.is_empty());
-        assert!(latched.merge(&DeviceCommand::default().with_mode(DetectionMode::Full)));
-        assert!(latched.merge(&DeviceCommand::default().with_club(Club::PitchingWedge)));
-        assert!(!latched.merge(&DeviceCommand::default().with_club(Club::PitchingWedge)));
-        assert!(!latched.merge(&DeviceCommand::default()));
-        assert!(latched.merge(&DeviceCommand::default().with_handed(Handedness::Left)));
-        assert!(latched.merge(&DeviceCommand::default().with_mode(DetectionMode::Putting)));
+    fn a_turn_with_a_null_club_after_one_with_a_club_has_no_club() {
+        let first = GolferTurn::new(None, Some(Club::Iron7), Handedness::Right, Mode::Full);
+        let second = GolferTurn::new(None, None, Handedness::Right, Mode::Chipping);
+        assert_eq!(TurnHints::from_turn(&first).club, Some(Club::Iron7));
+        let hints = TurnHints::from_turn(&second);
+        assert_eq!(hints.club, None);
         assert_eq!(
-            latched,
-            DeviceCommand::default()
-                .with_mode(DetectionMode::Putting)
-                .with_handed(Handedness::Left)
-                .with_club(Club::PitchingWedge)
+            hints,
+            TurnHints::default()
+                .with_handedness(Handedness::Right)
+                .with_mode(Mode::Chipping)
         );
-        assert!(!latched.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_handedness_or_mode_is_no_hint() {
+        let turn: GolferTurn = serde_json::from_str(
+            r#"{"golfer":null,"club":"7I","handedness":"ambidextrous","mode":"scrambling"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            TurnHints::from_turn(&turn),
+            TurnHints::default().with_club(Club::Iron7)
+        );
+    }
+
+    #[test]
+    fn a_full_turn_replaces_every_field() {
+        let turn = GolferTurn::new(None, Some(Club::Putter), Handedness::Left, Mode::Putting);
+        let hints = TurnHints::from_turn(&turn);
+        assert_eq!(
+            hints,
+            TurnHints::default()
+                .with_handedness(Handedness::Left)
+                .with_club(Club::Putter)
+                .with_mode(Mode::Putting)
+        );
+        assert!(!hints.is_empty());
+        assert!(TurnHints::default().is_empty());
     }
 
     #[test]
@@ -665,9 +703,9 @@ mod tests {
         let info = DriverInfo::new("beacon", "Beacon", Source::Measured)
             .with_manufacturer("Birdie Labs")
             .exclusive()
-            .with_fixed_mode(DetectionMode::Putting);
+            .with_fixed_mode(Mode::Putting);
         assert!(info.exclusive);
-        assert_eq!(info.fixed_mode, Some(DetectionMode::Putting));
+        assert_eq!(info.fixed_mode, Some(Mode::Putting));
         assert_eq!(info.manufacturer, Some("Birdie Labs"));
         assert!(info.raw.is_none());
     }
@@ -728,8 +766,8 @@ mod tests {
         let flags = HostFlags::new();
         let mut alerts = Vec::new();
         let mut sink = |e: DeviceEvent| {
-            if let DeviceEvent::Frp(crate::FrpEvent::Alert { severity, message }) = e {
-                alerts.push((severity, message));
+            if let DeviceEvent::Frp(crate::FrpBody::BusAlert(alert)) = e {
+                alerts.push((alert.severity, alert.message));
             }
         };
         let mut driver = Plain::new(Nothing {}).unwrap();
@@ -766,40 +804,40 @@ mod tests {
                 (crate::Severity::Warn, "boom".to_owned())
             ]
         );
-        // `command` and `action` default to ignoring what they are given.
+        // `hints` and `action` default to ignoring what they are given.
         let mut session = PlainSession(DeviceIdentity::new("Plain-1"));
-        assert!(session.command(&DeviceCommand::default()).is_ok());
+        assert!(session.hints(&TurnHints::default()).is_ok());
         driver.apply_config(&Nothing {});
     }
 
     struct Host {
         ticks: u32,
-        latched: DeviceCommand,
+        hints: TurnHints,
     }
 
     impl ConnectHost for Host {
         fn tick(&mut self) {
             self.ticks += 1;
-            self.latched.club = Some(Club::Driver);
+            self.hints.club = Some(Club::Driver);
         }
-        fn latched(&self) -> &DeviceCommand {
-            &self.latched
+        fn hints(&self) -> &TurnHints {
+            &self.hints
         }
     }
 
     #[test]
-    fn tick_refreshes_the_latched_command_and_ends_with_a_stop() {
+    fn tick_refreshes_the_hints_and_ends_with_a_stop() {
         let stop = Stop::new();
         let flags = HostFlags::new();
         let mut sink = |_| {};
         let mut host = Host {
             ticks: 0,
-            latched: DeviceCommand::default(),
+            hints: TurnHints::default(),
         };
         let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &flags), &mut host);
-        assert_eq!(ctx.latched().club, None);
+        assert_eq!(ctx.hints().club, None);
         ctx.tick().expect("running");
-        assert_eq!(ctx.latched().club, Some(Club::Driver));
+        assert_eq!(ctx.hints().club, Some(Club::Driver));
         stop.stop();
         assert_eq!(ctx.tick(), Err(Stopped));
         assert_eq!(host.ticks, 1, "a stopped tick does not reach the host");
@@ -814,7 +852,7 @@ mod tests {
         let mut sink = |_| {};
         let mut host = Host {
             ticks: 0,
-            latched: DeviceCommand::default(),
+            hints: TurnHints::default(),
         };
         let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &flags), &mut host);
         let stream = ctx
