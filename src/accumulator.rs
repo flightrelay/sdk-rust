@@ -256,7 +256,8 @@ impl ShotAggregator {
         self.feed_at(msg, Instant::now())
     }
 
-    fn feed_at(&mut self, msg: &FrpMessage, now: Instant) -> Option<ShotEvent> {
+    /// [`feed`](Self::feed) at `now`: what the timeouts count from.
+    pub fn feed_at(&mut self, msg: &FrpMessage, now: Instant) -> Option<ShotEvent> {
         self.discard_expired_at(now);
         let from = msg.from.as_str();
         match &msg.body {
@@ -372,7 +373,8 @@ impl ShotAggregator {
         self.discard_expired_at(Instant::now())
     }
 
-    fn discard_expired_at(&mut self, now: Instant) -> usize {
+    /// [`discard_expired`](Self::discard_expired) at `now`.
+    pub fn discard_expired_at(&mut self, now: Instant) -> usize {
         let timeout = self.timeout;
         let fresh = |at: &Instant| now.saturating_duration_since(*at) <= timeout;
         self.finished.retain(|_, (_, at)| fresh(at));
@@ -399,7 +401,8 @@ impl ShotAggregator {
         self.discard_at(shot_id, Instant::now())
     }
 
-    fn discard_at(&mut self, shot_id: &str, now: Instant) -> bool {
+    /// [`discard`](Self::discard) at `now`.
+    pub fn discard_at(&mut self, shot_id: &str, now: Instant) -> bool {
         if self.pending.remove(shot_id).is_none() {
             return false;
         }
@@ -415,7 +418,8 @@ impl ShotAggregator {
         self.forget_actor_at(actor, Instant::now());
     }
 
-    fn forget_actor_at(&mut self, actor: &str, now: Instant) {
+    /// [`forget_actor`](Self::forget_actor) at `now`.
+    pub fn forget_actor_at(&mut self, actor: &str, now: Instant) {
         self.sources.remove(actor);
         if self.turn.as_ref().is_some_and(|(owner, _)| owner == actor) {
             self.turn = None;

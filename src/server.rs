@@ -1,4 +1,4 @@
-//! [`FrpServer`]: run a [`DeviceDriver`] as a launch monitor actor on the bus.
+//! [`FrpServer`]: run a [`FrpDriver`] as a launch monitor actor on the bus.
 //!
 //! Requires the `server` feature. The server connects the driver, polls its
 //! session and publishes what the driver emits as one launch monitor actor,
@@ -10,9 +10,9 @@
 //!
 //! # Threads
 //!
-//! The caller's thread is the device thread: [`connect`](DeviceDriver::connect),
-//! [`poll`](DeviceSession::poll), [`hints`](DeviceSession::hints),
-//! [`close`](DeviceSession::close) and the retry sleeps all run on it, so a
+//! The caller's thread is the device thread: [`connect`](FrpDriver::connect),
+//! [`poll`](FrpSession::poll), [`hints`](FrpSession::hints),
+//! [`close`](FrpSession::close) and the retry sleeps all run on it, so a
 //! session can be `!Send`. A network thread owns every connection, as a
 //! [`Hub`], so peers are served while a connect blocks. An acceptor thread
 //! obtains connections: it accepts in listen mode and dials, and redials, in
@@ -49,7 +49,7 @@
 //! - Each `golfer.turn` replaces all the hints ([`TurnHints::from_turn`]):
 //!   a `null` or unrecognized field is no hint for it, and nothing is
 //!   carried over from an earlier turn. Whenever the resulting hints change,
-//!   the session gets them through [`hints`](DeviceSession::hints), and the
+//!   the session gets them through [`hints`](FrpSession::hints), and the
 //!   next connect through
 //!   [`ConnectCtx::hints`](crate::driver::ConnectCtx::hints). The hints of
 //!   the last complete turn stay when the session actor goes away.
@@ -74,8 +74,8 @@
 //! server starts.
 //!
 //! ```no_run
-//! # use flightrelay::driver::{DeviceDriver, Stop};
-//! # fn serve<D: DeviceDriver>(driver: D) -> Result<(), Box<dyn std::error::Error>> {
+//! # use flightrelay::driver::{FrpDriver, Stop};
+//! # fn serve<D: FrpDriver>(driver: D) -> Result<(), Box<dyn std::error::Error>> {
 //! use flightrelay::{FrpServer, ServerConfig, Transport};
 //!
 //! // Generated once with `flightrelay::new_actor_id()` and kept by the host.
@@ -101,11 +101,10 @@ use std::sync::mpsc::{
 use std::time::{Duration, Instant};
 
 use crate::driver::{
-    Backoff, ConnectCtx, ConnectHost, DeviceDriver, DeviceEvent, DeviceIdentity, DeviceSession,
-    DeviceStatus, DriverInfo, Events, HostFlags, Level, SessionEnd, StatusChange, Stop, TurnHints,
+    Backoff, ConnectCtx, ConnectHost, DeviceEvent, DeviceIdentity, DeviceStatus, DriverInfo,
+    Events, FrpDriver, FrpSession, HostFlags, Level, SessionEnd, StatusChange, Stop, TurnHints,
 };
 use crate::endpoint::DEFAULT_WRITE_BUFFER_LIMIT;
-use crate::types::roles;
 use crate::{
     BusActor, DEFAULT_HEARTBEAT, DEFAULT_SHOT_TIMEOUT, DeviceInfo, EndpointConfig, FrpBody,
     FrpConnection, FrpEndpoint, FrpError, FrpMessage, Hub, HubEvent, Removal, ShotFinished,
@@ -245,13 +244,13 @@ type Observer = Box<dyn FnMut(&ServerEvent<'_>)>;
 
 /// Runs a driver as a launch monitor actor on the bus. See the
 /// [module docs](self).
-pub struct FrpServer<D: DeviceDriver> {
+pub struct FrpServer<D: FrpDriver> {
     driver: D,
     config: ServerConfig,
     observer: Option<Observer>,
 }
 
-impl<D: DeviceDriver> fmt::Debug for FrpServer<D> {
+impl<D: FrpDriver> fmt::Debug for FrpServer<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrpServer")
             .field("config", &self.config)
@@ -277,7 +276,7 @@ enum Note {
     Log(Level, String),
 }
 
-impl<D: DeviceDriver> FrpServer<D> {
+impl<D: FrpDriver> FrpServer<D> {
     /// A server for `driver`.
     #[must_use]
     pub fn new(driver: D, config: ServerConfig) -> Self {
@@ -303,7 +302,7 @@ impl<D: DeviceDriver> FrpServer<D> {
     /// # Errors
     ///
     /// Returns [`ServerError::Endpoint`] when the endpoint cannot open,
-    /// [`ServerError::Driver`] when [`retry_delay`](DeviceDriver::retry_delay)
+    /// [`ServerError::Driver`] when [`retry_delay`](FrpDriver::retry_delay)
     /// returned `None`, and [`ServerError::Network`] when the network thread
     /// ended on its own; the session, if any, is closed first.
     #[allow(clippy::too_many_lines)]
@@ -361,6 +360,7 @@ impl<D: DeviceDriver> FrpServer<D> {
                 note_tx: note_tx.clone(),
                 down_tx: bridge.then_some(down_tx),
             },
+            Instant::now(),
         );
         let net_thread = std::thread::Builder::new()
             .name("frp-net".into())
@@ -703,6 +703,9 @@ struct Net {
     /// The driver's name, until a device is identified.
     fallback_name: String,
     heartbeat: Duration,
+    /// The time of the current [`handle`](Self::handle) or
+    /// [`tick`](Self::tick): what every timer compares against.
+    now: Instant,
     last_beat: Instant,
     raw_frames: bool,
     shot_timeout: Duration,
@@ -711,18 +714,23 @@ struct Net {
 }
 
 impl Net {
-    fn new(config: &ServerConfig, info: &DriverInfo, links: Links) -> Self {
+    fn new(config: &ServerConfig, info: &DriverInfo, links: Links, now: Instant) -> Self {
         let heartbeat = config.heartbeat.max(MIN_HEARTBEAT);
         let mut actor = BusActor::new(
             config.name.clone().unwrap_or_else(|| info.name.to_owned()),
             heartbeat.as_secs_f64(),
         )
-        .with_role(roles::LAUNCH_MONITOR)
         .with_device(DeviceInfo {
             manufacturer: info.manufacturer.map(str::to_owned),
             source: Some(info.source),
             ..DeviceInfo::default()
         });
+        for role in info.roles {
+            actor = actor.with_role(*role);
+        }
+        for namespace in info.namespaces {
+            actor = actor.with_namespace(*namespace);
+        }
         let status = DeviceStatus::not_armed();
         actor.blockers.clone_from(&status.blockers);
         Self {
@@ -735,7 +743,8 @@ impl Net {
             name: config.name.clone(),
             fallback_name: info.name.to_owned(),
             heartbeat,
-            last_beat: Instant::now(),
+            now,
+            last_beat: now,
             raw_frames: config.raw_frames,
             shot_timeout: config.shot_timeout,
             seq: 0,
@@ -749,10 +758,10 @@ impl Net {
             let mut shutdown = false;
             match self.links.rx.recv_timeout(NET_TICK) {
                 Ok(msg) => {
-                    shutdown |= self.handle(msg);
+                    shutdown |= self.handle(msg, Instant::now());
                     while !shutdown {
                         match self.links.rx.try_recv() {
-                            Ok(msg) => shutdown |= self.handle(msg),
+                            Ok(msg) => shutdown |= self.handle(msg, Instant::now()),
                             Err(TryRecvError::Empty) => break,
                             Err(TryRecvError::Disconnected) => shutdown = true,
                         }
@@ -765,13 +774,20 @@ impl Net {
                 self.shut_down();
                 return;
             }
-            self.expire_shots();
-            if self.last_beat.elapsed() >= self.heartbeat {
-                self.publish_actor();
-            }
-            let events = self.hub.poll();
-            self.on_hub(events);
+            self.tick(Instant::now());
         }
+    }
+
+    /// What time decides at `now` (expired shots, the heartbeat), then one
+    /// pass over the connections.
+    fn tick(&mut self, now: Instant) {
+        self.now = now;
+        self.expire_shots();
+        if now.saturating_duration_since(self.last_beat) >= self.heartbeat {
+            self.publish_actor();
+        }
+        let events = self.hub.poll();
+        self.on_hub(events);
     }
 
     fn note(&self, note: Note) {
@@ -831,8 +847,10 @@ impl Net {
         }
     }
 
-    /// Returns whether to shut down.
-    fn handle(&mut self, msg: ToNet) -> bool {
+    /// Takes one message from the driver side at `now`. Returns whether to
+    /// shut down.
+    fn handle(&mut self, msg: ToNet, now: Instant) -> bool {
+        self.now = now;
         match msg {
             ToNet::Message(body) => self.on_driver_message(*body),
             ToNet::Status(status) => {
@@ -890,7 +908,7 @@ impl Net {
     }
 
     fn publish_actor(&mut self) {
-        self.last_beat = Instant::now();
+        self.last_beat = self.now;
         let msg = self.actor_message();
         self.publish(&msg);
     }
@@ -902,7 +920,7 @@ impl Net {
                     m.key.shot_id.clone(),
                     OpenShot {
                         key: m.key.clone(),
-                        since: Instant::now(),
+                        since: self.now,
                     },
                 );
             }
@@ -993,11 +1011,11 @@ impl Net {
     }
 
     fn expire_shots(&mut self) {
-        let timeout = self.shot_timeout;
+        let (now, timeout) = (self.now, self.shot_timeout);
         let stale: Vec<String> = self
             .open
             .iter()
-            .filter(|(_, s)| s.since.elapsed() >= timeout)
+            .filter(|(_, s)| now.saturating_duration_since(s.since) >= timeout)
             .map(|(id, _)| id.clone())
             .collect();
         for id in stale {
@@ -1053,15 +1071,23 @@ mod tests {
     }
 
     fn net_with(config: &ServerConfig) -> Net {
-        let (_to_net, rx) = sync_channel(QUEUE);
-        let (hints_tx, _) = channel();
-        let (note_tx, _) = channel();
-        let (_conn_tx, conn_rx) = channel();
+        net_with_notes(config).0
+    }
+
+    fn net_with_notes(config: &ServerConfig) -> (Net, Receiver<Note>) {
         let info =
             DriverInfo::new("beacon", "Beacon", Source::Virtual).with_manufacturer("Birdie Labs");
-        Net::new(
+        net_with_info(config, &info)
+    }
+
+    fn net_with_info(config: &ServerConfig, info: &DriverInfo) -> (Net, Receiver<Note>) {
+        let (_to_net, rx) = sync_channel(QUEUE);
+        let (hints_tx, _) = channel();
+        let (note_tx, notes) = channel();
+        let (_conn_tx, conn_rx) = channel();
+        let net = Net::new(
             config,
-            &info,
+            info,
             Links {
                 rx,
                 conn_rx,
@@ -1069,7 +1095,68 @@ mod tests {
                 note_tx,
                 down_tx: None,
             },
-        )
+            Instant::now(),
+        );
+        (net, notes)
+    }
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn a_drivers_namespaces_reach_its_actor() {
+        let config = ServerConfig::new(Transport::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let info = DriverInfo::new("beacon", "Beacon", Source::Virtual)
+            .with_namespaces(&["clubhouse", "range"]);
+        let (with, _notes) = net_with_info(&config, &info);
+        assert_eq!(with.actor.namespaces, ["clubhouse", "range"]);
+        assert!(net(None).actor.namespaces.is_empty());
+    }
+
+    #[test]
+    fn the_actor_is_republished_once_per_heartbeat() {
+        let mut net = net(None);
+        let (t0, hb) = (net.last_beat, net.heartbeat);
+        net.tick((t0 + hb).checked_sub(MS).unwrap());
+        assert_eq!(net.last_beat, t0, "not due yet");
+        net.tick(t0 + hb);
+        assert_eq!(net.last_beat, t0 + hb, "due: published");
+        net.tick(t0 + hb + MS);
+        assert_eq!(net.last_beat, t0 + hb, "no second beat");
+        // Publishing for any other reason restarts the wait.
+        net.handle(
+            ToNet::StatusChange(StatusChange::Battery(Some(50))),
+            t0 + hb + 2 * MS,
+        );
+        net.tick(t0 + hb * 2 + MS);
+        assert_eq!(net.last_beat, t0 + hb + 2 * MS);
+    }
+
+    #[test]
+    fn a_shot_left_open_is_finished_at_the_shot_timeout() {
+        let config = ServerConfig::new(Transport::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let (mut net, notes) = net_with_notes(&config);
+        let (t0, timeout) = (net.now, net.shot_timeout);
+        let key = crate::driver::ShotIds::new().next_key();
+        let number = key.shot_number;
+        net.handle(
+            ToNet::Message(Box::new(crate::ShotTrigger::new(key).into())),
+            t0,
+        );
+        net.tick((t0 + timeout).checked_sub(MS).unwrap());
+        assert_eq!(net.open.len(), 1, "still open");
+        net.tick(t0 + timeout);
+        assert!(net.open.is_empty(), "finished");
+        let logs: Vec<String> = notes
+            .try_iter()
+            .filter_map(|n| match n {
+                Note::Log(_, line) => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            logs,
+            [format!("finishing shot {number}: it stayed open too long")]
+        );
     }
 
     #[test]

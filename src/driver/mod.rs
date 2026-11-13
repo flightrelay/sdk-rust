@@ -1,28 +1,44 @@
-//! The device driver contract: how a launch monitor plugs into a host.
+//! The driver contract: how a launch monitor, or a program, plugs into a host.
+//!
+//! A driver is anything that speaks FRP on one side and a launch monitor or
+//! a program (a simulator, a game) on the other; the "device" in these types
+//! is whatever sits at that other end.
 //!
 //! Requires the `driver` feature, which adds no dependencies. A driver is
 //! built in two steps:
 //!
-//! 1. [`DeviceDriver::new`] validates a config and builds the driver, with no
+//! 1. [`FrpDriver::new`] validates a config and builds the driver, with no
 //!    I/O. The driver object holds everything that outlives one connection
 //!    (a shot counter, a retry clock).
-//! 2. [`DeviceDriver::connect`] opens one [`DeviceSession`]: transport,
-//!    handshake, identity. The host then calls [`DeviceSession::poll`] until
-//!    it fails or the host stops, and [`DeviceSession::close`] to release the
+//! 2. [`FrpDriver::connect`] opens one [`FrpSession`]: transport,
+//!    handshake, identity. The host then steps the session until it fails or
+//!    the host stops, and calls [`FrpSession::close`] to release the
 //!    device.
+//!
+//! Time is an input. A session implements [`FrpSession::step`], which
+//! takes `now`, handles what has arrived and what is due, and returns
+//! without blocking; every timer compares against that `now`. A host runs it
+//! with the provided [`FrpSession::poll`], or calls `step` itself, which
+//! is also how a test drives a session in virtual time
+//! (`flightrelay::testing::TestHost`, feature `testing`). A connect reads the
+//! time with [`ConnectCtx::now`] and lets it pass with [`ConnectCtx::wait`],
+//! so its deadlines are the host's too.
 //!
 //! The contract is synchronous and caller-driven, with no async runtime.
 //! The host owns the reconnect loop; the driver only advises the delay
-//! ([`DeviceDriver::retry_delay`]). A session may be `!Send`, and the driver
+//! ([`FrpDriver::retry_delay`]). A session may be `!Send`, and the driver
 //! is `Send`; both are used on one thread.
 //!
-//! A driver is a launch monitor actor on the bus. It emits [`DeviceEvent`]s
-//! into an [`Events`] sink: `shot.*` messages and alerts, its status (the
-//! `blockers`, battery, attitude and telemetry of its `bus.actor`), and three
-//! host-only kinds (phase, log, shot discarded). It sends each shot message
-//! once, when it has it, and leaves out any value the device does not have.
-//! The host stamps every message with the actor's id and publishes the
-//! actor's `bus.actor`.
+//! A driver is an actor on the bus, a launch monitor unless its roles say
+//! otherwise. It emits [`DeviceEvent`]s into an [`Events`] sink: message
+//! bodies of the kinds its roles send (`shot.*` for a launch monitor,
+//! `game.*` and `golfer.profile` for a game, and `golfer.select`,
+//! `bus.reply` and `bus.alert` for any), which the host drops otherwise;
+//! its status (the `blockers`, battery, attitude and telemetry of its
+//! `bus.actor`); and three host-only kinds (phase, log, shot discarded). It
+//! sends each shot message once, when it has it, and leaves out any value
+//! the device does not have. The host stamps every message with the actor's
+//! id and publishes the actor's `bus.actor`.
 //!
 //! The host holds the driver's current [`DeviceStatus`] and publishes exactly
 //! that: the driver sends it whole ([`Events::status`]) or one part at a time
@@ -44,10 +60,10 @@
 //! # A minimal driver
 //!
 //! ```
-//! use std::time::Duration;
+//! use std::time::Instant;
 //! use flightrelay::driver::{
-//!     ConfigError, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverError,
-//!     DriverInfo, Events, NoAction, ShotIds, Stopped,
+//!     ConfigError, ConnectCtx, FrpDriver, DeviceIdentity, FrpSession, DriverError,
+//!     DriverInfo, Events, Activity, NoAction, ShotIds, Stopped,
 //! };
 //! use flightrelay::{Launch, Source, Velocity};
 //! use flightrelay::config::DriverConfig;
@@ -80,7 +96,7 @@
 //!     armed: bool,
 //! }
 //!
-//! impl DeviceDriver for Beacon {
+//! impl FrpDriver for Beacon {
 //!     type Config = Config;
 //!     type Error = Error;
 //!     type Action = NoAction;
@@ -109,16 +125,15 @@
 //!     }
 //! }
 //!
-//! impl DeviceSession for BeaconSession {
+//! impl FrpSession for BeaconSession {
 //!     type Driver = Beacon;
 //!
-//!     fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), Error> {
+//!     fn step(&mut self, _now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
 //!         if !self.armed {
 //!             self.armed = true;
 //!             out.ready(true); // no blockers
 //!         }
-//!         std::thread::sleep(timeout);
-//!         Ok(())
+//!         Ok(Activity::Idle) // nothing more waiting
 //!     }
 //!     fn identity(&self) -> &DeviceIdentity {
 //!         &self.identity
@@ -130,24 +145,45 @@
 //! ```
 
 mod events;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 mod util;
 
 use std::error::Error;
 use std::fmt;
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use crate::config::{ConfigError, DriverConfig};
 pub use events::{DeviceEvent, DeviceStatus, Events, HostFlags, Level, StatusChange};
 pub use util::{Backoff, Live, STABLE_SESSION, ShotIds, Stop, connect_tcp};
 
-use crate::{Club, GolferTurn, Handedness, Mode, RawFrame, Source};
+use crate::types::roles;
+use crate::{Club, FrpMessage, GolferTurn, Handedness, Mode, RawFrame, Source};
 
-/// The default [`DeviceDriver::STOP_WAIT`].
+/// How long [`FrpSession::poll`] waits before the next step after one
+/// that returned [`Activity::Idle`]. Also the longest slice of
+/// [`ConnectCtx::wait`].
+pub const IDLE: Duration = Duration::from_millis(5);
+
+/// What a [`FrpSession::step`] did. A host treats a variant it does not
+/// know as [`Activity::Idle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Activity {
+    /// This pass did work (handled input, sent something). More may be
+    /// waiting, so a host steps again at once.
+    Active,
+    /// This pass found nothing to do. A host waits up to [`IDLE`] before
+    /// the next step.
+    Idle,
+}
+
+/// The default [`FrpDriver::STOP_WAIT`].
 pub const DEFAULT_STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// How a launch monitor plugs into a host. See the [module docs](self).
-pub trait DeviceDriver: Send + Sized + 'static {
+pub trait FrpDriver: Send + Sized + 'static {
     /// The driver's settings.
     type Config: DriverConfig;
     /// What a connect or a session can fail with. It converts from
@@ -157,10 +193,10 @@ pub trait DeviceDriver: Send + Sized + 'static {
     /// are none.
     type Action: fmt::Debug + Send + 'static;
     /// The connected device. Names this driver back.
-    type Session: DeviceSession<Driver = Self>;
+    type Session: FrpSession<Driver = Self>;
 
     /// Longest time from [`Stop::stop`] until [`connect`](Self::connect)
-    /// returns or [`close`](DeviceSession::close) ends.
+    /// returns or [`close`](FrpSession::close) ends.
     const STOP_WAIT: Duration = DEFAULT_STOP_WAIT;
 
     /// Static facts, known before any I/O, so a host can classify the device
@@ -181,10 +217,12 @@ pub trait DeviceDriver: Send + Sized + 'static {
     fn config(&self) -> &Self::Config;
 
     /// Open one session: transport, handshake, identity. Blocks, calling
-    /// [`ctx.tick()`](ConnectCtx::tick) between steps and at least every
-    /// 250 ms inside waits; it returns `Err(Stopped)` after a stop, which `?`
-    /// converts. Returns once the device is identified; configuring and
-    /// arming may go on inside [`poll`](DeviceSession::poll). Events emitted
+    /// [`ctx.tick()`](ConnectCtx::tick) or [`ctx.wait(d)`](ConnectCtx::wait)
+    /// on every pass of a loop and at least every 250 ms; both return
+    /// `Err(Stopped)` after a stop, which `?` converts. Deadlines compare
+    /// against [`ctx.now()`](ConnectCtx::now). Returns once the device is
+    /// identified; configuring and arming may go on inside
+    /// [`step`](FrpSession::step). Events emitted
     /// while connecting (a phase, a hint alert, logs) reach the host at once
     /// through `ctx.out`.
     ///
@@ -220,15 +258,37 @@ pub trait DeviceDriver: Send + Sized + 'static {
 }
 
 /// One connection to a device.
-pub trait DeviceSession: Sized {
+pub trait FrpSession: Sized {
     /// The driver this session belongs to.
-    type Driver: DeviceDriver<Session = Self>;
+    type Driver: FrpDriver<Session = Self>;
 
-    /// Push zero or more events into `out`, returning within about `timeout`
-    /// (plus one device read). `Err` ends the session and the host asks
-    /// [`retry_delay`](DeviceDriver::retry_delay). A wire or decode error that
-    /// leaves the session usable is not an `Err`: the driver raises an alert
-    /// and returns `Ok`.
+    /// Handle what has arrived and what is due at `now`, push events into
+    /// `out`, and return without blocking. Every timer of the session
+    /// compares against `now`; a session reads no clock of its own (a device
+    /// whose samples carry their own clock, like an input device, may keep
+    /// that one). One step is one pass: [`Activity::Active`] when more may be
+    /// waiting, [`Activity::Idle`] when nothing is. `Err` ends the session and
+    /// the host asks [`retry_delay`](FrpDriver::retry_delay). A wire or
+    /// decode error that leaves the session usable is not an `Err`: the
+    /// driver raises an alert and returns `Ok`.
+    ///
+    /// This is the one method a session implements, and the entry point for
+    /// a host or a test that runs the session itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns what ended the session.
+    fn step(
+        &mut self,
+        now: Instant,
+        out: &mut Events<'_>,
+    ) -> Result<Activity, DriverError<Self::Driver>>;
+
+    /// Step for about `timeout` of real time, waiting [`IDLE`] after a step
+    /// that returned [`Activity::Idle`]. Always steps at least once, so a zero
+    /// timeout still sees a dead device. It does not return early: a host
+    /// that wants to act between steps calls [`step`](Self::step) itself.
+    /// Drivers implement `step` and leave this alone.
     ///
     /// # Errors
     ///
@@ -237,13 +297,27 @@ pub trait DeviceSession: Sized {
         &mut self,
         timeout: Duration,
         out: &mut Events<'_>,
-    ) -> Result<(), DriverError<Self::Driver>>;
+    ) -> Result<(), DriverError<Self::Driver>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let activity = self.step(Instant::now(), out)?;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(());
+            }
+            if activity == Activity::Idle {
+                std::thread::sleep(left.min(IDLE));
+            }
+        }
+    }
 
     /// The tracking hints of a new `golfer.turn`: the complete set, which
     /// replaces every earlier one. A field that is `None` is no hint for
     /// that field. Apply each field the device supports and ignore the
     /// rest; act only when a field differs from what the device has. The
-    /// host calls this whenever the hints change. The default ignores them.
+    /// host calls this whenever the hints change. It records what was asked
+    /// and reads no clock; anything timed happens in the next
+    /// [`step`](Self::step). The default ignores them.
     ///
     /// # Errors
     ///
@@ -252,7 +326,22 @@ pub trait DeviceSession: Sized {
         Ok(())
     }
 
-    /// A device-specific operation. The default ignores it.
+    /// A bus message the host routes to this session: a finished shot, an
+    /// actor's `bus.actor`, a `golfer.turn`. It records the message and reads
+    /// no clock; anything timed happens in the next [`step`](Self::step).
+    /// Which messages a host routes is the host's choice. The default
+    /// ignores it.
+    ///
+    /// # Errors
+    ///
+    /// Returns what ended the session.
+    fn bus(&mut self, _msg: &FrpMessage) -> Result<(), DriverError<Self::Driver>> {
+        Ok(())
+    }
+
+    /// A device-specific operation. Like [`hints`](Self::hints), it reads no
+    /// clock; anything timed happens in the next [`step`](Self::step). The
+    /// default ignores it.
     ///
     /// # Errors
     ///
@@ -269,7 +358,7 @@ pub trait DeviceSession: Sized {
     fn identity(&self) -> &DeviceIdentity;
 
     /// Release the device (disarm, disconnect), bounded by
-    /// [`STOP_WAIT`](DeviceDriver::STOP_WAIT). Dropping a session without
+    /// [`STOP_WAIT`](FrpDriver::STOP_WAIT). Dropping a session without
     /// `close` must still free the transport, only less politely.
     ///
     /// # Errors
@@ -279,9 +368,9 @@ pub trait DeviceSession: Sized {
 }
 
 /// A driver's error type.
-pub type DriverError<D> = <D as DeviceDriver>::Error;
+pub type DriverError<D> = <D as FrpDriver>::Error;
 /// A driver's action type.
-pub type DriverAction<D> = <D as DeviceDriver>::Action;
+pub type DriverAction<D> = <D as FrpDriver>::Action;
 
 /// Returned by [`ConnectCtx::tick`] after a stop; every driver error converts
 /// from it.
@@ -289,18 +378,18 @@ pub type DriverAction<D> = <D as DeviceDriver>::Action;
 #[error("stopped")]
 pub struct Stopped;
 
-/// A driver with no [`DeviceDriver::Action`].
+/// A driver with no [`FrpDriver::Action`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoAction {}
 
-/// How a session ended, as [`DeviceDriver::retry_delay`] sees it. A host
+/// How a session ended, as [`FrpDriver::retry_delay`] sees it. A host
 /// builds it with a struct literal.
 #[derive(Debug)]
 pub struct SessionEnd<'a, E> {
     /// What ended the session or failed the connect; `None` after a clean
     /// stop.
     pub error: Option<&'a E>,
-    /// How long the session lasted; `None` when [`connect`](DeviceDriver::connect)
+    /// How long the session lasted; `None` when [`connect`](FrpDriver::connect)
     /// failed.
     pub connected_for: Option<Duration>,
     /// Failed connects since the last session that connected, this one
@@ -308,17 +397,26 @@ pub struct SessionEnd<'a, E> {
     pub attempts: u32,
 }
 
-/// The host side of a connect: what [`ConnectCtx::tick`] and
-/// [`ConnectCtx::hints`] ask of it.
+/// The host side of a connect: what [`ConnectCtx`] asks of it.
 pub trait ConnectHost {
     /// Drain the host's inputs (the bus) and refresh the hints.
     fn tick(&mut self);
 
     /// The hints of the last complete `golfer.turn`.
     fn hints(&self) -> &TurnHints;
+
+    /// The time now. The default reads the clock.
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    /// Let `d` pass (at most [`IDLE`]). The default sleeps it.
+    fn wait(&mut self, d: Duration) {
+        std::thread::sleep(d);
+    }
 }
 
-/// What [`DeviceDriver::connect`] gets from its host.
+/// What [`FrpDriver::connect`] gets from its host.
 pub struct ConnectCtx<'a> {
     /// The stop token. A driver passes `stop.flag()` to a transport layer
     /// that takes a cancel flag.
@@ -343,9 +441,11 @@ impl<'a> ConnectCtx<'a> {
         self.host.hints()
     }
 
-    /// Call between steps and between slices of a long wait, at most about
-    /// 250 ms apart. The host drains its inputs and refreshes
-    /// [`hints`](Self::hints).
+    /// Call on every pass of a connect loop that does not
+    /// [`wait`](Self::wait), and at least about every 250 ms. The host
+    /// drains its inputs and refreshes [`hints`](Self::hints). Time passes
+    /// for a connect only in `wait` and, for a test host, in `tick`, so a
+    /// loop that calls neither never reaches a deadline in a test.
     ///
     /// # Errors
     ///
@@ -356,6 +456,30 @@ impl<'a> ConnectCtx<'a> {
         }
         self.host.tick();
         Ok(())
+    }
+
+    /// The host's time: what a connect's deadlines compare against.
+    #[must_use]
+    pub fn now(&self) -> Instant {
+        self.host.now()
+    }
+
+    /// Let `d` pass in slices of at most [`IDLE`], ticking after each.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Stopped`] after a stop.
+    pub fn wait(&mut self, d: Duration) -> Result<(), Stopped> {
+        let mut left = d;
+        loop {
+            self.tick()?;
+            if left.is_zero() {
+                return Ok(());
+            }
+            let slice = left.min(IDLE);
+            self.host.wait(slice);
+            left -= slice;
+        }
     }
 
     /// [`connect_tcp`] that keeps ticking while it waits. The outer error is
@@ -476,11 +600,18 @@ pub struct DriverInfo {
     /// How a host captures this device's raw frames; `None` for a device
     /// with no wire protocol.
     pub raw: Option<RawProfile>,
+    /// The FRP roles of the driver's actor, from [`roles`](crate::types::roles).
+    /// A launch monitor is `&[roles::LAUNCH_MONITOR]`.
+    pub roles: &'static [&'static str],
+    /// The golfer id namespaces the driver's actor issues, as in
+    /// [`BusActor::namespaces`](crate::BusActor::namespaces). Empty for a
+    /// device that issues no golfer ids.
+    pub namespaces: &'static [&'static str],
 }
 
 impl DriverInfo {
-    /// Facts for a device of `kind` and `name`: not exclusive, no fixed
-    /// mode, no raw frames.
+    /// Facts for a device of `kind` and `name`: a launch monitor, not
+    /// exclusive, no fixed mode, no raw frames.
     #[must_use]
     pub fn new(kind: &'static str, name: &'static str, source: Source) -> Self {
         Self {
@@ -491,6 +622,8 @@ impl DriverInfo {
             exclusive: false,
             fixed_mode: None,
             raw: None,
+            roles: &[roles::LAUNCH_MONITOR],
+            namespaces: &[],
         }
     }
 
@@ -512,6 +645,20 @@ impl DriverInfo {
     #[must_use]
     pub fn with_fixed_mode(mut self, mode: Mode) -> Self {
         self.fixed_mode = Some(mode);
+        self
+    }
+
+    /// Set the actor's FRP roles.
+    #[must_use]
+    pub fn with_roles(mut self, list: &'static [&'static str]) -> Self {
+        self.roles = list;
+        self
+    }
+
+    /// Set the golfer id namespaces the actor issues.
+    #[must_use]
+    pub fn with_namespaces(mut self, list: &'static [&'static str]) -> Self {
+        self.namespaces = list;
         self
     }
 
@@ -732,7 +879,7 @@ mod tests {
     struct Plain(Nothing);
     struct PlainSession(DeviceIdentity);
 
-    impl DeviceDriver for Plain {
+    impl FrpDriver for Plain {
         type Config = Nothing;
         type Error = Oops;
         type Action = NoAction;
@@ -754,10 +901,10 @@ mod tests {
         }
     }
 
-    impl DeviceSession for PlainSession {
+    impl FrpSession for PlainSession {
         type Driver = Plain;
-        fn poll(&mut self, _: Duration, _: &mut Events<'_>) -> Result<(), Oops> {
-            Ok(())
+        fn step(&mut self, _: Instant, _: &mut Events<'_>) -> Result<Activity, Oops> {
+            Ok(Activity::Idle)
         }
         fn identity(&self) -> &DeviceIdentity {
             &self.0

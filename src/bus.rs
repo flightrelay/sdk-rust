@@ -55,7 +55,9 @@ impl BusState {
         self.apply_at(msg, Instant::now())
     }
 
-    fn apply_at(&mut self, msg: &FrpMessage, now: Instant) -> bool {
+    /// [`apply`](Self::apply) at `now`: the time the actor's heartbeat
+    /// clock restarts from.
+    pub fn apply_at(&mut self, msg: &FrpMessage, now: Instant) -> bool {
         let Some(key) = msg.state_key() else {
             return false;
         };
@@ -87,7 +89,8 @@ impl BusState {
         self.expire_at(Instant::now())
     }
 
-    fn expire_at(&mut self, now: Instant) -> Vec<String> {
+    /// [`expire`](Self::expire) at `now`.
+    pub fn expire_at(&mut self, now: Instant) -> Vec<String> {
         let gone: Vec<String> = self
             .heard
             .iter()

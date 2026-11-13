@@ -231,16 +231,21 @@ impl Hub {
         events
     }
 
-    /// Close every connection, after pushing out what is queued for about
-    /// `flush_for`. A peer that reads more slowly than that sees the
+    /// Close every connection once what is queued has gone out, waiting at
+    /// most `flush_for`. A peer that reads more slowly than that sees the
     /// connection reset instead of a close.
     pub fn close_all(&mut self, flush_for: std::time::Duration) {
         let until = std::time::Instant::now() + flush_for;
-        while std::time::Instant::now() < until {
+        loop {
+            let mut done = true;
             for p in &mut self.peers {
-                let _ = p.conn.flush();
+                // A failed connection has nothing more to send.
+                done &= p.conn.flushed().unwrap_or(true);
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            if done || std::time::Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         for p in std::mem::take(&mut self.peers) {
             let _ = p.conn.close();

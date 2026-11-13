@@ -25,6 +25,7 @@ driver = ["config"]
 server = ["driver", "transport"]
 main = ["server", "dep:toml", "dep:ctrlc"]
 mock = ["driver"]
+testing = ["driver"]
 
 [[example]]
 name = "frp-mock"

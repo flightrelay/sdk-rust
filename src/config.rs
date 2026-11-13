@@ -79,7 +79,7 @@ pub trait DriverConfig:
 
     /// Whether moving from `old` to `new` needs a new session. The default is
     /// any change. A driver that applies some fields live overrides this and
-    /// `DeviceDriver::apply_config` (feature `driver`).
+    /// `FrpDriver::apply_config` (feature `driver`).
     #[must_use]
     fn restart_needed(old: &Self, new: &Self) -> bool {
         old != new

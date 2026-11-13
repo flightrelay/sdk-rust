@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use flightrelay::driver::{DeviceDriver, Stop};
+use flightrelay::driver::{FrpDriver, Stop};
 use flightrelay::mock::{MockConfig, MockDriver};
 use flightrelay::types::roles;
 use flightrelay::{

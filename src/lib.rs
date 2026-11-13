@@ -37,7 +37,7 @@
 //!   connection
 //! - **`config`** — `config::DriverConfig`, the serde settings of a device
 //!   driver
-//! - **`driver`** — the `driver::DeviceDriver` contract between a launch
+//! - **`driver`** — the `driver::FrpDriver` contract between a launch
 //!   monitor and its host (implies `config`)
 //! - **`server`** — `FrpServer`, which runs a driver as a launch monitor
 //!   actor on the bus (implies `driver` and `transport`)
@@ -166,6 +166,9 @@ pub mod server;
 
 #[cfg(feature = "mock")]
 pub mod mock;
+
+#[cfg(feature = "testing")]
+pub use driver::testing;
 
 pub use error::FrpError;
 pub use kinds::{

@@ -593,6 +593,22 @@ impl FrpConnection {
         }
     }
 
+    /// [`flush`](Self::flush) that tells whether it got everything out:
+    /// `Ok(true)` once nothing is left queued, `Ok(false)` while the socket
+    /// cannot take more yet.
+    pub(crate) fn flushed(&mut self) -> Result<bool, FrpError> {
+        match self.socket.flush() {
+            Ok(()) => Ok(true),
+            Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Ok(false)
+            }
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                Err(FrpError::Closed)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Cleanly close the WebSocket connection.
     ///
     /// On a non-blocking connection the close frame is queued and the call

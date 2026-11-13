@@ -1,11 +1,11 @@
-//! [`run`]: a complete `main` for a [`DeviceDriver`], and
+//! [`run`]: a complete `main` for a [`FrpDriver`], and
 //! [`config_actor_id`] for a binary that builds its own [`FrpServer`].
 //!
 //! Requires the `main` feature. A binary is one line:
 //!
 //! ```no_run
-//! # use flightrelay::driver::DeviceDriver;
-//! # fn main_for<D: DeviceDriver>() -> std::process::ExitCode {
+//! # use flightrelay::driver::FrpDriver;
+//! # fn main_for<D: FrpDriver>() -> std::process::ExitCode {
 //! flightrelay::run::<D>()
 //! # }
 //! ```
@@ -66,14 +66,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde_json::{Map, Value};
 
 use crate::config::{ConfigError, DriverConfig};
-use crate::driver::{DeviceDriver, DeviceEvent, Level, Stop};
+use crate::driver::{DeviceEvent, FrpDriver, Level, Stop};
 use crate::{FrpBody, FrpServer, ServerConfig, ServerEvent, Transport};
 
 /// The table of the config file that holds the runner's own settings.
 const RUNNER_TABLE: &str = "frp";
 
 /// What differs between binaries that run on [`run`].
-pub struct RunOptions<D: DeviceDriver> {
+pub struct RunOptions<D: FrpDriver> {
     /// The config the file and `--set` flags apply over. Default:
     /// `D::Config::default`.
     pub default_config: fn() -> D::Config,
@@ -86,7 +86,7 @@ pub struct RunOptions<D: DeviceDriver> {
     pub program: Option<&'static str>,
 }
 
-impl<D: DeviceDriver> Default for RunOptions<D> {
+impl<D: FrpDriver> Default for RunOptions<D> {
     fn default() -> Self {
         Self {
             default_config: D::Config::default,
@@ -96,7 +96,7 @@ impl<D: DeviceDriver> Default for RunOptions<D> {
     }
 }
 
-impl<D: DeviceDriver> std::fmt::Debug for RunOptions<D> {
+impl<D: FrpDriver> std::fmt::Debug for RunOptions<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunOptions")
             .field("default_target", &self.default_target)
@@ -108,14 +108,14 @@ impl<D: DeviceDriver> std::fmt::Debug for RunOptions<D> {
 /// Run `D` as a program: the arguments come from `std::env`. Never returns
 /// before the process should exit.
 #[must_use]
-pub fn run<D: DeviceDriver>() -> ExitCode {
+pub fn run<D: FrpDriver>() -> ExitCode {
     run_with::<D>(RunOptions::default())
 }
 
 /// [`run`] with options.
 #[must_use]
 #[allow(clippy::needless_pass_by_value)] // the options belong to the program being run
-pub fn run_with<D: DeviceDriver>(options: RunOptions<D>) -> ExitCode {
+pub fn run_with<D: FrpDriver>(options: RunOptions<D>) -> ExitCode {
     let mut args = std::env::args_os().map(|a| a.to_string_lossy().into_owned());
     let program = args.next().map(|path| {
         std::path::Path::new(&path)
@@ -128,14 +128,14 @@ pub fn run_with<D: DeviceDriver>(options: RunOptions<D>) -> ExitCode {
 /// [`run`] over explicit arguments, which exclude the program name.
 #[must_use]
 #[allow(clippy::needless_pass_by_value)] // the options belong to the program being run
-pub fn run_args<D: DeviceDriver>(
+pub fn run_args<D: FrpDriver>(
     args: impl Iterator<Item = String>,
     options: RunOptions<D>,
 ) -> ExitCode {
     run_with_program::<D>(None, args, &options)
 }
 
-fn run_with_program<D: DeviceDriver>(
+fn run_with_program<D: FrpDriver>(
     argv0: Option<String>,
     args: impl Iterator<Item = String>,
     options: &RunOptions<D>,
@@ -676,7 +676,7 @@ fn render_table(path: &str, map: &Map<String, Value>, out: &mut String) {
 }
 
 /// The testable body of [`run`]: returns the exit code.
-fn execute<D: DeviceDriver>(
+fn execute<D: FrpDriver>(
     program: &str,
     args: &[String],
     options: &RunOptions<D>,

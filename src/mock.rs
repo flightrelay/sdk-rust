@@ -10,7 +10,7 @@
 //! flight (`shot.flight`, [`Basis::Modeled`]) and the club (`shot.club`).
 //! Values follow the mode in the hints when the shot fires: full swing,
 //! chipping or putting. The mode comes from the host's `golfer.turn` hints
-//! at connect and from [`hints`](DeviceSession::hints) afterwards; no mode
+//! at connect and from [`hints`](FrpSession::hints) afterwards; no mode
 //! hint means a full swing, as before any turn. The mock ignores handedness
 //! and club.
 //!
@@ -20,11 +20,11 @@
 //!
 //! A host can hold shots back, e.g. between rounds: the mock asks
 //! [`Events::shots_allowed`] before it numbers a shot or raises a blocker for
-//! it, and asks again on the next poll, so a held shot takes no number and
+//! it, and asks again on the next step, so a held shot takes no number and
 //! fires as soon as shots are allowed again.
 //!
 //! ```
-//! use flightrelay::driver::DeviceDriver;
+//! use flightrelay::driver::FrpDriver;
 //! use flightrelay::mock::{MockConfig, MockDriver};
 //! use flightrelay::Source;
 //!
@@ -43,8 +43,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigError, DriverConfig, is_default_value};
 use crate::driver::{
-    ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events, Level, NoAction,
-    ShotIds, Stopped, TurnHints,
+    Activity, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver, FrpSession, Level,
+    NoAction, ShotIds, Stopped, TurnHints,
 };
 use crate::types::blockers;
 use crate::{Basis, ClubData, Distance, FlightResult, Launch, Mode, Source, Velocity};
@@ -166,7 +166,7 @@ pub struct MockDriver {
     ids: ShotIds,
 }
 
-impl DeviceDriver for MockDriver {
+impl FrpDriver for MockDriver {
     type Config = MockConfig;
     type Error = MockError;
     type Action = NoAction;
@@ -272,53 +272,40 @@ impl MockSession {
     }
 }
 
-impl DeviceSession for MockSession {
+impl FrpSession for MockSession {
     type Driver = MockDriver;
 
-    fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), MockError> {
+    fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, MockError> {
         let c = self.config.clone();
+        let waited = |since: Instant, secs: f64| {
+            now.saturating_duration_since(since) >= MockConfig::secs(secs)
+        };
         match self.phase {
             Phase::Start => {
                 out.blockers([blockers::NOT_ARMED]);
                 self.mode_telemetry(out, "idle");
                 out.log(Level::Info, "mock: connected");
-                self.phase = Phase::Idle {
-                    since: Instant::now(),
-                };
+                self.phase = Phase::Idle { since: now };
             }
-            Phase::Idle { since } if since.elapsed() >= MockConfig::secs(c.arm_delay_s) => {
+            Phase::Idle { since } if waited(since, c.arm_delay_s) => {
                 out.blockers([blockers::NO_BALL]);
                 self.mode_telemetry(out, "armed");
-                self.phase = Phase::Armed {
-                    since: Instant::now(),
-                };
+                self.phase = Phase::Armed { since: now };
             }
-            Phase::Armed { since } if since.elapsed() >= MockConfig::secs(c.ball_ready_delay_s) => {
+            Phase::Armed { since } if waited(since, c.ball_ready_delay_s) => {
                 out.ready(true);
-                self.phase = Phase::Ready {
-                    since: Instant::now(),
-                };
+                self.phase = Phase::Ready { since: now };
             }
-            Phase::Ready { since }
-                if since.elapsed() >= MockConfig::secs(c.shot_interval_s)
-                    && out.shots_allowed() =>
-            {
+            Phase::Ready { since } if waited(since, c.shot_interval_s) && out.shots_allowed() => {
                 self.fire(out);
-                self.phase = Phase::PostShot {
-                    since: Instant::now(),
-                };
+                self.phase = Phase::PostShot { since: now };
             }
-            Phase::PostShot { since }
-                if since.elapsed() >= MockConfig::secs(c.post_shot_delay_s) =>
-            {
-                self.phase = Phase::Idle {
-                    since: Instant::now(),
-                };
+            Phase::PostShot { since } if waited(since, c.post_shot_delay_s) => {
+                self.phase = Phase::Idle { since: now };
             }
             _ => {}
         }
-        std::thread::sleep(timeout.min(Duration::from_millis(100)));
-        Ok(())
+        Ok(Activity::Idle)
     }
 
     fn hints(&mut self, hints: &TurnHints) -> Result<(), MockError> {
@@ -431,16 +418,8 @@ fn generate_shot(n: u32, mode: Mode) -> Shot {
 mod tests {
     use super::*;
     use crate::FrpBody;
-    use crate::driver::{ConnectHost, DeviceEvent, HostFlags, StatusChange, Stop};
-
-    struct Host(TurnHints);
-
-    impl ConnectHost for Host {
-        fn tick(&mut self) {}
-        fn hints(&self) -> &TurnHints {
-            &self.0
-        }
-    }
+    use crate::driver::testing::TestHost;
+    use crate::driver::{DeviceEvent, IDLE, StatusChange};
 
     fn fast() -> MockConfig {
         MockConfig {
@@ -452,41 +431,30 @@ mod tests {
         }
     }
 
-    fn connect(driver: &mut MockDriver, mode: Option<Mode>) -> MockSession {
-        let stop = Stop::new();
-        let flags = HostFlags::new();
-        let mut sink = |_| {};
-        let mut host = Host(TurnHints {
+    fn host(mode: Option<Mode>) -> TestHost {
+        TestHost::new().with_hints(TurnHints {
             mode,
             ..TurnHints::default()
-        });
-        let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &flags), &mut host);
-        driver.connect(&mut ctx).expect("connect")
+        })
     }
 
-    /// Polls until `done` says so, collecting the messages and status.
+    /// Steps in virtual time until `done` says so, collecting the messages
+    /// and status.
     fn drive(
+        host: &mut TestHost,
         session: &mut MockSession,
-        flags: &HostFlags,
         done: impl Fn(&[DeviceEvent]) -> bool,
     ) -> Vec<DeviceEvent> {
         let mut seen: Vec<DeviceEvent> = Vec::new();
-        let give_up = Instant::now() + Duration::from_secs(5);
-        while !done(&seen) {
-            assert!(Instant::now() < give_up, "timed out; saw {seen:?}");
-            let mut sink = |e: DeviceEvent| {
-                if matches!(
-                    e,
-                    DeviceEvent::Frp(_) | DeviceEvent::Status(_) | DeviceEvent::StatusChange(_)
-                ) {
-                    seen.push(e);
-                }
-            };
-            session
-                .poll(Duration::from_millis(5), &mut Events::new(&mut sink, flags))
-                .expect("poll");
+        for _ in 0..100_000 {
+            if done(&seen) {
+                return seen;
+            }
+            host.run_for(IDLE, |now, out| session.step(now, out))
+                .expect("step");
+            seen.extend(host.take_frp());
         }
-        seen
+        panic!("never done; saw {seen:?}");
     }
 
     fn kinds(events: &[DeviceEvent]) -> Vec<&'static str> {
@@ -528,7 +496,7 @@ mod tests {
         assert_eq!(info.source, Source::Virtual);
         assert!(info.raw.is_none() && info.fixed_mode.is_none() && !info.exclusive);
         let mut driver = MockDriver::new(MockConfig::default()).unwrap();
-        let session = connect(&mut driver, None);
+        let session = host(None).connect(&mut driver).unwrap();
         assert_eq!(
             session.identity().label(),
             "Mock Launch Monitor (simulated)"
@@ -538,9 +506,9 @@ mod tests {
     #[test]
     fn a_session_arms_signals_ready_and_fires_a_complete_shot() {
         let mut driver = MockDriver::new(fast()).unwrap();
-        let mut session = connect(&mut driver, Some(Mode::Chipping));
-        let flags = HostFlags::new();
-        let seen = drive(&mut session, &flags, |s| kinds(s).contains(&"finished"));
+        let mut h = host(Some(Mode::Chipping));
+        let mut session = h.connect(&mut driver).unwrap();
+        let seen = drive(&mut h, &mut session, |s| kinds(s).contains(&"finished"));
 
         // Not armed on connect, no ball once armed, nothing in the way with
         // the ball ready, then not armed again as the shot goes out.
@@ -597,7 +565,6 @@ mod tests {
     #[test]
     fn values_follow_the_mode_and_shot_numbers_keep_counting_across_sessions() {
         let mut driver = MockDriver::new(fast()).unwrap();
-        let flags = HostFlags::new();
         let speed = |mode| {
             generate_shot(1, mode)
                 .launch
@@ -608,11 +575,13 @@ mod tests {
         assert!(speed(Mode::Full) > speed(Mode::Chipping));
         assert!(speed(Mode::Chipping) > speed(Mode::Putting));
 
-        let mut first = connect(&mut driver, None);
-        let seen = drive(&mut first, &flags, |s| kinds(s).contains(&"finished"));
+        let mut h = host(None);
+        let mut first = h.connect(&mut driver).unwrap();
+        let seen = drive(&mut h, &mut first, |s| kinds(s).contains(&"finished"));
         drop(first);
-        let mut second = connect(&mut driver, Some(Mode::Putting));
-        let again = drive(&mut second, &flags, |s| kinds(s).contains(&"finished"));
+        let mut h = host(Some(Mode::Putting));
+        let mut second = h.connect(&mut driver).unwrap();
+        let again = drive(&mut h, &mut second, |s| kinds(s).contains(&"finished"));
         let number = |events: &[DeviceEvent]| {
             bodies(events).find_map(|b| match b {
                 FrpBody::ShotTrigger(t) => Some(t.key.shot_number),
@@ -629,9 +598,9 @@ mod tests {
             ..fast()
         })
         .unwrap();
-        let mut session = connect(&mut driver, Some(Mode::Full));
-        let flags = HostFlags::new();
-        let _ = drive(&mut session, &flags, |s| blocker_values(s).len() >= 2);
+        let mut h = host(Some(Mode::Full));
+        let mut session = h.connect(&mut driver).unwrap();
+        let _ = drive(&mut h, &mut session, |s| blocker_values(s).len() >= 2);
         session
             .hints(
                 &TurnHints::default()
@@ -639,7 +608,7 @@ mod tests {
                     .with_handedness(crate::Handedness::Left),
             )
             .unwrap();
-        let seen = drive(&mut session, &flags, |s| kinds(s).contains(&"finished"));
+        let seen = drive(&mut h, &mut session, |s| kinds(s).contains(&"finished"));
         let launch = bodies(&seen).find_map(|b| match b {
             FrpBody::ShotLaunch(m) => Some(&m.launch),
             _ => None,
@@ -655,11 +624,11 @@ mod tests {
             ..fast()
         })
         .unwrap();
-        let mut session = connect(&mut driver, Some(Mode::Putting));
-        let flags = HostFlags::new();
-        let _ = drive(&mut session, &flags, |s| blocker_values(s).len() >= 2);
+        let mut h = host(Some(Mode::Putting));
+        let mut session = h.connect(&mut driver).unwrap();
+        let _ = drive(&mut h, &mut session, |s| blocker_values(s).len() >= 2);
         session.hints(&TurnHints::default()).unwrap();
-        let seen = drive(&mut session, &flags, |s| kinds(s).contains(&"finished"));
+        let seen = drive(&mut h, &mut session, |s| kinds(s).contains(&"finished"));
         let launch = bodies(&seen).find_map(|b| match b {
             FrpBody::ShotLaunch(m) => Some(&m.launch),
             _ => None,
@@ -671,39 +640,22 @@ mod tests {
     #[test]
     fn a_held_shot_takes_no_number_and_fires_when_allowed() {
         let mut driver = MockDriver::new(fast()).unwrap();
-        let mut session = connect(&mut driver, None);
-        let flags = HostFlags::new();
-        flags.set_shots_allowed(false);
+        let mut h = host(None);
+        let mut session = h.connect(&mut driver).unwrap();
+        h.flags.set_shots_allowed(false);
         // Ready and past the interval, but held: no trigger, no new blocker.
-        let held = drive(&mut session, &flags, |s| {
+        let held = drive(&mut h, &mut session, |s| {
             blocker_values(s).contains(&String::new())
         });
-        let more = {
-            let mut seen = Vec::new();
-            for _ in 0..20 {
-                let mut sink = |e: DeviceEvent| {
-                    if matches!(
-                        e,
-                        DeviceEvent::Frp(_) | DeviceEvent::Status(_) | DeviceEvent::StatusChange(_)
-                    ) {
-                        seen.push(e);
-                    }
-                };
-                session
-                    .poll(
-                        Duration::from_millis(5),
-                        &mut Events::new(&mut sink, &flags),
-                    )
-                    .unwrap();
-            }
-            seen
-        };
+        h.run_for(MockConfig::secs(60.0), |now, out| session.step(now, out))
+            .unwrap();
+        let more = h.take_frp();
         assert!(!kinds(&held).contains(&"trigger") && !kinds(&more).contains(&"trigger"));
         assert!(blocker_values(&more).is_empty(), "no blocker while held");
         assert_eq!(session.ids.count(), 0, "no shot number taken");
 
-        flags.set_shots_allowed(true);
-        let seen = drive(&mut session, &flags, |s| kinds(s).contains(&"finished"));
+        h.flags.set_shots_allowed(true);
+        let seen = drive(&mut h, &mut session, |s| kinds(s).contains(&"finished"));
         let trigger = bodies(&seen).find_map(|b| match b {
             FrpBody::ShotTrigger(t) => Some(t.key.shot_number),
             _ => None,
@@ -714,24 +666,28 @@ mod tests {
     #[test]
     fn close_reports_not_armed() {
         let mut driver = MockDriver::new(MockConfig::default()).unwrap();
-        let session = connect(&mut driver, None);
-        let flags = HostFlags::new();
-        let mut seen = Vec::new();
-        let mut sink = |e: DeviceEvent| seen.push(e);
-        session.close(&mut Events::new(&mut sink, &flags)).unwrap();
-        assert_eq!(blocker_values(&seen), ["not_armed"]);
+        let mut h = host(None);
+        let session = h.connect(&mut driver).unwrap();
+        h.with(|_, out| session.close(out)).unwrap();
+        assert_eq!(blocker_values(&h.take()), ["not_armed"]);
     }
 
     #[test]
     fn the_serial_is_optional_and_names_the_device() {
         let mut driver = MockDriver::new(fast()).unwrap();
-        assert_eq!(connect(&mut driver, None).identity().device, "MockLM-0001");
+        assert_eq!(
+            host(None).connect(&mut driver).unwrap().identity().device,
+            "MockLM-0001"
+        );
         let mut driver = MockDriver::new(MockConfig {
             serial: Some("ABC9".to_owned()),
             ..fast()
         })
         .unwrap();
-        assert_eq!(connect(&mut driver, None).identity().device, "MockLM-ABC9");
+        assert_eq!(
+            host(None).connect(&mut driver).unwrap().identity().device,
+            "MockLM-ABC9"
+        );
         let config = MockConfig::from_map(
             serde_json::json!({ "serial": "7" })
                 .as_object()
@@ -807,9 +763,9 @@ mod tests {
             serial: None,
             post_shot_delay_s: f64::NEG_INFINITY,
         });
-        let mut session = connect(&mut driver, None);
-        let flags = HostFlags::new();
-        let seen = drive(&mut session, &flags, |s| kinds(s).contains(&"finished"));
+        let mut h = host(None);
+        let mut session = h.connect(&mut driver).unwrap();
+        let seen = drive(&mut h, &mut session, |s| kinds(s).contains(&"finished"));
         assert!(kinds(&seen).contains(&"launch"), "a shot, without a panic");
     }
 

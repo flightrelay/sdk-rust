@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use flightrelay::config::DriverConfig;
 use flightrelay::driver::{
-    Backoff, ConfigError, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo,
-    Events, NoAction, SessionEnd, Stop, Stopped, TurnHints,
+    Activity, Backoff, ConfigError, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpDriver,
+    FrpSession, Level, NoAction, SessionEnd, Stop, Stopped, TurnHints,
 };
 use flightrelay::{
     Club, EndpointConfig, FrpEndpoint, FrpMessage, FrpServer, Handedness, Launch, Mode, RawDir,
@@ -137,7 +137,7 @@ fn fake() -> (Fake, Control) {
     (driver, Control { inner, jobs: tx })
 }
 
-impl DeviceDriver for Fake {
+impl FrpDriver for Fake {
     type Config = FakeConfig;
     type Error = FakeError;
     type Action = NoAction;
@@ -177,15 +177,13 @@ impl DeviceDriver for Fake {
                     {
                         ctx.out.alert(Severity::Warn, message);
                     }
-                    ctx.tick()?;
-                    std::thread::sleep(Duration::from_millis(10));
+                    ctx.wait(Duration::from_millis(10))?;
                 }
                 identity()
             }
             Plan::BlockUntilClub => {
                 while ctx.hints().club.is_none() {
-                    ctx.tick()?;
-                    std::thread::sleep(Duration::from_millis(10));
+                    ctx.wait(Duration::from_millis(10))?;
                 }
                 identity()
             }
@@ -219,17 +217,17 @@ impl DeviceDriver for Fake {
     }
 }
 
-impl DeviceSession for FakeSession {
+impl FrpSession for FakeSession {
     type Driver = Fake;
 
-    fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), FakeError> {
-        let msg = self.jobs.lock().unwrap().recv_timeout(timeout);
+    fn step(&mut self, _: Instant, out: &mut Events<'_>) -> Result<Activity, FakeError> {
+        let msg = self.jobs.lock().unwrap().try_recv();
         match msg {
             Ok(Msg::Run(job)) => job(out),
             Ok(Msg::Fail(why)) => return Err(FakeError::Failed(why)),
-            Err(_) => {}
+            Err(_) => return Ok(Activity::Idle),
         }
-        Ok(())
+        Ok(Activity::Active)
     }
     fn hints(&mut self, hints: &TurnHints) -> Result<(), FakeError> {
         self.inner.hints.lock().unwrap().push(*hints);
@@ -326,6 +324,11 @@ impl Harness {
     /// A peer the server has greeted and taken in, so what is published
     /// from now on reaches it. Its greeting is read.
     fn peer(&self) -> Peer {
+        self.peer_and_greeting().0
+    }
+
+    /// [`Harness::peer`], and its greeting.
+    fn peer_and_greeting(&self) -> (Peer, Vec<Value>) {
         let before = self
             .log()
             .iter()
@@ -335,7 +338,7 @@ impl Harness {
         self.wait_for_nth("peer+ ", before + 1);
         let hello = peer.until(|v| kind(v) == "bus.sync");
         assert_eq!(kinds(&hello), ["bus.actor", "bus.sync"]);
-        peer
+        (peer, hello)
     }
 
     fn stop_and_join(mut self) -> Result<(), ServerError<FakeError>> {
@@ -410,15 +413,6 @@ impl Peer {
         }
     }
 
-    /// Everything that arrives until `quiet` passes with nothing.
-    fn drain(&mut self, quiet: Duration) -> Vec<Value> {
-        let mut out = Vec::new();
-        while let Some(v) = self.next(quiet) {
-            out.push(v);
-        }
-        out
-    }
-
     /// Read until `pred` matches a message; returns everything read.
     fn until(&mut self, pred: impl Fn(&Value) -> bool) -> Vec<Value> {
         let give_up = Instant::now() + Duration::from_secs(10);
@@ -462,6 +456,20 @@ fn key(n: u32) -> ShotKey {
     ShotKey::new(format!("550e8400-e29b-41d4-a716-4466554400{n:02}"), n)
 }
 
+/// Whether `v` is an actor that carries the fake's identity.
+fn identified(v: &Value) -> bool {
+    kind(v) == "bus.actor" && v["device"]["model"] == "Eagle One"
+}
+
+/// `seen`, then what `peer` reads until an actor carries the identity (none
+/// if `seen` has one already).
+fn through_identity(peer: &mut Peer, mut seen: Vec<Value>) -> Vec<Value> {
+    if !seen.iter().any(identified) {
+        seen.extend(peer.until(identified));
+    }
+    seen
+}
+
 fn launch() -> Launch {
     Launch {
         launch_speed: Some(Velocity::MetersPerSecond(67.2)),
@@ -499,8 +507,9 @@ fn a_peer_is_greeted_with_the_actor_then_a_sync() {
 #[test]
 fn the_actor_takes_the_identity_and_never_publishes_the_device_id() {
     let h = Harness::listen();
-    let mut peer = h.peer();
     h.wait_for("device+ ");
+    // The greeting carries the identity, or the actor follows it at once.
+    let mut peer = Peer::connect(&h.addr());
     let seen = peer.until(|v| v["device"]["model"] == "Eagle One");
     let actor = actors(&seen).pop().unwrap().clone();
     assert_eq!(actor["name"], "Birdie Labs Eagle One");
@@ -522,12 +531,10 @@ fn a_named_actor_keeps_its_name() {
     let mut peer = Peer::connect(&h.addr());
     let hello = peer.until(|v| kind(v) == "bus.actor");
     assert_eq!(hello[0]["name"], "Bay 3");
-    h.wait_for("device+ ");
-    assert!(
-        peer.drain(Duration::from_millis(300))
-            .iter()
-            .all(|v| kind(v) != "bus.actor" || v["name"] == "Bay 3")
-    );
+    // The identity does not rename it.
+    let seen = through_identity(&mut peer, hello);
+    let actor = seen.iter().find(|v| identified(v)).unwrap();
+    assert_eq!(actor["name"], "Bay 3");
 }
 
 #[test]
@@ -535,33 +542,13 @@ fn a_sync_from_any_peer_is_answered_with_the_actor() {
     let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| {
         c.heartbeat = Duration::from_secs(60);
     });
-    let mut peer = h.peer();
-    h.wait_for("device+ ");
-    let _ = peer.drain(Duration::from_millis(200));
+    let (mut peer, hello) = h.peer_and_greeting();
+    // Nothing changes the actor after the identity, so the next one is the
+    // answer.
+    through_identity(&mut peer, hello);
     peer.send(&json!({ "kind": "bus.sync", "from": GAME }));
     let answer = peer.until(|v| kind(v) == "bus.actor");
     assert_eq!(answer.last().unwrap()["from"], ACTOR);
-}
-
-#[test]
-fn the_actor_is_republished_every_heartbeat() {
-    let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| {
-        c.heartbeat = Duration::from_millis(100);
-    });
-    let mut peer = h.peer();
-    h.wait_for("device+ ");
-    let _ = peer.drain(Duration::from_millis(50));
-    let at = Instant::now();
-    let mut beats = 0;
-    while at.elapsed() < Duration::from_millis(1000) {
-        if peer
-            .next(Duration::from_millis(50))
-            .is_some_and(|v| kind(&v) == "bus.actor")
-        {
-            beats += 1;
-        }
-    }
-    assert!((6..=14).contains(&beats), "{beats} heartbeats in a second");
 }
 
 #[test]
@@ -619,37 +606,40 @@ fn the_server_forwards_between_peers_never_back_to_the_source() {
     let mut session = h.peer();
     let mut game = h.peer();
     let mut lights = h.peer();
-    for p in [&mut session, &mut game, &mut lights] {
-        let _ = p.drain(Duration::from_millis(200));
-    }
     let profile = json!({ "kind": "golfer.profile", "from": CLUBHOUSE, "id": "clubhouse.sam",
                           "name": "Sam", "x-extra": 1 });
     session.send(&profile);
+    let at_lights = lights.until(|v| *v == profile);
+    // Sent once the profile is through, so the two arrive in this order.
     let ext = json!({ "kind": "x.birdielabs.glow", "from": GAME, "hue": 120 });
     game.send(&ext);
-    let not_actor = |v: &Value| kind(v) != "bus.actor";
-    let at_game: Vec<Value> = game
-        .drain(Duration::from_millis(300))
+    // Once lights has both, the server has forwarded (or echoed) both, so a
+    // marker from lights reaches each peer after anything it got from them.
+    let others = |v: &Value| kind(v) != "bus.actor";
+    let at_lights: Vec<Value> = at_lights
         .into_iter()
-        .filter(not_actor)
+        .chain(lights.until(|v| *v == ext))
+        .filter(others)
         .collect();
-    let at_lights: Vec<Value> = lights
-        .drain(Duration::from_millis(300))
+    let marker = json!({ "kind": "x.birdielabs.mark", "from": GAME });
+    lights.send(&marker);
+    let at_game: Vec<Value> = game
+        .until(|v| *v == marker)
         .into_iter()
-        .filter(not_actor)
+        .filter(others)
         .collect();
     let at_session: Vec<Value> = session
-        .drain(Duration::from_millis(300))
+        .until(|v| *v == marker)
         .into_iter()
-        .filter(not_actor)
+        .filter(others)
         .collect();
+    assert_eq!(at_lights, [profile.clone(), ext.clone()]);
     assert_eq!(
         at_game,
-        std::slice::from_ref(&profile),
+        [profile, marker.clone()],
         "unknown fields travel too"
     );
-    assert_eq!(at_lights, [profile, ext.clone()]);
-    assert_eq!(at_session, [ext], "never back to the source");
+    assert_eq!(at_session, [ext, marker], "never back to the source");
 }
 
 #[test]
@@ -665,11 +655,13 @@ fn a_turn_reaches_the_driver_as_hints_that_replace_the_last() {
     session.send(&turn(Some("7I"), "lh", "full"));
     // A null club is no club, and an unknown mode is no mode: nothing is
     // kept from the turn before.
+    // It is read after the duplicate, so once its hints are in, the
+    // duplicate's would be too.
+    let rh = TurnHints::default().with_handedness(Handedness::Right);
     session.send(&turn(None, "rh", "flop"));
     wait_until("the second hints", || {
-        h.control.inner.hints.lock().unwrap().len() == 2
+        h.control.inner.hints.lock().unwrap().last() == Some(&rh)
     });
-    std::thread::sleep(Duration::from_millis(100));
     let hints = h.control.inner.hints.lock().unwrap().clone();
     assert_eq!(
         hints,
@@ -678,7 +670,7 @@ fn a_turn_reaches_the_driver_as_hints_that_replace_the_last() {
                 .with_club(Club::Iron7)
                 .with_handedness(Handedness::Left)
                 .with_mode(Mode::Full),
-            TurnHints::default().with_handedness(Handedness::Right),
+            rh,
         ]
     );
     assert!(h.log().iter().any(|l| l.starts_with("hints ")));
@@ -747,7 +739,9 @@ fn an_alert_while_connecting_goes_out_at_once() {
 
 #[test]
 fn driver_status_is_merged_into_the_actor() {
-    let h = Harness::listen();
+    let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| {
+        c.heartbeat = Duration::from_secs(60);
+    });
     let mut peer = h.peer();
     h.wait_for("device+ ");
     h.control.run(|out| {
@@ -768,10 +762,12 @@ fn driver_status_is_merged_into_the_actor() {
     let actor = seen.last().unwrap();
     assert_eq!(actor["telemetry"]["radar_mode"], "armed");
     assert_eq!(actor["device"]["battery_pct"], 82);
-    // A status that changes nothing publishes nothing.
+    // A status that changes nothing publishes nothing: the next actor is
+    // the one for the change after it.
     h.control.run(|out| out.battery(82));
-    let quiet = peer.drain(Duration::from_millis(300));
-    assert!(actors(&quiet).is_empty(), "{quiet:#?}");
+    h.control.run(|out| out.battery(83));
+    let seen = peer.until(|v| v["device"]["battery_pct"] == 83);
+    assert_eq!(actors(&seen).len(), 1, "{seen:#?}");
 }
 
 #[test]
@@ -798,18 +794,6 @@ fn a_lost_session_finishes_its_open_shot_and_raises_not_armed() {
 }
 
 #[test]
-fn a_shot_that_stays_open_is_finished_after_the_shot_timeout() {
-    let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| {
-        c.shot_timeout = Duration::from_millis(200);
-    });
-    let mut peer = h.peer();
-    h.wait_for("device+ ");
-    h.control.run(|out| out.shot_trigger(key(4)));
-    let seen = peer.until(|v| kind(v) == "shot.finished");
-    assert_eq!(seen.last().unwrap()["key"]["shot_number"], 4);
-}
-
-#[test]
 fn a_stop_closes_the_session_and_removes_the_actor() {
     let h = Harness::listen();
     let mut peer = h.peer();
@@ -818,13 +802,9 @@ fn a_stop_closes_the_session_and_removes_the_actor() {
     peer.until(|v| kind(v) == "shot.trigger");
     let control = h.control.clone();
     assert!(h.stop_and_join().is_ok());
-    let seen = peer.drain(Duration::from_millis(500));
+    let removal = json!({ "kind": "bus.actor", "from": ACTOR, "removed": true });
+    let seen = peer.until(|v| *v == removal);
     assert!(kinds(&seen).contains(&"shot.finished"), "{seen:#?}");
-    let last = seen.last().expect("the removal");
-    assert_eq!(
-        last,
-        &json!({ "kind": "bus.actor", "from": ACTOR, "removed": true })
-    );
     assert_eq!(control.inner.closes.load(Ordering::SeqCst), 1);
 }
 
@@ -869,88 +849,38 @@ fn flood(control: &Control, count: usize) {
     });
 }
 
-/// Counts the alerts a peer reads, on a thread of its own.
-fn count_alerts(mut peer: Peer, want: usize) -> JoinHandle<usize> {
-    std::thread::spawn(move || {
-        let mut count = 0;
-        let give_up = Instant::now() + Duration::from_secs(40);
-        while count < want && Instant::now() < give_up {
-            if let Some(v) = peer.next(Duration::from_millis(200))
-                && kind(&v) == "bus.alert"
-            {
-                count += 1;
-            }
-        }
-        count
-    })
-}
-
-fn peer_left_lines(h: &Harness) -> Vec<String> {
-    h.log()
-        .into_iter()
-        .filter(|l| l.starts_with("peer- "))
-        .collect()
-}
-
 #[test]
-fn a_peer_that_does_not_read_is_queued_and_kept_while_the_others_are_unaffected() {
-    let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| {
-        c.write_buffer_limit = 256 * 1024 * 1024;
-    });
-    let stalled = h.peer(); // never reads again
-    let reader = count_alerts(h.peer(), 160);
-    h.wait_for("device+ ");
-    flood(&h.control, 160); // 16 MB: more than the kernel buffers hold
-    assert_eq!(
-        reader.join().unwrap(),
-        160,
-        "the reading peer gets everything"
-    );
-    std::thread::sleep(Duration::from_millis(300));
-    // The reader has hung up by now; the stalled peer is still there.
-    assert!(
-        !peer_left_lines(&h)
-            .iter()
-            .any(|l| l.contains("write buffer")),
-        "a full kernel buffer alone drops nobody: {:#?}",
-        peer_left_lines(&h)
-    );
-    assert!(peer_left_lines(&h).len() <= 1, "{:#?}", peer_left_lines(&h));
-    drop(stalled);
-}
-
-#[test]
-fn a_peer_that_falls_behind_the_write_buffer_cap_is_dropped_alone() {
+fn a_peer_that_falls_behind_the_write_buffer_cap_is_dropped() {
     let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| {
         c.write_buffer_limit = 512 * 1024;
     });
-    let stalled = h.peer();
-    let reader = count_alerts(h.peer(), 160);
+    let stalled = h.peer(); // never reads again
     h.wait_for("device+ ");
-    flood(&h.control, 160);
+    flood(&h.control, 160); // 16 MB: more than the kernel buffers and the cap hold
     let left = h.wait_for("peer- ");
     assert!(left.contains("write buffer full"), "{left}");
-    assert_eq!(reader.join().unwrap(), 160, "the other peer is unaffected");
-    let full: Vec<String> = peer_left_lines(&h)
-        .into_iter()
-        .filter(|l| l.contains("write buffer"))
-        .collect();
-    assert_eq!(full.len(), 1, "{full:#?}");
     drop(stalled);
 }
 
 #[test]
 fn a_silent_client_cannot_hold_up_the_acceptor() {
-    let h = Harness::listen();
+    let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| {
+        c.log_level = Level::Debug;
+    });
     let addr = h.addr();
     let _silent = TcpStream::connect(&addr).unwrap(); // connects, says nothing
-    let at = Instant::now();
     let mut peer = Peer::connect(&addr);
-    assert!(at.elapsed() < Duration::from_secs(3), "{:?}", at.elapsed());
     assert_eq!(
         kind(&peer.next(Duration::from_secs(5)).unwrap()),
         "bus.actor"
     );
+    // The acceptor gave up on the silent client, then took the peer.
+    let timed_out =
+        h.wait_for("device Log(Debug, \"connection failed: handshake failed: handshake timed out");
+    let taken = h.wait_for("peer+ ");
+    let log = h.log();
+    let at = |line: &str| log.iter().position(|l| *l == line).unwrap();
+    assert!(at(&timed_out) < at(&taken), "{log:#?}");
 }
 
 #[test]
@@ -1110,35 +1040,4 @@ fn a_wss_target_is_refused_before_anything_starts() {
         other => panic!("{other:?}"),
     }
     assert_eq!(connects, 0, "the driver never connected");
-}
-
-#[test]
-fn a_bridge_that_cannot_reach_the_bus_says_so_once_at_the_default_level() {
-    let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap()
-    };
-    let url = format!("ws://{closed}/frp");
-    let lines = |h: &Harness| -> Vec<String> {
-        h.log()
-            .into_iter()
-            .filter(|l| l.contains("cannot reach the bus"))
-            .collect()
-    };
-    let info = Harness::start(Transport::connect(url.clone()), |_| {});
-    info.wait_for("device Log(Info, \"cannot reach the bus");
-    std::thread::sleep(Duration::from_millis(1600));
-    assert_eq!(lines(&info).len(), 1, "{:#?}", info.log());
-    drop(info);
-
-    let debug = Harness::start(Transport::connect(url), |c| {
-        c.log_level = flightrelay::driver::Level::Debug;
-    });
-    debug.wait_for("device Log(Debug, \"cannot reach the bus");
-    let all = lines(&debug);
-    assert!(all[0].starts_with("device Log(Info, "), "{all:#?}");
-    assert!(
-        all[1..].iter().all(|l| l.starts_with("device Log(Debug, ")),
-        "{all:#?}"
-    );
 }

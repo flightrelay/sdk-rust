@@ -57,9 +57,11 @@ impl fmt::Display for Level {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum DeviceEvent {
-    /// A message body of this launch monitor: a `shot.*` message or a
-    /// `bus.alert`. The host publishes it with the actor's id as `from`;
-    /// other kinds are not the driver's to send, and the host drops them.
+    /// A message body of this actor, of a kind its roles send: `shot.*` for
+    /// a launch monitor, `game.*` and `golfer.profile` for a game, and
+    /// `golfer.select`, `bus.reply` and `bus.alert` for any. The host
+    /// publishes it with the actor's id as `from`; other kinds are not the
+    /// driver's to send, and the host drops them.
     Frp(FrpBody),
     /// The device's whole status: blockers, battery, attitude, telemetry.
     /// It replaces the status the host holds, so a value it leaves out is

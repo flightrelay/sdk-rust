@@ -2,14 +2,14 @@
 
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use super::*;
 use crate::config::is_default;
 use crate::driver::{
-    ConnectCtx, DeviceIdentity, DeviceSession, DriverInfo, Events, NoAction, Stopped,
+    Activity, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpSession, NoAction, Stopped,
 };
 use crate::{EndpointConfig, FrpEndpoint, FrpMessage, Source};
 
@@ -82,7 +82,7 @@ impl From<Stopped> for FakeError {
 struct Fake(Cfg);
 struct FakeSession(DeviceIdentity);
 
-impl DeviceDriver for Fake {
+impl FrpDriver for Fake {
     type Config = Cfg;
     type Error = FakeError;
     type Action = NoAction;
@@ -126,11 +126,10 @@ impl DeviceDriver for Fake {
     }
 }
 
-impl DeviceSession for FakeSession {
+impl FrpSession for FakeSession {
     type Driver = Fake;
-    fn poll(&mut self, timeout: Duration, _: &mut Events<'_>) -> Result<(), FakeError> {
-        std::thread::sleep(timeout.min(Duration::from_millis(10)));
-        Ok(())
+    fn step(&mut self, _: Instant, _: &mut Events<'_>) -> Result<Activity, FakeError> {
+        Ok(Activity::Idle)
     }
     fn identity(&self) -> &DeviceIdentity {
         &self.0

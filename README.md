@@ -15,7 +15,7 @@ This crate implements FRP 0.3.0 (`SPEC_VERSION`).
 - **Bus state** — `BusState` keeps the current state of the bus by (kind, from, id), applies removals, and drops an actor after three missed heartbeats
 - **WebSocket binding** — `FrpEndpoint` listens or dials and yields `FrpConnection`s with synchronous send/recv (`recv_timeout` waits no longer than a heartbeat is due); `greet` sends what a side sends on connecting (its `bus.actor`s, their state, then `bus.sync`)
 - **Hub** — `Hub` forwards every message to every other connection, never back to its source
-- **Device drivers** — a `DeviceDriver` trait for a launch monitor, `FrpServer` to run one as an actor on the bus, `run` for a complete `main`, and a simulated `MockDriver`
+- **Device drivers** — a `FrpDriver` trait for a launch monitor, `FrpServer` to run one as an actor on the bus, `run` for a complete `main`, and a simulated `MockDriver`
 
 ## Features
 
@@ -25,7 +25,8 @@ This crate implements FRP 0.3.0 (`SPEC_VERSION`).
 | `controller` | `ShotAggregator`, `BusState` |
 | `transport` | `FrpEndpoint` / `FrpConnection`, `Hub` — the WebSocket binding |
 | `config` | `DriverConfig`, `ConfigError`, `is_default` — serde settings for a driver |
-| `driver` | the `DeviceDriver` / `DeviceSession` traits, `Events`, `TurnHints`, `DeviceStatus`, `StatusChange`, `Stop`, `Backoff`, `ShotIds`, `Live`, `connect_tcp` (implies `config`) |
+| `driver` | the `FrpDriver` / `FrpSession` traits, `Activity`, `IDLE`, `Events`, `TurnHints`, `DeviceStatus`, `StatusChange`, `Stop`, `Backoff`, `ShotIds`, `Live`, `connect_tcp` (implies `config`) |
+| `testing` | `TestHost`, a single-threaded host for driver tests with a stepped clock (implies `driver`) |
 | `server` | `FrpServer` (implies `driver` and `transport`) |
 | `main` | `run`, `run_with`, `run_args`, `config_actor_id` (implies `server`) |
 | `mock` | `MockDriver`, a simulated launch monitor (implies `driver`) |
@@ -184,7 +185,33 @@ A launch monitor can publish the protocol messages behind its shots as `shot.raw
 
 A driver connects one launch monitor to a host, as a launch monitor actor on the bus.
 
-A driver is built in two steps. `DeviceDriver::new(config)` validates a config and builds the driver, with no I/O, and the driver keeps whatever outlives one connection (a shot counter, a retry clock). `connect(&mut ctx)` opens one `DeviceSession`: transport, handshake with the device, identity. The host then calls `poll(timeout, &mut events)` until it fails or the host stops, and `close` to release the device. The host owns the reconnect loop and asks the driver for the delay (`retry_delay`). Everything is synchronous and caller-driven.
+A driver is built in two steps. `FrpDriver::new(config)` validates a config and builds the driver, with no I/O, and the driver keeps whatever outlives one connection (a shot counter, a retry clock). `connect(&mut ctx)` opens one `FrpSession`: transport, handshake with the device, identity. The host then steps the session until it fails or the host stops, and calls `close` to release the device. The host owns the reconnect loop and asks the driver for the delay (`retry_delay`). Everything is synchronous and caller-driven.
+
+Time is an input. A session implements one method, `step(now, &mut events)`: it handles what has arrived and what is due at `now`, returns without blocking, and says whether more is waiting (`Activity::Active`) or not (`Activity::Idle`). Every timer of the session compares against that `now`. A host runs it with the provided `poll(timeout, &mut events)`, which steps and waits `IDLE` (5 ms) after an idle step, or calls `step` itself. A connect reads the time with `ctx.now()` and lets it pass with `ctx.wait(d)`; every pass of a connect loop calls `ctx.wait` or `ctx.tick()`, which also return `Err(Stopped)` after a stop.
+
+```rust
+use std::time::Instant;
+use flightrelay::driver::{FrpSession, Events, Activity};
+
+impl FrpSession for BeaconSession {
+    type Driver = Beacon;
+
+    fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
+        match self.device.read()? {
+            Some(frame) => {
+                self.last_heard = now;
+                self.handle(frame, out);
+                Ok(Activity::Active)
+            }
+            None if now - self.last_heard > STALE => Err(Error::Stale),
+            None => Ok(Activity::Idle),
+        }
+    }
+    // identity, close, and optionally hints and action
+}
+```
+
+With the `testing` feature, `TestHost` is the host side of a driver test, on one thread with a clock that moves only when the test moves it: `host.connect(&mut driver)` (or `connect_with` for a connect over a fake transport), `host.run_for(d, |now, out| session.step(now, out))` to step through `d` of virtual time, `host.with(|now, out| ..)` for one step or a close, and `host.take()` for what the driver emitted. `stop_after_ticks(n)` stops a connect on its `n`th tick, and `tick_takes(d)` lets time pass for a connect that ticks but never waits. A ten-second timeout takes microseconds to test.
 
 A driver emits `DeviceEvent`s into the `Events` sink: `shot.*` messages and alerts (`out.launch(..)`, `out.flight(..)`, `out.alert(..)`), its status (`out.blockers([..])`, `out.ready(..)`, `out.battery(..)`, `out.attitude(..)`, `out.telemetry(..)`, `out.clear_telemetry(..)`, or the whole `DeviceStatus` at once with `out.status(..)`), and three host-only kinds (a phase, a log line, a discarded shot). The host holds the driver's current status and its `bus.actor` carries exactly that, so a driver takes a value off the same way it sets one:
 
@@ -201,7 +228,7 @@ out.status(DeviceStatus::new()     // the whole status: anything left out is off
     .with_telemetry("radar_mode", "armed"));
 ```
 
- It reads `golfer.turn` as `TurnHints`: each `golfer.turn` replaces all the hints, and a `null` or unrecognized field is `None`, no hint for that field, with nothing kept from an earlier turn. `DeviceSession::hints` gets the new set whenever it changes, and `ConnectCtx::hints()` shows the last complete turn's during a connect. The host keeps that set when the session actor goes away; what the hardware does for a field with no hint is the driver's business.
+ It reads `golfer.turn` as `TurnHints`: each `golfer.turn` replaces all the hints, and a `null` or unrecognized field is `None`, no hint for that field, with nothing kept from an earlier turn. `FrpSession::hints` gets the new set whenever it changes, and `ConnectCtx::hints()` shows the last complete turn's during a connect. The host keeps that set when the session actor goes away; what the hardware does for a field with no hint is the driver's business.
 
 To run a driver on the bus, give it to `FrpServer` with the actor id the host keeps:
 
