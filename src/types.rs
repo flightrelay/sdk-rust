@@ -1,24 +1,28 @@
-//! FRP domain types: shot key, ball launch, flight result, club data, face
-//! impact, raw frame, device info.
+//! FRP value types: the shot payloads (shot key, ball launch, flight result,
+//! club data, face impact, raw frame) and the values the bus kinds share
+//! (golfer id, position, club code, handedness, mode, source, severity),
+//! plus the standard role and blocker names.
 
 use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::units::{Distance, Velocity};
 
-/// Correlates shot lifecycle events. Generated once at trigger time, carried on
-/// every event in the shot sequence.
+/// Identifies a shot. Generated once by the launch monitor that saw the
+/// strike, carried on every `shot.*` message of the shot, whoever sends it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ShotKey {
     /// Unique shot ID (UUID v4 string).
     pub shot_id: String,
-    /// Monotonic counter from the device, for human display.
+    /// Counter from the launch monitor, for human display.
     pub shot_number: u32,
 }
 
 impl ShotKey {
-    /// A shot key from a UUID v4 `shot_id` and a device-supplied `shot_number`.
+    /// A shot key from a UUID v4 `shot_id` and a launch-monitor-supplied
+    /// `shot_number`.
     #[must_use]
     pub fn new(shot_id: impl Into<String>, shot_number: u32) -> Self {
         Self {
@@ -156,13 +160,14 @@ impl AssumedLaunch {
 }
 
 /// Results of the ball's flight: where it landed, where it came to rest, and
-/// how it flew. Sent in `flight_result`, at most one per shot.
+/// how it flew. Sent in `shot.flight`. A shot may have several, from its
+/// launch monitor and from flight models, told apart by the sender and
+/// [`model`](Self::model).
 ///
 /// [`basis`](Self::basis) is required on the wire: JSON without it, or with a
 /// value other than `"tracked"` or `"modeled"`, does not parse as a
-/// `FlightResult`. Inside an [`FrpEnvelope`](crate::FrpEnvelope) such an
-/// event parses as [`FrpEvent::Unknown`](crate::FrpEvent::Unknown), so a
-/// controller ignores it.
+/// `FlightResult`. A `shot.flight` with such a `flight` parses as
+/// [`FrpBody::Unknown`](crate::FrpBody::Unknown), so a receiver ignores it.
 ///
 /// [`assumed`](Self::assumed) carries the launch values a flight model
 /// assumed, on a [`Modeled`](Basis::Modeled) result only. Build one with
@@ -320,20 +325,19 @@ pub struct FaceImpact {
     pub vertical: Option<Distance>,
 }
 
-/// One protocol message behind a device's FRP events, sent as `raw_frame`
-/// for debugging.
+/// One protocol message behind a launch monitor's FRP messages, sent as
+/// `shot.raw` for debugging.
 ///
-/// A device sends raw frames only to a controller that asked for them with
-/// `raw_frames` in its `start`, and never a frame that carries device or
-/// user identity (serial numbers, hardware addresses, network names,
-/// account data). Raw frames are not shot events: they never create,
-/// complete or change a shot, even with a [`key`](Self::key).
+/// An actor sends raw frames only when its own configuration turns them on,
+/// and never a frame that carries device or user identity (serial numbers,
+/// hardware addresses, network names, account data). Relays may drop them.
+/// Raw frames never create, complete or change a shot, even with a
+/// [`key`](Self::key).
 ///
 /// [`data`](Self::data) is opaque to FRP. On the wire it is lowercase
 /// hexadecimal; when parsing, either case is accepted, and a `data` that is
-/// not an even number of hexadecimal digits does not parse. Inside an
-/// [`FrpEnvelope`](crate::FrpEnvelope) such an event parses as
-/// [`FrpEvent::Unknown`](crate::FrpEvent::Unknown).
+/// not an even number of hexadecimal digits does not parse; such a
+/// `shot.raw` parses as [`FrpBody::Unknown`](crate::FrpBody::Unknown).
 ///
 /// ```
 /// use flightrelay::{RawDir, RawFrame};
@@ -351,9 +355,8 @@ pub struct FaceImpact {
 pub struct RawFrame {
     /// Direction, seen from the device implementation.
     pub dir: RawDir,
-    /// Per-device counter: increases by one for every raw frame the device
-    /// sends for its `device` id, so a controller sees gaps and a forwarder
-    /// recognizes a repeat.
+    /// Per-actor counter: increases by one for every raw frame the actor
+    /// sends, so a receiver sees gaps.
     pub seq: u64,
     /// When the device implementation received or sent the message, in
     /// milliseconds since the Unix epoch (UTC) by the device's clock. A value
@@ -361,7 +364,7 @@ pub struct RawFrame {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::message::deserialize_lenient"
+        deserialize_with = "crate::lenient::option"
     )]
     pub timestamp: Option<u64>,
     /// Short text the device implementation chooses, e.g. the message's name.
@@ -369,7 +372,7 @@ pub struct RawFrame {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::message::deserialize_lenient"
+        deserialize_with = "crate::lenient::option"
     )]
     pub label: Option<String>,
     /// The message's bytes: exactly one protocol message, as the device
@@ -381,7 +384,7 @@ pub struct RawFrame {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::message::deserialize_lenient"
+        deserialize_with = "crate::lenient::option"
     )]
     pub key: Option<ShotKey>,
 }
@@ -469,12 +472,444 @@ mod hex {
     }
 }
 
-/// Standard telemetry key constants.
-pub mod telemetry {
-    pub const READY: &str = "ready";
-    pub const BATTERY_PCT: &str = "battery_pct";
-    pub const TILT: &str = "tilt";
-    pub const ROLL: &str = "roll";
+/// Alert severity level, on `bus.alert`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// Something went wrong that the sender handled.
+    Warn,
+    /// Something failed.
+    Error,
+    /// The sender can't continue and may go away.
+    Critical,
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Warn => write!(f, "warn"),
+            Self::Error => write!(f, "error"),
+            Self::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+/// Where a launch monitor's shots originate, declared in the `device` block
+/// of its `bus.actor`.
+///
+/// `None` where a `Source` is optional means unknown. A receiver that
+/// requires measured shots treats unknown as not measured. Relaying a shot
+/// never changes its source. New classes may be added in minor releases, so
+/// matches need a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Source {
+    /// A physical launch monitor measured the shots.
+    Measured,
+    /// No physical measurement: simulators, mocks, generated or test shots.
+    Virtual,
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Measured => write!(f, "measured"),
+            Self::Virtual => write!(f, "virtual"),
+        }
+    }
+}
+
+/// The kind of stroke the golfer is about to play, on `golfer.turn` and
+/// `golfer.select`. A launch monitor may tune its detection to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// A full swing.
+    Full,
+    /// A chip.
+    Chipping,
+    /// A putt.
+    Putting,
+}
+
+impl fmt::Display for Mode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => write!(f, "full"),
+            Self::Chipping => write!(f, "chipping"),
+            Self::Putting => write!(f, "putting"),
+        }
+    }
+}
+
+/// A golfer's handedness: `"rh"` or `"lh"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Handedness {
+    /// Right-handed.
+    #[serde(rename = "rh")]
+    Right,
+    /// Left-handed.
+    #[serde(rename = "lh")]
+    Left,
+}
+
+impl fmt::Display for Handedness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Right => write!(f, "rh"),
+            Self::Left => write!(f, "lh"),
+        }
+    }
+}
+
+/// A golfer's sex on `golfer.profile`, for published norms that depend on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sex {
+    /// `"male"`.
+    Male,
+    /// `"female"`.
+    Female,
+}
+
+/// A club code (`"DR"`, `"7I"`, `"PT"`, ...), from a closed set.
+///
+/// `Display` and `FromStr` use the same codes, case-sensitively. A receiver
+/// treats an unknown code as absent: where a message carries a club, an
+/// unknown code parses as `None` (or, in a bag, is left out), and the rest of
+/// the message still applies.
+///
+/// Ordered driver through putter, as in [`Club::ALL`]. New codes may be added
+/// in minor releases, so matches need a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Club {
+    #[serde(rename = "DR")]
+    Driver,
+    #[serde(rename = "MD")]
+    MiniDriver,
+    #[serde(rename = "2W")]
+    Wood2,
+    #[serde(rename = "3W")]
+    Wood3,
+    #[serde(rename = "4W")]
+    Wood4,
+    #[serde(rename = "5W")]
+    Wood5,
+    #[serde(rename = "6W")]
+    Wood6,
+    #[serde(rename = "7W")]
+    Wood7,
+    #[serde(rename = "8W")]
+    Wood8,
+    #[serde(rename = "9W")]
+    Wood9,
+    #[serde(rename = "1H")]
+    Hybrid1,
+    #[serde(rename = "2H")]
+    Hybrid2,
+    #[serde(rename = "3H")]
+    Hybrid3,
+    #[serde(rename = "4H")]
+    Hybrid4,
+    #[serde(rename = "5H")]
+    Hybrid5,
+    #[serde(rename = "6H")]
+    Hybrid6,
+    #[serde(rename = "7H")]
+    Hybrid7,
+    #[serde(rename = "8H")]
+    Hybrid8,
+    #[serde(rename = "9H")]
+    Hybrid9,
+    #[serde(rename = "1I")]
+    Iron1,
+    #[serde(rename = "2I")]
+    Iron2,
+    #[serde(rename = "3I")]
+    Iron3,
+    #[serde(rename = "4I")]
+    Iron4,
+    #[serde(rename = "5I")]
+    Iron5,
+    #[serde(rename = "6I")]
+    Iron6,
+    #[serde(rename = "7I")]
+    Iron7,
+    #[serde(rename = "8I")]
+    Iron8,
+    #[serde(rename = "9I")]
+    Iron9,
+    #[serde(rename = "PW")]
+    PitchingWedge,
+    #[serde(rename = "GW")]
+    GapWedge,
+    #[serde(rename = "SW")]
+    SandWedge,
+    #[serde(rename = "LW")]
+    LobWedge,
+    #[serde(rename = "PT")]
+    Putter,
+}
+
+impl Club {
+    /// Every club, driver through putter.
+    pub const ALL: &[Club] = &[
+        Club::Driver,
+        Club::MiniDriver,
+        Club::Wood2,
+        Club::Wood3,
+        Club::Wood4,
+        Club::Wood5,
+        Club::Wood6,
+        Club::Wood7,
+        Club::Wood8,
+        Club::Wood9,
+        Club::Hybrid1,
+        Club::Hybrid2,
+        Club::Hybrid3,
+        Club::Hybrid4,
+        Club::Hybrid5,
+        Club::Hybrid6,
+        Club::Hybrid7,
+        Club::Hybrid8,
+        Club::Hybrid9,
+        Club::Iron1,
+        Club::Iron2,
+        Club::Iron3,
+        Club::Iron4,
+        Club::Iron5,
+        Club::Iron6,
+        Club::Iron7,
+        Club::Iron8,
+        Club::Iron9,
+        Club::PitchingWedge,
+        Club::GapWedge,
+        Club::SandWedge,
+        Club::LobWedge,
+        Club::Putter,
+    ];
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Driver => "DR",
+            Self::MiniDriver => "MD",
+            Self::Wood2 => "2W",
+            Self::Wood3 => "3W",
+            Self::Wood4 => "4W",
+            Self::Wood5 => "5W",
+            Self::Wood6 => "6W",
+            Self::Wood7 => "7W",
+            Self::Wood8 => "8W",
+            Self::Wood9 => "9W",
+            Self::Hybrid1 => "1H",
+            Self::Hybrid2 => "2H",
+            Self::Hybrid3 => "3H",
+            Self::Hybrid4 => "4H",
+            Self::Hybrid5 => "5H",
+            Self::Hybrid6 => "6H",
+            Self::Hybrid7 => "7H",
+            Self::Hybrid8 => "8H",
+            Self::Hybrid9 => "9H",
+            Self::Iron1 => "1I",
+            Self::Iron2 => "2I",
+            Self::Iron3 => "3I",
+            Self::Iron4 => "4I",
+            Self::Iron5 => "5I",
+            Self::Iron6 => "6I",
+            Self::Iron7 => "7I",
+            Self::Iron8 => "8I",
+            Self::Iron9 => "9I",
+            Self::PitchingWedge => "PW",
+            Self::GapWedge => "GW",
+            Self::SandWedge => "SW",
+            Self::LobWedge => "LW",
+            Self::Putter => "PT",
+        }
+    }
+}
+
+impl fmt::Display for Club {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+impl FromStr for Club {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|club| club.code() == s)
+            .ok_or_else(|| format!("unknown club code: {s:?}"))
+    }
+}
+
+/// A golfer id: `<namespace>.<id>`, e.g. `backnine.local-3`.
+///
+/// The namespace is one or more lowercase ASCII letters, digits and `-`; the
+/// id after the first `.` is any non-empty string. The actor that lists the
+/// namespace in its `bus.actor` issues the ids in it and publishes their
+/// `golfer.profile`. Serializes as the plain string.
+///
+/// ```
+/// use flightrelay::GolferId;
+///
+/// let id: GolferId = "backnine.local-3".parse()?;
+/// assert_eq!(id.namespace(), "backnine");
+/// assert_eq!(id.local(), "local-3");
+/// assert!("Back.nine".parse::<GolferId>().is_err());
+/// # Ok::<(), flightrelay::InvalidGolferId>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct GolferId(String);
+
+/// A string that is not a valid [`GolferId`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("not a golfer id (<namespace>.<id>): {0:?}")]
+pub struct InvalidGolferId(pub String);
+
+impl GolferId {
+    /// The id `local` in `namespace`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidGolferId`] when the namespace is empty or holds a
+    /// character other than a lowercase ASCII letter, digit or `-`, or when
+    /// `local` is empty.
+    pub fn new(namespace: &str, local: &str) -> Result<Self, InvalidGolferId> {
+        format!("{namespace}.{local}").parse()
+    }
+
+    /// The namespace: everything before the first `.`.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        self.0.split_once('.').map_or("", |(ns, _)| ns)
+    }
+
+    /// The id within the namespace: everything after the first `.`.
+    #[must_use]
+    pub fn local(&self) -> &str {
+        self.0.split_once('.').map_or("", |(_, id)| id)
+    }
+
+    /// The whole id, as on the wire.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for GolferId {
+    type Err = InvalidGolferId;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let valid = s.split_once('.').is_some_and(|(ns, id)| {
+            !ns.is_empty()
+                && !id.is_empty()
+                && ns
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        });
+        if valid {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(InvalidGolferId(s.to_owned()))
+        }
+    }
+}
+
+impl fmt::Display for GolferId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for GolferId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// A position in a game's own world frame: three unit-tagged distances
+/// `[x, y, z]`, z up. Only the game that sent it interprets x and y; others
+/// may compare positions from the same game.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Position(pub [Distance; 3]);
+
+impl Position {
+    /// A position from its three coordinates.
+    #[must_use]
+    pub fn new(x: Distance, y: Distance, z: Distance) -> Self {
+        Self([x, y, z])
+    }
+
+    /// The x coordinate.
+    #[must_use]
+    pub fn x(&self) -> Distance {
+        self.0[0]
+    }
+
+    /// The y coordinate.
+    #[must_use]
+    pub fn y(&self) -> Distance {
+        self.0[1]
+    }
+
+    /// The z coordinate (up).
+    #[must_use]
+    pub fn z(&self) -> Distance {
+        self.0[2]
+    }
+}
+
+/// Standard role names for [`BusActor::roles`](crate::BusActor::roles).
+/// Other strings are allowed.
+pub mod roles {
+    /// Owns `golfer.turn` and answers `golfer.select`.
+    pub const SESSION: &str = "session";
+    /// Owns `practice.block` and answers `practice.new_block`.
+    pub const PRACTICE: &str = "practice";
+    /// Owns `game.round`, `game.scores` and `game.ball`, sends
+    /// `game.stroke`, and answers `game.aim`.
+    pub const GAME: &str = "game";
+    /// Publishes shots. Owns nothing.
+    pub const LAUNCH_MONITOR: &str = "launch_monitor";
+    /// Publishes `shot.flight` for shots it saw launched. Owns nothing.
+    pub const FLIGHT_MODEL: &str = "flight_model";
+    /// Lighting. Owns nothing.
+    pub const LIGHTS: &str = "lights";
+    /// Collects and shows what happens on the bus. Owns nothing.
+    pub const COLLECTOR: &str = "collector";
+}
+
+/// Standard blocker names for [`BusActor::blockers`](crate::BusActor::blockers).
+/// Values are open strings; a receiver shows an unknown one as is.
+pub mod blockers {
+    /// Launch monitor: not ready to detect a shot.
+    pub const NOT_ARMED: &str = "not_armed";
+    /// Launch monitor: no ball seen in the hitting area.
+    pub const NO_BALL: &str = "no_ball";
+    /// Session: the user paused play.
+    pub const PAUSED: &str = "paused";
+    /// Game: no round or ball in play.
+    pub const NOT_IN_PLAY: &str = "not_in_play";
+    /// Game: a menu, loading screen or similar is in the way.
+    pub const INTERRUPTED: &str = "interrupted";
+    /// Game: the golfer up isn't playing at this simulator.
+    pub const NOT_YOUR_TURN: &str = "not_your_turn";
+    /// Game: the previous ball is still moving.
+    pub const SHOT_IN_PROGRESS: &str = "shot_in_progress";
+    /// Game: waiting on a ruling or a choice (see `game.ball.decision`).
+    pub const AWAITING_DECISION: &str = "awaiting_decision";
+    /// Game: outside control is turned off.
+    pub const CONTROLS_DISABLED: &str = "controls_disabled";
 }
 
 #[cfg(test)]

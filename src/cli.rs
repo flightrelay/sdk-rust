@@ -1,4 +1,5 @@
-//! [`run`]: a complete `main` for a [`DeviceDriver`].
+//! [`run`]: a complete `main` for a [`DeviceDriver`], and
+//! [`config_actor_id`] for a binary that builds its own [`FrpServer`].
 //!
 //! Requires the `main` feature. A binary is one line:
 //!
@@ -18,8 +19,8 @@
 //! ```
 //!
 //! - `--config <path>`: a TOML file holding the driver's config table at the
-//!   top level. Without it the config starts from
-//!   [`RunOptions::default_config`].
+//!   top level, and the runner's own settings in an `[frp]` table (below).
+//!   Without it the config starts from [`RunOptions::default_config`].
 //! - `--set key=value` (repeatable): applied over the file, in order. The key
 //!   is a dotted path into the config; the value is parsed as a TOML value,
 //!   or taken as a string when it does not parse (`--set address=10.0.0.1:5100`,
@@ -28,22 +29,35 @@
 //!   the config does not have is refused, so a typo cannot go unnoticed; a
 //!   key is known when setting it changes the config, so an optional field
 //!   that is unset by default is settable. A file may carry keys the config
-//!   ignores.
-//! - `--target`: a `ws://` URL bridges (dials a host, again whenever the link
+//!   ignores. `--set frp.<key>=<value>` sets a runner setting.
+//! - `--target`: a `ws://` URL bridges (dials a hub, again whenever the link
 //!   drops); `wss://` is refused; anything else is an address to listen on.
 //!   Default: [`RunOptions::default_target`].
 //! - `--log`: the lowest level of driver log lines to print. Default `info`.
 //! - `--help`: usage, then every config key with its default.
 //!
+//! The runner's settings, in the `[frp]` table:
+//!
+//! - `actor_id`: the launch monitor actor's id on the bus. When the file has
+//!   none, the runner generates one ([`new_actor_id`](crate::new_actor_id))
+//!   and writes it into the file's `[frp]` table, so the actor keeps its id
+//!   across restarts. The file is changed only when the edit reads back as
+//!   the same config plus `actor_id`; a file whose `[frp]` table it cannot
+//!   edit that way (dotted `frp.` keys, an inline `frp = { .. }`, a
+//!   `[ frp ]` header) is left untouched, and the runner prints the id with
+//!   the line to add. Without `--config` the id lasts for the run only.
+//! - `raw_frames`: whether the actor publishes `shot.raw`. Default `false`.
+//!
 //! The config is resolved as defaults, then the file, then each `--set`, then
 //! [`validate`](DriverConfig::validate). A bad flag, file, key or value prints
 //! the problem and exits 2. A driver that gives up exits 1. Ctrl-C (and
-//! SIGTERM on Unix) stops the server: the session is closed and the process
-//! exits 0.
+//! SIGTERM on Unix) stops the server: the session is closed, the actor's
+//! removal goes out, and the process exits 0.
 //!
 //! Output is one stderr line per event, prefixed with the program name:
-//! listening, controllers coming and going, the device connecting and being
-//! lost, each driver log line, a line per shot and each command.
+//! listening, peers coming and going, the device connecting and being lost,
+//! each driver log line, a line per shot and each change of the turn's
+//! hints.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -53,7 +67,10 @@ use serde_json::{Map, Value};
 
 use crate::config::{ConfigError, DriverConfig};
 use crate::driver::{DeviceDriver, DeviceEvent, Level, Stop};
-use crate::{FrpEvent, FrpServer, ServerConfig, ServerEvent, Transport};
+use crate::{FrpBody, FrpServer, ServerConfig, ServerEvent, Transport};
+
+/// The table of the config file that holds the runner's own settings.
+const RUNNER_TABLE: &str = "frp";
 
 /// What differs between binaries that run on [`run`].
 pub struct RunOptions<D: DeviceDriver> {
@@ -206,9 +223,10 @@ fn usage(program: &str, default_target: &str) -> String {
          \x20      {pad} [--set <key>=<value>]... [--log <info|debug|trace>] [--help]\n\
          \n\
          Options:\n\
-         \x20 --config <path>   TOML file with the driver's config at the top level\n\
+         \x20 --config <path>   TOML file with the driver's config at the top level and an [frp] table\n\
          \x20 --target <t>      an address to listen on, or a ws:// URL to dial (default {default_target})\n\
-         \x20 --set key=value   set a config key over the file; repeatable, dotted keys reach tables;\n\
+         \x20 --set key=value   set a config key over the file (frp.<key> for the runner); repeatable,\n\
+         \x20                    dotted keys reach tables;\n\
          \x20                    a value that parses as another TOML type is quoted to be a string\n\
          \x20 --log <level>     lowest driver log level to print (default info)\n\
          \x20 --help            print this text",
@@ -216,16 +234,61 @@ fn usage(program: &str, default_target: &str) -> String {
     )
 }
 
+/// The runner's own settings, from the `[frp]` table.
+#[derive(Debug, Default, PartialEq)]
+struct Runner {
+    actor_id: Option<String>,
+    raw_frames: bool,
+}
+
+impl Runner {
+    fn from_map(map: &Map<String, Value>) -> Result<Self, ConfigError> {
+        let mut runner = Self::default();
+        for (key, value) in map {
+            match (key.as_str(), value) {
+                ("actor_id", Value::String(id)) if !id.is_empty() => {
+                    runner.actor_id = Some(id.clone());
+                }
+                ("actor_id", _) => {
+                    return Err(ConfigError::field(
+                        "frp.actor_id",
+                        "must be a non-empty string",
+                    ));
+                }
+                ("raw_frames", Value::Bool(on)) => runner.raw_frames = *on,
+                ("raw_frames", _) => {
+                    return Err(ConfigError::field(
+                        "frp.raw_frames",
+                        "must be true or false",
+                    ));
+                }
+                (other, _) => {
+                    return Err(ConfigError::field(format!("frp.{other}"), "unknown key"));
+                }
+            }
+        }
+        Ok(runner)
+    }
+}
+
 /// Resolves the config: defaults, then the file, then each `--set`, then
-/// `validate`.
-fn resolve<C: DriverConfig>(base: &C, args: &Args) -> Result<C, ConfigError> {
+/// `validate`. The `[frp]` table and `frp.` keys go to the runner.
+fn resolve<C: DriverConfig>(base: &C, args: &Args) -> Result<(C, Runner), ConfigError> {
     let mut map = base.to_map();
+    let mut runner = Map::new();
     if let Some(path) = &args.config {
         let text = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::new(format!("cannot read {path}: {e}")))?;
         let table: toml::Table = toml::from_str(&text)
             .map_err(|e| ConfigError::new(format!("{path}: {}", e.message())))?;
-        if let Value::Object(file) = toml_to_json(&toml::Value::Table(table)) {
+        if let Value::Object(mut file) = toml_to_json(&toml::Value::Table(table)) {
+            match file.remove(RUNNER_TABLE) {
+                Some(Value::Object(own)) => runner = own,
+                Some(_) => {
+                    return Err(ConfigError::field(RUNNER_TABLE, "must be a table"));
+                }
+                None => {}
+            }
             merge(&mut map, file);
         }
     }
@@ -233,10 +296,218 @@ fn resolve<C: DriverConfig>(base: &C, args: &Args) -> Result<C, ConfigError> {
         let (key, raw) = set
             .split_once('=')
             .ok_or_else(|| ConfigError::new(format!("--set {set:?}: expected key=value")))?;
+        if let Some(own) = key.strip_prefix("frp.") {
+            runner.insert(own.to_owned(), parse_value(raw));
+            continue;
+        }
         set_path(&mut map, key, parse_value(raw))?;
         check_known::<C>(&map, key)?;
     }
-    C::from_map(map)
+    let runner = Runner::from_map(&runner)?;
+    Ok((C::from_map(map)?, runner))
+}
+
+/// The launch monitor actor id kept in a config file, from
+/// [`config_actor_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConfigActorId {
+    /// The actor id.
+    pub id: String,
+    /// Whether it was read, or generated and saved or not.
+    pub origin: ActorIdOrigin,
+}
+
+/// Where a [`ConfigActorId`] came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ActorIdOrigin {
+    /// The file's `[frp]` table had it.
+    Read,
+    /// The file had none: the id is new and is now in the file's `[frp]`
+    /// table.
+    Saved,
+    /// The file had none: the id is new, and the file was left untouched
+    /// because its `[frp]` table is in a shape the edit does not handle
+    /// (dotted `frp.` keys, an inline `frp = { .. }`, a `[ frp ]` header).
+    /// The id lasts until the program adds `actor_id = "<id>"` to the table
+    /// itself.
+    NotSaved,
+    /// The file had none: the id is new, and writing it failed for this
+    /// reason; the file is as it was.
+    SaveFailed(String),
+}
+
+/// The launch monitor actor id in the `[frp]` table (`frp.actor_id`) of the
+/// TOML config file at `path`, for a binary that builds its own
+/// [`FrpServer`] instead of calling [`run`].
+///
+/// When the file has none, a new id ([`new_actor_id`](crate::new_actor_id))
+/// is written into its `[frp]` table by the same rules [`run`] follows: the
+/// file is changed only when the edit reads back as the same config plus
+/// `actor_id`, and it is replaced through a temporary file in the same
+/// directory, so a failed write leaves the old file whole. The other keys of
+/// the `[frp]` table are not checked.
+///
+/// ```no_run
+/// use flightrelay::{ActorIdOrigin, ServerConfig, Transport, config_actor_id};
+///
+/// let kept = config_actor_id("launch-monitor.toml")?;
+/// if !matches!(kept.origin, ActorIdOrigin::Read | ActorIdOrigin::Saved) {
+///     eprintln!("new actor id {} for this run only", kept.id);
+/// }
+/// let config = ServerConfig::new(Transport::listen("0.0.0.0:5880"), kept.id);
+/// # Ok::<(), flightrelay::config::ConfigError>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns a [`ConfigError`] when the file cannot be read or is not TOML,
+/// when `frp` is not a table, or when `frp.actor_id` is not a non-empty
+/// string.
+pub fn config_actor_id(path: impl AsRef<std::path::Path>) -> Result<ConfigActorId, ConfigError> {
+    let path = path.as_ref();
+    let shown = path.display();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| ConfigError::new(format!("cannot read {shown}: {e}")))?;
+    let table: toml::Table =
+        toml::from_str(&text).map_err(|e| ConfigError::new(format!("{shown}: {}", e.message())))?;
+    let id = match table.get(RUNNER_TABLE) {
+        None => None,
+        Some(toml::Value::Table(frp)) => match frp.get("actor_id") {
+            None => None,
+            Some(toml::Value::String(id)) if !id.is_empty() => Some(id.clone()),
+            Some(_) => {
+                return Err(ConfigError::field(
+                    "frp.actor_id",
+                    "must be a non-empty string",
+                ));
+            }
+        },
+        Some(_) => return Err(ConfigError::field(RUNNER_TABLE, "must be a table")),
+    };
+    Ok(match id {
+        Some(id) => ConfigActorId {
+            id,
+            origin: ActorIdOrigin::Read,
+        },
+        None => generate_and_save(path),
+    })
+}
+
+/// A new actor id, written into the `[frp]` table of the file at `path`
+/// when that is safe ([`save_actor_id`]).
+fn generate_and_save(path: &std::path::Path) -> ConfigActorId {
+    let id = crate::new_actor_id();
+    let origin = match save_actor_id(path, &id) {
+        Ok(true) => ActorIdOrigin::Saved,
+        Ok(false) => ActorIdOrigin::NotSaved,
+        Err(e) => ActorIdOrigin::SaveFailed(e.to_string()),
+    };
+    ConfigActorId { id, origin }
+}
+
+/// Writes `actor_id` into the `[frp]` table of the TOML file at `path`: on
+/// the line after the table's `[frp]` header, or in a new table at the end.
+/// The rest of the file is kept as it is, line endings included.
+///
+/// The new text is read back before it is written: `frp.actor_id` must be
+/// `actor_id` and every other key unchanged. When it is not (the table is
+/// written with dotted keys, inline, as `[ frp ]`, or in any other shape this
+/// edit does not handle), the file is left untouched and this returns
+/// `Ok(false)`. The file is replaced through a temporary file in the same
+/// directory, so a failed write leaves the old file whole.
+fn save_actor_id(path: &std::path::Path, actor_id: &str) -> std::io::Result<bool> {
+    let text = std::fs::read_to_string(path)?;
+    let Some(out) = with_actor_id(&text, actor_id) else {
+        return Ok(false);
+    };
+    replace_file(path, &out)?;
+    Ok(true)
+}
+
+/// `text` with `actor_id = "<actor_id>"` added to its `[frp]` table, or
+/// `None` when the result does not read back as `text` plus that one key.
+fn with_actor_id(text: &str, actor_id: &str) -> Option<String> {
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let line = format!("actor_id = {}", toml::Value::String(actor_id.to_owned()));
+    let is_header = |l: &str| {
+        l.trim().strip_prefix("[frp]").is_some_and(|rest| {
+            let rest = rest.trim_start();
+            rest.is_empty() || rest.starts_with('#')
+        })
+    };
+    let mut out = String::with_capacity(text.len() + line.len() + 16);
+    let mut placed = false;
+    for l in text.split_inclusive('\n') {
+        out.push_str(l);
+        if !placed && is_header(l) {
+            if !l.ends_with('\n') {
+                out.push_str(eol);
+            }
+            out.push_str(&line);
+            out.push_str(eol);
+            placed = true;
+        }
+    }
+    if !placed {
+        if !out.is_empty() {
+            if !out.ends_with('\n') {
+                out.push_str(eol);
+            }
+            out.push_str(eol);
+        }
+        out.push_str("[frp]");
+        out.push_str(eol);
+        out.push_str(&line);
+        out.push_str(eol);
+    }
+    adds_only_actor_id(text, &out, actor_id).then_some(out)
+}
+
+/// Whether `after` reads as `before` with `frp.actor_id = actor_id` added.
+fn adds_only_actor_id(before: &str, after: &str, actor_id: &str) -> bool {
+    let (Ok(before), Ok(mut after)) = (
+        toml::from_str::<toml::Table>(before),
+        toml::from_str::<toml::Table>(after),
+    ) else {
+        return false;
+    };
+    let Some(toml::Value::Table(frp)) = after.get_mut(RUNNER_TABLE) else {
+        return false;
+    };
+    if frp
+        .remove("actor_id")
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .as_deref()
+        != Some(actor_id)
+    {
+        return false;
+    }
+    if frp.is_empty() && !before.contains_key(RUNNER_TABLE) {
+        after.remove(RUNNER_TABLE);
+    }
+    after == before
+}
+
+/// Replaces the file at `path` (a link's target, when it is a link) with
+/// `text`, through a temporary file in the same directory and a rename. The
+/// new file keeps the old one's permissions.
+fn replace_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let path = std::fs::canonicalize(path)?;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .map_or_else(|| "config".into(), |n| n.to_string_lossy().into_owned());
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let written = std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::metadata(&path))
+        .and_then(|meta| std::fs::set_permissions(&tmp, meta.permissions()))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Lays `over` on `base`, merging tables key by key.
@@ -426,9 +697,13 @@ fn execute<D: DeviceDriver>(
         say(stdout, &usage(program, options.default_target));
         say(stdout, "\nConfig keys and their defaults:\n");
         say(stdout, base.help_toml_of().trim_end());
+        say(
+            stdout,
+            "\n[frp]\n# actor_id = (unset: generated, and saved to the --config file)\nraw_frames = false",
+        );
         return 0;
     }
-    let config = match resolve(&base, &args) {
+    let (config, runner) = match resolve(&base, &args) {
         Ok(c) => c,
         Err(e) => {
             say(stderr, &format!("{program}: {e}"));
@@ -462,9 +737,13 @@ fn execute<D: DeviceDriver>(
     } else {
         Transport::listen(target)
     };
+    let actor_id = runner
+        .actor_id
+        .unwrap_or_else(|| new_actor_id(program, args.config.as_deref(), stderr));
     let log = args.log.unwrap_or(Level::Info);
-    let mut server_config = ServerConfig::new(transport);
+    let mut server_config = ServerConfig::new(transport, actor_id);
     server_config.log_level = log;
+    server_config.raw_frames = runner.raw_frames;
 
     let out = Arc::clone(stderr);
     let prefix = program.to_owned();
@@ -484,6 +763,34 @@ fn execute<D: DeviceDriver>(
     }
 }
 
+/// A new actor id, saved to the config file at `path` when there is one.
+fn new_actor_id(program: &str, path: Option<&str>, stderr: &Stream) -> String {
+    let Some(path) = path else {
+        let id = crate::new_actor_id();
+        say(
+            stderr,
+            &format!("{program}: new actor id {id} for this run; use --config to keep one"),
+        );
+        return id;
+    };
+    let ConfigActorId { id, origin } = generate_and_save(std::path::Path::new(path));
+    let line = match origin {
+        ActorIdOrigin::Read | ActorIdOrigin::Saved => {
+            format!("{program}: new actor id {id}, saved to {path}")
+        }
+        ActorIdOrigin::NotSaved => format!(
+            "{program}: new actor id {id} for this run; {path} was left as it is: \
+             add actor_id = \"{id}\" to its [frp] table to keep it"
+        ),
+        ActorIdOrigin::SaveFailed(e) => format!(
+            "{program}: new actor id {id} for this run; cannot save it to {path} ({e}): \
+             add actor_id = \"{id}\" to its [frp] table to keep it"
+        ),
+    };
+    say(stderr, &line);
+    id
+}
+
 /// A delay as the output prints it: whole seconds, else milliseconds below a
 /// second, else tenths of a second.
 fn delay_text(d: std::time::Duration) -> String {
@@ -499,15 +806,12 @@ fn delay_text(d: std::time::Duration) -> String {
 
 /// One output line for a server event, or none.
 fn describe(event: &ServerEvent<'_>, log: Level) -> Option<String> {
-    let name = |peer: Option<&str>| peer.map_or(String::new(), |p| format!(" ({p})"));
+    let at = |addr: Option<std::net::SocketAddr>| addr.map_or(String::new(), |a| format!(" ({a})"));
+    let opt = |v: Option<String>| v.unwrap_or_else(|| "-".into());
     Some(match event {
         ServerEvent::Listening(addr) => format!("listening on {addr}"),
-        ServerEvent::ControllerConnected { peer } => {
-            format!("controller connected{}", name(*peer))
-        }
-        ServerEvent::ControllerLeft { peer, reason } => {
-            format!("controller left{}: {reason}", name(*peer))
-        }
+        ServerEvent::PeerConnected { addr } => format!("peer connected{}", at(*addr)),
+        ServerEvent::PeerLeft { addr, reason } => format!("peer left{}: {reason}", at(*addr)),
         ServerEvent::DeviceConnected(identity) => {
             format!("device connected: {}", identity.label())
         }
@@ -518,27 +822,20 @@ fn describe(event: &ServerEvent<'_>, log: Level) -> Option<String> {
                 None => format!("device lost: {why}; giving up"),
             }
         }
-        ServerEvent::Command(cmd) => format!(
-            "command: mode={} hand={} club={}",
-            cmd.mode.map_or("-".into(), |v| v.to_string()),
-            cmd.handed.map_or("-", |h| match h {
-                crate::Handedness::Right => "rh",
-                crate::Handedness::Left => "lh",
-            }),
-            cmd.club.map_or("-".into(), |c| {
-                serde_json::to_value(c)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_default()
-            }),
+        ServerEvent::Hints(hints) => format!(
+            "turn: hand={} club={} mode={}",
+            opt(hints.handedness.map(|h| h.to_string())),
+            opt(hints.club.map(|c| c.to_string())),
+            opt(hints.mode.map(|m| m.to_string())),
         ),
         ServerEvent::Device(DeviceEvent::Log(level, line)) => format!("{level}: {line}"),
         ServerEvent::Device(DeviceEvent::Phase(phase)) if log <= Level::Debug => {
             format!("phase: {phase}")
         }
-        ServerEvent::Device(DeviceEvent::Frp(FrpEvent::Launch { key, launch })) => {
+        ServerEvent::Device(DeviceEvent::Frp(FrpBody::ShotLaunch(m))) => {
             use std::fmt::Write;
-            let mut line = format!("shot {}:", key.shot_number);
+            let launch = &m.launch;
+            let mut line = format!("shot {}:", m.key.shot_number);
             if let Some(v) = launch.launch_speed {
                 let _ = write!(line, " ball {:.1} mph", v.as_mph());
             }
@@ -550,8 +847,8 @@ fn describe(event: &ServerEvent<'_>, log: Level) -> Option<String> {
             }
             line
         }
-        ServerEvent::Device(DeviceEvent::Frp(FrpEvent::Alert { severity, message })) => {
-            format!("alert ({severity}): {message}")
+        ServerEvent::Device(DeviceEvent::Frp(FrpBody::BusAlert(alert))) => {
+            format!("alert ({}): {}", alert.severity, alert.message)
         }
         _ => return None,
     })

@@ -1,344 +1,208 @@
 # flightrelay
 
-Rust SDK for the [Flight Relay Protocol (FRP)](https://github.com/flightrelay/spec) — golf launch monitor event streaming over WebSocket.
+Rust SDK for the [Flight Relay Protocol (FRP)](https://github.com/flightrelay/spec) — a message bus for golf simulators: launch monitors, games, flight models, sessions, lights and collectors, over WebSocket.
 
-This crate implements FRP 0.2.0 (`SPEC_VERSION`).
+This crate implements FRP 0.3.0 (`SPEC_VERSION`).
 
 [![CI](https://github.com/flightrelay/sdk-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/flightrelay/sdk-rust/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/flightrelay.svg)](https://crates.io/crates/flightrelay)
 
 ## What's in the box
 
-- **Message types** — strongly typed Rust representations of every FRP message, event, and command
-- **Unit-tagged values** — `Distance` and `Velocity` types that serialize as unit-tagged strings (`"180.5m"`, `"67.2mps"`) with full unit conversion
-- **Shot accumulator** — `ShotAggregator` collects lifecycle events (`shot_trigger` → `launch` + `flight_result` + `club_path` + `face_impact` → `shot_finished`) and yields a composed `CompletedShot`. Shots that don't finish within the accumulator timeout (30 s by default) are discarded, and their late events are ignored
-- **Strike timestamp** — the optional `timestamp` on `shot_trigger`: when the device detected the strike, in milliseconds since the Unix epoch
-- **Measured values and flight results** — `Launch` carries the measured launch; carry, total and the rest of the flight go in `FlightResult` with its `Basis` (`tracked`, `modeled`), and a modeled result can list the launch values its model assumed in `AssumedLaunch`; the device's `Source` (`measured`, `virtual`) goes on `device_telemetry`
-- **Raw frames** — optional `RawFrame` debug events carrying the protocol messages behind a device's events, sent only to a controller that asks for them in `start`
-- **Duplicate dropping for forwarders** — `ForwardFilter` drops repeated shot events, unchanged telemetry, repeated alerts and repeated raw frames before a bridge or hub forwards them, so an event that loops back dies out
-- **WebSocket transport** — `FrpEndpoint` handles the FRP handshake for either role, in either transport direction, and yields `FrpConnection`s with synchronous send/recv
-- **Device drivers** — a `DeviceDriver` trait for a launch monitor, `FrpServer` to serve one to FRP controllers, `run` for a complete `main`, and a simulated `MockDriver`
+- **Message types** — one Rust type per FRP kind (all 21), in a flat `FrpMessage { from, body }`; unknown and extension kinds (`x.<vendor>.*`) parse as `FrpBody::Unknown` and serialize back unchanged
+- **Unit-tagged values** — `Distance` and `Velocity` serialize as unit-tagged strings (`"180.5m"`, `"67.2mps"`) with unit conversion
+- **Shot accumulator** — `ShotAggregator` composes a shot from its `shot.*` messages by `shot_id`, whoever sent each part, keeps every `shot.flight`, stamps the `golfer.turn` and `practice.block` current at the trigger, and reports a message that arrives after `shot.finished` as a warning
+- **Bus state** — `BusState` keeps the current state of the bus by (kind, from, id), applies removals, and drops an actor after three missed heartbeats
+- **WebSocket binding** — `FrpEndpoint` listens or dials and yields `FrpConnection`s with synchronous send/recv (`recv_timeout` waits no longer than a heartbeat is due); `greet` sends what a side sends on connecting (its `bus.actor`s, their state, then `bus.sync`)
+- **Hub** — `Hub` forwards every message to every other connection, never back to its source
+- **Device drivers** — a `DeviceDriver` trait for a launch monitor, `FrpServer` to run one as an actor on the bus, `run` for a complete `main`, and a simulated `MockDriver`
 
 ## Features
 
 | Feature | Description |
 |---|---|
-| *(default)* | Message types, parsing, unit-tagged values |
-| `controller` | `ShotAggregator` for accumulating shot lifecycle events |
-| `device` | `ForwardFilter` for endpoints that forward events |
-| `transport` | `FrpEndpoint` / `FrpConnection` — WebSocket transport for either role |
+| *(default)* | Message types, parsing, unit-tagged values, `new_actor_id` |
+| `controller` | `ShotAggregator`, `BusState` |
+| `transport` | `FrpEndpoint` / `FrpConnection`, `Hub` — the WebSocket binding |
 | `config` | `DriverConfig`, `ConfigError`, `is_default` — serde settings for a driver |
-| `driver` | the `DeviceDriver` / `DeviceSession` traits, `Events`, `Stop`, `Backoff`, `ShotIds`, `Live`, `connect_tcp` (implies `config`) |
-| `server` | `FrpServer` (implies `driver`, `device` and `transport`) |
-| `main` | `run`, `run_with`, `run_args` (implies `server`) |
+| `driver` | the `DeviceDriver` / `DeviceSession` traits, `Events`, `TurnHints`, `DeviceStatus`, `StatusChange`, `Stop`, `Backoff`, `ShotIds`, `Live`, `connect_tcp` (implies `config`) |
+| `server` | `FrpServer` (implies `driver` and `transport`) |
+| `main` | `run`, `run_with`, `run_args`, `config_actor_id` (implies `server`) |
 | `mock` | `MockDriver`, a simulated launch monitor (implies `driver`) |
 
 The `transport` feature adds a dependency on `tungstenite`, and `main` adds `toml` and `ctrlc`. `config` and `driver` add no dependencies, and `config` builds for `wasm32-unknown-unknown`.
 
-## Roles and transport direction
+## The bus
 
-FRP roles are **entity names, not directions**. A **device** emits shot data and accepts commands; a **controller** receives shot data and sends commands. Either role may open the WebSocket or accept it, and the handshake always runs controller→device (`start`) and device→controller (`init`) regardless of who dialed.
+FRP is a multi-producer, multi-consumer bus of **actors**. Every actor receives everything. Every message is one flat JSON object:
 
-`FrpEndpoint` keeps these axes separate — `Role` picks the handshake direction, `Transport` picks who opens the socket:
+```json
+{ "kind": "golfer.turn", "from": "c19e04b7a2d5f318", "golfer": "backnine.local-3", "club": "7I", "handedness": "rh", "mode": "full" }
+```
 
-| | `Transport::Listen` | `Transport::Connect` |
-|---|---|---|
-| `Role::Device` | launch monitor serving simulators | bridge dialing into a central bus |
-| `Role::Controller` | bus accepting bridges | simulator connecting to a monitor |
+- **State** (`bus.actor`, `golfer.profile`, `golfer.turn`, `practice.block`, `game.round`, `game.scores`, `game.ball`) is a complete object its owner republishes when it changes, when it starts, and in answer to `bus.sync`. The owner removes a state with a last message marked `"removed": true` (`FrpBody::Removed`).
+- **Occurrences** (`bus.sync`, `bus.reply`, `bus.alert`, `shot.*`, `game.stroke`) are sent once.
+- **Commands** (`golfer.select`, `practice.new_block`, `game.aim`) carry a `ref`; the actor holding the owning role (`session`, `practice`, `game`) applies one, publishes the changed state, and answers with `bus.reply`.
 
-An endpoint is long-lived and outlives its connections. Call `establish()` again to reconnect — the caller owns any retry or backoff policy.
+`bus.actor` doubles as the heartbeat: an actor republishes it every `heartbeat` seconds, and an actor not heard for three heartbeats is gone, with all its state. An actor id is a random string generated once by the host that runs the actor and kept across restarts (`new_actor_id()`); the host decides where to keep it.
+
+There is no handshake. On connecting, each side sends `bus.actor` for each actor it hosts, then `bus.sync`, and the other side's actors republish their state. A hub forwards every message to every other connection, never back to the one it came from; hubs connected in a loop are a configuration error.
 
 ## Usage
 
-### Controller connecting to a device
+### A collector
+
+A collector is an actor like any other: it greets with its `bus.actor`, answers `bus.sync` by republishing it, and republishes it every heartbeat so the bus doesn't take it for gone. `recv_timeout` waits for the next message no longer than the next heartbeat is due, so one blocking loop does both.
 
 ```rust
-use flightrelay::{EndpointConfig, FrpEndpoint, FrpError, FrpMessage, Role, ShotAggregator, Transport};
+use std::time::Instant;
+use flightrelay::{BusActor, BusState, DEFAULT_HEARTBEAT, EndpointConfig, FrpBody, FrpEndpoint,
+                  FrpMessage, ShotAggregator, ShotEvent, Transport};
+use flightrelay::types::roles;
 
-let mut ep = FrpEndpoint::open(
-    EndpointConfig::new(Role::Controller, Transport::connect("ws://192.168.1.50:5880/frp"))
-        .with_name("My App"),
-)?;
+let me = FrpMessage::new(
+    my_actor_id,
+    BusActor::new("Shot Log", DEFAULT_HEARTBEAT.as_secs_f64()).with_role(roles::COLLECTOR),
+);
+let mut ep = FrpEndpoint::open(EndpointConfig::new(Transport::connect("ws://192.168.1.50:5880/frp")))?;
 let mut conn = ep.establish()?;
-let mut shots = ShotAggregator::new();
+conn.greet(&[me.clone()], &[])?;
 
+let mut bus = BusState::new();
+let mut shots = ShotAggregator::new();
+let mut last_beat = Instant::now();
 loop {
-    let envelope = match conn.recv() {
-        Ok(FrpMessage::Envelope(envelope)) => envelope,
-        Ok(FrpMessage::Protocol(_)) | Err(FrpError::Json(_)) => continue, // ignore and keep reading
+    let left = DEFAULT_HEARTBEAT.saturating_sub(last_beat.elapsed());
+    let msg = match conn.recv_timeout(left) {
+        Ok(msg) => msg,
+        Err(e) if !e.is_fatal() => None, // not FRP: ignore it and keep reading
         Err(e) => return Err(e.into()), // the connection is gone
     };
-    if let Some(shot) = shots.feed_envelope(&envelope) {
-        if let Some(carry) = shot.flight.and_then(|flight| flight.carry_distance) {
-            println!("{}: carry {carry}", shot.device);
+    if let Some(msg) = msg {
+        if matches!(msg.body, FrpBody::BusSync(_)) {
+            conn.send(&me)?;
         }
+        bus.apply(&msg);
+        match shots.feed(&msg) {
+            Some(ShotEvent::Finished(shot)) => {
+                let golfer = shot.turn.as_ref().and_then(|t| t.golfer.as_ref());
+                if let Some(carry) = shot.flight().and_then(|f| f.carry_distance) {
+                    println!("{golfer:?}: carry {carry}");
+                }
+            }
+            Some(ShotEvent::Late(late)) => eprintln!("warning: {late}"),
+            None => {}
+        }
+    }
+    if last_beat.elapsed() >= DEFAULT_HEARTBEAT {
+        conn.send(&me)?; // the heartbeat
+        last_beat = Instant::now();
+    }
+    for gone in bus.expire() {
+        shots.forget_actor(&gone);
     }
 }
 ```
 
 ```toml
 [dependencies]
-flightrelay = { version = "0.5", features = ["transport", "controller"] }
+flightrelay = { version = "0.6", features = ["transport", "controller"] }
 ```
 
-### Device serving controllers
+### A launch monitor
+
+A launch monitor publishes its `bus.actor` (with a `device` block and its `blockers`), then each shot as `shot.trigger`, `shot.launch`, `shot.club`, `shot.impact`, at most one `shot.flight` of its own, and `shot.finished`. It reads `golfer.turn` for its tracking hints: handedness, club and mode, each applied if the device supports it. Every turn is complete: a `null` club means no club, and a `null` or unknown value in any field is no hint for that field.
 
 ```rust
-use flightrelay::{Basis, Distance, EndpointConfig, FlightResult, FrpEndpoint, FrpEnvelope,
-                  FrpEvent, Launch, Role, ShotKey, Transport, Velocity};
+use flightrelay::{BusActor, Basis, DeviceInfo, Distance, FlightResult, FrpMessage, Launch,
+                  ShotFinished, ShotFlight, ShotKey, ShotLaunch, ShotTrigger, Source, Velocity};
+use flightrelay::types::{blockers, roles};
 
-// Controllers connect to ws://host:5880/frp
-let mut ep = FrpEndpoint::open(
-    EndpointConfig::new(Role::Device, Transport::listen("0.0.0.0:5880")),
-)?;
-let mut conn = ep.establish()?;
+let me = "7d2f9a41c03be856"; // generated once, kept by the host
+let mut actor = BusActor::new("Eagle One X4K2", 2.0)
+    .with_role(roles::LAUNCH_MONITOR)
+    .with_device(DeviceInfo { source: Some(Source::Measured), ..DeviceInfo::default() });
+actor.blockers = vec![blockers::NO_BALL.into()];
+conn.greet(&[FrpMessage::new(me, actor)], &[])?;
 
-// Send a shot
 let key = ShotKey::new("550e8400-e29b-41d4-a716-446655440000", 1);
-conn.send_envelope(&FrpEnvelope::new("MyDevice-001", FrpEvent::shot_trigger(key.clone())))?;
-conn.send_envelope(&FrpEnvelope::new("MyDevice-001", FrpEvent::launch(
-    key.clone(),
-    Launch {
-        launch_speed: Some(Velocity::MetersPerSecond(67.2)),
-        launch_elevation: Some(14.2),
-        ..Default::default()
-    },
-)))?;
-conn.send_envelope(&FrpEnvelope::new("MyDevice-001", FrpEvent::flight_result(
-    key.clone(),
-    FlightResult {
-        model: Some("MyDevice flight model 1.0 (Example Co)".into()),
+conn.send(&FrpMessage::new(me, ShotTrigger::new(key.clone())))?;
+conn.send(&FrpMessage::new(me, ShotLaunch {
+    key: key.clone(),
+    launch: Launch { launch_speed: Some(Velocity::MetersPerSecond(67.2)), ..Default::default() },
+}))?;
+conn.send(&FrpMessage::new(me, ShotFlight {
+    key: key.clone(),
+    flight: FlightResult {
+        model: Some("Eagle One flight model 2.1".into()),
         carry_distance: Some(Distance::Meters(180.5)),
         ..FlightResult::new(Basis::Modeled)
     },
-)))?;
-conn.send_envelope(&FrpEnvelope::new("MyDevice-001", FrpEvent::shot_finished(key)))?;
+}))?;
+conn.send(&FrpMessage::new(me, ShotFinished { key }))?;
 ```
 
-```toml
-[dependencies]
-flightrelay = { version = "0.5", features = ["transport"] }
-```
+A launch monitor driver gets all of this — greeting, heartbeat, answering `bus.sync`, turn hints, raw frame numbering — from `FrpServer` (below).
 
-### Device bridging out to a central controller
-
-The same device code, dialing out instead of listening — useful for a launch
-monitor bridge reporting into a central bus:
+### A hub
 
 ```rust
-use flightrelay::{EndpointConfig, FrpEndpoint, Role, Transport};
+use flightrelay::{EndpointConfig, FrpEndpoint, Hub, HubEvent, Transport};
 
-let mut ep = FrpEndpoint::open(
-    EndpointConfig::new(Role::Device, Transport::connect("ws://flighthook:5880/frp"))
-        .with_name("ironsight"),
-)?;
-
-loop {
-    let mut conn = ep.establish()?;   // dials, waits for `start`, replies `init`
-    pump_shots(&mut conn);            // returns when the connection drops
-    std::thread::sleep(backoff);
+let mut ep = FrpEndpoint::open(EndpointConfig::new(Transport::listen("0.0.0.0:5880")))?;
+let mut hub = Hub::new();
+// For each connection: greet it with your own actors, then `hub.add(conn)?`.
+// Then, regularly:
+for event in hub.poll() {
+    match event {
+        HubEvent::Message { message, .. } => { /* already forwarded to every other peer */ }
+        HubEvent::Invalid { .. } => {}          // not FRP: not forwarded
+        HubEvent::Left { reason, .. } => eprintln!("peer left: {reason}"),
+    }
 }
+hub.send(&my_message)?; // publish your own message to every peer
 ```
 
 ### Measured values and flight results
 
-`Launch`, `ClubData` and `FaceImpact` carry measured values only. A device omits a value it doesn't have instead of sending a placeholder. `complete_spin()` translates one spin pair into the other, and the translated pair is measured too:
+`Launch`, `ClubData` and `FaceImpact` carry measured values only. A sender omits a value it doesn't have instead of sending a placeholder. `complete_spin()` translates one spin pair into the other, and the translated pair is measured too. Carry, total and the rest of the flight go in a `FlightResult` with its required `Basis` (`tracked`, `modeled`); a modeled result can list the launch values its model assumed in `AssumedLaunch`.
 
-```rust
-use flightrelay::{Basis, Distance, FlightResult, FrpEvent, Launch, Source};
+A shot may have several flights: its launch monitor's own and any flight model's, told apart by `from` and `model`. `CompletedShot::flights` keeps every one, in arrival order; `CompletedShot::flight()` picks one to show (the first tracked, else the launch monitor's, else the first). A receiver that flies the ball itself reads `CompletedShot::launch_for_flight()`: the measured launch, with missing values filled from the shown flight's `assumed` values when it is modeled.
 
-let mut launch = Launch {
-    total_spin_rpm: Some(3231),
-    spin_axis: Some(-8.0),
-    ..Default::default() // no launch_elevation: the hardware doesn't measure it
-};
-launch.complete_spin(); // adds backspin_rpm and sidespin_rpm
+A receiver that needs measured data only (e.g. a tournament round) keeps shots whose `source` is `Source::Measured` — the source the launch monitor declares in its `bus.actor` — and ignores the flights.
 
-// Values that need a flight model go in a flight_result, at most one per shot
-let flight = FlightResult {
-    model: Some("Eagle One flight model 2.1 (Birdie Labs)".into()),
-    carry_distance: Some(Distance::Meters(180.5)),
-    ..FlightResult::new(Basis::Modeled)
-};
+### Late messages and the accumulator timeout
 
-// Declared per device on device_telemetry
-let telemetry = FrpEvent::DeviceTelemetry {
-    manufacturer: None,
-    model: None,
-    firmware: None,
-    source: Some(Source::Measured),
-    telemetry: None,
-};
-```
-
-`basis` is required: a `flight_result` without `"tracked"` or `"modeled"` arrives as `FrpEvent::Unknown`, so controllers and forwarders ignore it, as they do any event of a known kind that doesn't match it. `ShotAggregator` keeps the first event of each kind for a shot, so `CompletedShot::flight` is the shot's first `flight_result`.
-
-When the launch lacks a value the flight model needed, e.g. the spin of a chip whose speed and angles were measured but whose spin was not, a modeled result lists what the model assumed in `assumed`. An assumed value is not measured, so it never goes in `Launch`, and a field the shot's `launch` carries never goes in `assumed`. A controller that flies the ball itself reads `CompletedShot::launch_for_flight()`: the measured launch, with missing values filled from `assumed` of a modeled result (`Launch::fill_assumed` does the same without the aggregator). A field in both keeps the measured value, and `assumed` on a tracked result is ignored:
-
-```rust
-use flightrelay::{AssumedLaunch, Basis, Distance, FlightResult};
-
-let flight = FlightResult {
-    model: Some("Eagle One flight model 2.1 (Birdie Labs)".into()),
-    carry_distance: Some(Distance::Meters(31.2)),
-    assumed: Some(AssumedLaunch {
-        backspin_rpm: Some(4500),
-        sidespin_rpm: Some(0),
-        ..Default::default()
-    }),
-    ..FlightResult::new(Basis::Modeled)
-};
-
-// On the controller
-if let Some(launch) = shot.launch_for_flight() {
-    my_model.fly(&launch);
-}
-```
-
-A controller that needs measured data only (e.g. a tournament round) keeps shots from measured devices and ignores the flight result, assumed values included. `ShotAggregator` stamps each `CompletedShot` with the `source` its device last declared:
-
-```rust
-if let Some(mut shot) = shots.feed_envelope(&envelope) {
-    if shot.source == Some(Source::Measured) {
-        shot.flight = None;
-        record(shot);
-    }
-}
-```
-
-### Strike timestamp and the accumulator timeout
-
-A device can say when it detected the strike, in milliseconds since the Unix epoch (UTC) by its own clock:
-
-```rust
-use std::time::{SystemTime, UNIX_EPOCH};
-
-let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
-let trigger = FrpEvent::shot_trigger_at(key.clone(), now_ms);
-```
-
-`CompletedShot::timestamp` carries it. Clocks drift, so compare timestamps from different devices with a tolerance of your own.
-
-`ShotAggregator` discards a shot that has no `shot_finished` within 30 s of its `shot_trigger`. After a shot finishes or is discarded, events for its `shot_id` are ignored for one more timeout, so a late event, or the same shot arriving by a second route, never starts a new partial shot:
-
-```rust
-use std::time::Duration;
-
-let mut shots = ShotAggregator::new().with_timeout(Duration::from_secs(20));
-shots.discard_expired(); // also runs on every feed
-shots.forget_device("EagleOne-X4K2"); // e.g. after its connection closed
-```
-
-### Forwarding
-
-A bridge or hub forwards events with their `device`, `shot_id`, `shot_number` and `timestamp` unchanged, and drops duplicates first. `ForwardFilter` (feature `device`) does the dropping:
-
-```rust
-use flightrelay::{ForwardFilter, FrpError, FrpMessage};
-
-let mut filter = ForwardFilter::new();
-loop {
-    match upstream.recv() {
-        Ok(FrpMessage::Envelope(envelope)) => {
-            if filter.should_forward(&envelope) {
-                downstream.send_envelope(&envelope)?;
-            }
-        }
-        Ok(FrpMessage::Protocol(_)) | Err(FrpError::Json(_)) => {} // not forwarded
-        Err(_) => break, // upstream closed: forget its devices, then reconnect
-    }
-}
-```
-
-- Shot events pass once per `(device, shot_id, kind)` within the window (30 s by default), so a shot keeps at most one `flight_result`.
-- `device_telemetry` passes only when it changes the device's last-forwarded state. `filter.telemetry(device)` returns that state, for a controller that connects later.
-- An alert with a device context passes once per identical `(device, severity, message)` within the window.
-- A raw frame passes once per `(device, seq)` within the window. Its `key` plays no part: raw frames are not shot events.
-- `FrpEvent::Unknown` never passes: an unknown kind, or a known kind whose fields don't match it.
-- Telemetry state is kept per device until `filter.forget_device(device)`. Call it for each device of an upstream connection that closes.
-
-A forwarder may add a `flight_result` from its own model to a shot whose device sent none. When the upstream `shot_finished` arrives, it builds one with `Basis::Modeled`, a `model` naming itself and, in `assumed`, any launch values its model filled in, and forwards it before the `shot_finished` if `should_forward` lets it through:
-
-```rust
-if filter.should_forward(&finished) {
-    if let Some(flight) = my_model.fly(&launch) {
-        let added = FrpEnvelope::new(finished.device.clone(), FrpEvent::flight_result(key.clone(), flight));
-        if filter.should_forward(&added) { // false when the device sent one
-            downstream.send_envelope(&added)?;
-        }
-    }
-    downstream.send_envelope(&finished)?;
-}
-```
+`ShotAggregator` discards a shot that has no `shot.finished` within 30 s of its trigger. A message for a finished shot that arrives within the timeout after it finished (e.g. a slow flight model's `shot.flight`) is attached; when it changed the shot, `feed` returns `ShotEvent::Late` with the updated shot, for the caller to log as a warning. Later than that, or for a discarded shot, it is ignored. Only the actor that sent a shot's `shot.trigger` can finish it, and the open shots of an actor that leaves are discarded.
 
 ### Raw frames
 
-For debugging, a device that speaks another protocol to its hardware can send the messages behind its events as `raw_frame` events: one message per frame, as bytes (lowercase hex on the wire), with its direction (`RawDir::Rx` received, `RawDir::Tx` sent), a per-device `seq` that increases by one per frame, and optionally a timestamp, a label and the shot it belongs to. Raw frames are off by default. A controller asks for them in `start`:
-
-```rust
-let mut ep = FrpEndpoint::open(
-    EndpointConfig::new(Role::Controller, Transport::connect("ws://192.168.1.50:5880/frp"))
-        .with_raw_frames(true),
-)?;
-```
-
-A device sends them only when the controller asked, and never a frame that carries device or user identity (serial numbers, hardware addresses, network names, account data):
-
-```rust
-use flightrelay::{FrpEnvelope, FrpEvent, RawDir, RawFrame};
-
-if conn.raw_frames_requested() && !carries_identity(&bytes) {
-    let frame = RawFrame {
-        label: Some("result".into()),
-        key: Some(key.clone()),
-        ..RawFrame::new(RawDir::Rx, next_seq(), bytes)
-    };
-    conn.send_envelope(&FrpEnvelope::new("MyDevice-001", FrpEvent::raw_frame(frame)))?;
-}
-```
-
-Raw frames never affect a shot: `ShotAggregator` ignores them, even with a key. A `raw_frame` whose `dir`, `seq` or `data` is invalid (e.g. an odd number of hex digits) arrives as `FrpEvent::Unknown`. A forwarder may drop raw frames; one that forwards them passes them unchanged, only to a controller that asked for them.
+A launch monitor can publish the protocol messages behind its shots as `shot.raw` (`RawFrame`): one message per frame, as bytes (lowercase hex on the wire), with its direction, a per-actor `seq`, and optionally a timestamp, a label and the shot it belongs to. It does so only when its own configuration turns them on, and never for a frame that carries device or user identity. Raw frames never affect a shot. Relays may drop them.
 
 ### Device drivers
 
-A driver connects one launch monitor to a host. The host here is either `FrpServer`, which turns a driver's events into FRP for controllers, or an application that runs the driver itself.
+A driver connects one launch monitor to a host, as a launch monitor actor on the bus.
 
-A driver is built in two steps. `DeviceDriver::new(config)` validates a config and builds the driver, with no I/O, and the driver keeps whatever outlives one connection (a shot counter, a retry clock). `connect(&mut ctx)` opens one `DeviceSession`: transport, handshake, identity. The host then calls `poll(timeout, &mut events)` until it fails or the host stops, and `close` to release the device. The host owns the reconnect loop and asks the driver for the delay (`retry_delay`). Everything is synchronous and caller-driven.
+A driver is built in two steps. `DeviceDriver::new(config)` validates a config and builds the driver, with no I/O, and the driver keeps whatever outlives one connection (a shot counter, a retry clock). `connect(&mut ctx)` opens one `DeviceSession`: transport, handshake with the device, identity. The host then calls `poll(timeout, &mut events)` until it fails or the host stops, and `close` to release the device. The host owns the reconnect loop and asks the driver for the delay (`retry_delay`). Everything is synchronous and caller-driven.
+
+A driver emits `DeviceEvent`s into the `Events` sink: `shot.*` messages and alerts (`out.launch(..)`, `out.flight(..)`, `out.alert(..)`), its status (`out.blockers([..])`, `out.ready(..)`, `out.battery(..)`, `out.attitude(..)`, `out.telemetry(..)`, `out.clear_telemetry(..)`, or the whole `DeviceStatus` at once with `out.status(..)`), and three host-only kinds (a phase, a log line, a discarded shot). The host holds the driver's current status and its `bus.actor` carries exactly that, so a driver takes a value off the same way it sets one:
 
 ```rust
-use std::time::Duration;
-use flightrelay::driver::{
-    ConfigError, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverInfo, Events,
-    NoAction, ShotIds, Stopped,
-};
-use flightrelay::{Source, config::DriverConfig};
+use flightrelay::driver::DeviceStatus;
 
-// `Config` is a serde struct that implements `DriverConfig`; `Error` converts from `Stopped`.
-impl DeviceDriver for Beacon {
-    type Config = Config;
-    type Error = Error;
-    type Action = NoAction;
-    type Session = BeaconSession;
-
-    fn info(_: &Config) -> DriverInfo {
-        DriverInfo::new("beacon", "Beacon", Source::Virtual)
-    }
-    fn new(config: Config) -> Result<Self, ConfigError> {
-        config.validate()?;
-        Ok(Self { config, ids: ShotIds::new() })
-    }
-    fn config(&self) -> &Config { &self.config }
-    fn apply_config(&mut self, new: &Config) { self.config = new.clone(); }
-    fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<BeaconSession, Error> {
-        ctx.tick()?; // between steps; `Err(Stopped)` after a stop
-        Ok(BeaconSession { /* ... */ })
-    }
-}
+out.battery(80);
+out.battery(None);                 // no reading any more: the battery leaves the actor
+out.attitude(0.4, -0.2);
+out.clear_telemetry(["radar_mode"]);
+out.status(DeviceStatus::new()     // the whole status: anything left out is off the actor
+    .with_blockers(["no_ball"])
+    .with_battery(72)
+    .with_telemetry("radar_mode", "armed"));
 ```
 
-A driver emits `DeviceEvent`s into the `Events` sink: FRP events (shots, telemetry, alerts, raw frames) and three host-only kinds (a phase, a log line, a discarded shot). It sends each shot event once, when it has it, and leaves out any value the device does not have. `ConnectCtx::tick()` lets the host serve its own inputs while a long connect blocks, and `ConnectCtx::latched()` shows the mode, hand and club the host has latched, live.
+ It reads `golfer.turn` as `TurnHints`: each `golfer.turn` replaces all the hints, and a `null` or unrecognized field is `None`, no hint for that field, with nothing kept from an earlier turn. `DeviceSession::hints` gets the new set whenever it changes, and `ConnectCtx::hints()` shows the last complete turn's during a connect. The host keeps that set when the session actor goes away; what the hardware does for a field with no hint is the driver's business.
 
-To serve a driver to controllers, give it to `FrpServer`:
+To run a driver on the bus, give it to `FrpServer` with the actor id the host keeps:
 
 ```rust
 use flightrelay::driver::Stop;
@@ -346,12 +210,12 @@ use flightrelay::{FrpServer, ServerConfig, Transport};
 
 let driver = Beacon::new(Config::default())?;
 let stop = Stop::new();
-FrpServer::new(driver, ServerConfig::new(Transport::listen("0.0.0.0:5880")))
+FrpServer::new(driver, ServerConfig::new(Transport::listen("0.0.0.0:5880"), actor_id))
     .on_event(|event| eprintln!("{event:?}"))
     .run(&stop)?;
 ```
 
-The server accepts any number of controllers (`Transport::Connect` dials one instead), replays the device's telemetry to a controller that joins late, stamps `source` on every `device_telemetry`, drops duplicate events, finishes a shot a lost session left open, and passes a controller's `set_detection_mode` to the session as a `DeviceCommand`. A network thread owns every connection, so controllers are served while a connect blocks, and a controller that reads slowly is queued, then dropped alone once it passes `write_buffer_limit`.
+The server greets every peer with the actor's `bus.actor` and `bus.sync`, republishes `bus.actor` on change, every heartbeat (at least 0.1 s) and in answer to `bus.sync`, publishes the driver's messages under the actor id, forwards between its peers, finishes a shot a lost session left open, goes back to `DeviceStatus::not_armed()` (blocker `not_armed`, no battery, attitude or telemetry) while no session is up, and sends the actor's removal when it stops. `run` returns an error if its network thread dies. `Transport::Connect` dials a hub instead of listening.
 
 `run` is a whole `main`:
 
@@ -361,44 +225,40 @@ fn main() -> std::process::ExitCode {
 }
 ```
 
-Its command line is named flags, in any order: `--config <path>` (a TOML file with the driver's config), `--target <listen-addr | ws://host:port/frp>`, repeatable `--set key=value` over the file, `--log <info|debug|trace>`, and `--help`, which lists every config key with its default. A `--set` key the config does not have, and a `wss://` target, are refused with exit 2. Ctrl-C closes the session and exits.
+Its command line is named flags, in any order: `--config <path>` (a TOML file with the driver's config at the top level and the runner's own `[frp]` table), `--target <listen-addr | ws://host:port/frp>`, repeatable `--set key=value` over the file (`--set frp.raw_frames=true` for the runner), `--log <info|debug|trace>`, and `--help`, which lists every config key with its default. The `[frp]` table holds `actor_id` — generated on the first run and written into the file, so the actor keeps its id; a file whose `[frp]` table is written in a shape the runner can't safely edit is left as it is, and the runner prints the line to add — and `raw_frames`. Ctrl-C closes the session, removes the actor and exits.
 
-`MockDriver` (feature `mock`) is a virtual launch monitor that fires a shot at an interval, for testing a host without hardware:
+A binary that builds its own `FrpServer` keeps its actor id the same way with `config_actor_id(path)`: it reads `frp.actor_id` from the TOML file, or generates one and writes it in by the same rules, and says which (`ActorIdOrigin::Read`, `Saved`, `NotSaved`, `SaveFailed`).
 
 ```rust
-use flightrelay::driver::DeviceDriver;
-use flightrelay::mock::{MockConfig, MockDriver};
+let kept = flightrelay::config_actor_id("launch-monitor.toml")?;
+let config = ServerConfig::new(Transport::listen("0.0.0.0:5880"), kept.id);
+```
 
-let driver = MockDriver::new(MockConfig::default())?;
+`MockDriver` (feature `mock`) is a virtual launch monitor that fires a shot at an interval, in the mode the turn asks for, for testing a host without hardware:
+
+```text
+cargo run --example frp-mock --features main,mock -- --set shot_interval_s=5
 ```
 
 ### Messages only (no WebSocket)
 
 ```rust
-use flightrelay::{FrpMessage, Distance};
+use flightrelay::{Distance, FrpBody, FrpMessage};
 
-let msg = FrpMessage::parse(r#"{"device":"EagleOne-X4K2","event":{"kind":"flight_result","key":{"shot_id":"...","shot_number":1},"flight":{"basis":"tracked","carry_distance":"180.5m"}}}"#)?;
+let msg = FrpMessage::parse(r#"{"kind":"shot.flight","from":"e4a7136b9f02cd58","key":{"shot_id":"550e8400-e29b-41d4-a716-446655440000","shot_number":42},"flight":{"basis":"modeled","model":"Fairway Physics 1.3","carry_distance":"181.2m"}}"#)?;
+if let FrpBody::ShotFlight(f) = &msg.body {
+    println!("{} carry {:?}", msg.from, f.flight.carry_distance);
+}
 let json = msg.to_json()?;
 
-// Unit conversion
 let d = Distance::Meters(180.5);
-assert_eq!(d.as_yards(), 197.4); // approximate
+assert!((d.as_yards() - 197.4).abs() < 0.1);
 ```
 
 ```toml
 [dependencies]
-flightrelay = "0.5"
+flightrelay = "0.6"
 ```
-
-## Protocol
-
-FRP is a minimal WebSocket protocol. After a `start`/`init` handshake, the device streams JSON events for each shot lifecycle stage:
-
-```
-shot_trigger → launch + flight_result + club_path + face_impact (any order) → shot_finished
-```
-
-Events arrive as they become available — ball launch data may arrive immediately while the flight result, club and face impact data take longer to process. Controllers accumulate events by `shot_id` until `shot_finished`.
 
 See the [full spec](https://github.com/flightrelay/spec) for details.
 
