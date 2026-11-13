@@ -168,7 +168,7 @@ fn the_shown_flight_prefers_tracked() {
 }
 
 #[test]
-fn a_message_after_finished_is_attached_and_warned_about() {
+fn another_actors_message_after_finished_is_an_update() {
     let mut agg = ShotAggregator::new();
     agg.feed(&trigger());
     agg.feed(&msg(
@@ -181,22 +181,18 @@ fn a_message_after_finished_is_attached_and_warned_about() {
     let first = finish(&mut agg);
     assert!(first.flights.is_empty());
 
-    let late = flight(Basis::Modeled, "Fairway Physics 1.3", 181.2);
-    let Some(ShotEvent::Late(warning)) = agg.feed(&shot_flight(PHYSICS, late.clone())) else {
-        panic!("a late flight is surfaced");
+    let added = flight(Basis::Modeled, "Fairway Physics 1.3", 181.2);
+    let Some(ShotEvent::Updated(shot)) = agg.feed(&shot_flight(PHYSICS, added.clone())) else {
+        panic!("an addendum updates the shot, with no warning");
     };
-    assert_eq!(warning.from, PHYSICS);
-    assert_eq!(warning.kind, "shot.flight");
-    assert_eq!(warning.shot.flights[0].flight, late);
-    assert_eq!(warning.shot.launch, first.launch);
-    assert_eq!(
-        warning.to_string(),
-        "shot.flight from e4a7136b9f02cd58 arrived after shot 42 \
-         (550e8400-e29b-41d4-a716-446655440000) finished"
-    );
-    // The remembered shot keeps it: a second late part sees both.
-    let Some(ShotEvent::Late(again)) = agg.feed(&msg(
-        LM,
+    assert_eq!(shot.from, LM);
+    assert_eq!(shot.flights.len(), 1);
+    assert_eq!(shot.flights[0].from, PHYSICS);
+    assert_eq!(shot.flights[0].flight, added);
+    assert_eq!(shot.launch, first.launch);
+    // The remembered shot keeps it: a second addendum sees both.
+    let Some(ShotEvent::Updated(again)) = agg.feed(&msg(
+        CLUBHOUSE,
         ShotImpact {
             key: key(),
             impact: FaceImpact::default(),
@@ -204,25 +200,15 @@ fn a_message_after_finished_is_attached_and_warned_about() {
     )) else {
         panic!()
     };
-    assert_eq!(again.shot.flights.len(), 1);
-    assert!(again.shot.impact.is_some());
-    // A late part the shot already has changes nothing: no warning.
+    assert_eq!(again.flights.len(), 1);
+    assert!(again.impact.is_some());
+    // An addendum the shot already has changes nothing: no update.
     assert_eq!(
         agg.feed(&msg(
             PHYSICS,
             ShotLaunch {
                 key: key(),
                 launch: Launch::default(),
-            },
-        )),
-        None
-    );
-    assert_eq!(
-        agg.feed(&msg(
-            LM,
-            ShotImpact {
-                key: key(),
-                impact: FaceImpact::default(),
             },
         )),
         None
@@ -234,7 +220,50 @@ fn a_message_after_finished_is_attached_and_warned_about() {
 }
 
 #[test]
-fn a_late_message_for_a_shot_no_longer_remembered_is_ignored() {
+fn the_launch_monitors_own_message_after_finished_is_late() {
+    let mut agg = ShotAggregator::new();
+    agg.feed(&trigger());
+    finish(&mut agg);
+
+    let own = flight(Basis::Tracked, "Eagle One radar", 179.0);
+    let Some(ShotEvent::Late(warning)) = agg.feed(&shot_flight(LM, own.clone())) else {
+        panic!("the launch monitor's own message after its finish is late");
+    };
+    assert_eq!(warning.from, LM);
+    assert_eq!(warning.kind, "shot.flight");
+    assert_eq!(warning.shot.flights[0].flight, own);
+    assert_eq!(
+        warning.to_string(),
+        "shot.flight from 7d2f9a41c03be856 arrived after shot 42 \
+         (550e8400-e29b-41d4-a716-446655440000) finished"
+    );
+    // Out of order even when it changes nothing.
+    let impact = || {
+        msg(
+            LM,
+            ShotImpact {
+                key: key(),
+                impact: FaceImpact::default(),
+            },
+        )
+    };
+    let Some(ShotEvent::Late(first)) = agg.feed(&impact()) else {
+        panic!()
+    };
+    assert!(first.shot.impact.is_some());
+    let Some(ShotEvent::Late(repeat)) = agg.feed(&impact()) else {
+        panic!("a repeat is late too")
+    };
+    assert_eq!(repeat.shot, first.shot);
+    // Another actor's addendum stays an update.
+    assert!(matches!(
+        agg.feed(&shot_flight(PHYSICS, flight(Basis::Modeled, "m", 1.0))),
+        Some(ShotEvent::Updated(_))
+    ));
+}
+
+#[test]
+fn a_message_for_a_shot_no_longer_remembered_is_ignored() {
     let mut agg = ShotAggregator::new().with_timeout(Duration::from_secs(10));
     let t0 = Instant::now();
     agg.feed_at(&trigger(), t0);
@@ -242,12 +271,14 @@ fn a_late_message_for_a_shot_no_longer_remembered_is_ignored() {
         agg.feed_at(&finished(), t0 + Duration::from_secs(1)),
         Some(ShotEvent::Finished(_))
     ));
-    let late = shot_flight(PHYSICS, flight(Basis::Modeled, "m", 1.0));
+    let added = shot_flight(PHYSICS, flight(Basis::Modeled, "m", 1.0));
     assert!(matches!(
-        agg.feed_at(&late, t0 + Duration::from_secs(11)),
-        Some(ShotEvent::Late(_))
+        agg.feed_at(&added, t0 + Duration::from_secs(11)),
+        Some(ShotEvent::Updated(_))
     ));
-    assert!(agg.feed_at(&late, t0 + Duration::from_secs(12)).is_none());
+    let own = shot_flight(LM, flight(Basis::Tracked, "r", 1.0));
+    assert!(agg.feed_at(&added, t0 + Duration::from_secs(12)).is_none());
+    assert!(agg.feed_at(&own, t0 + Duration::from_secs(12)).is_none());
     // Forgotten, so a trigger with the same id would start over.
     agg.feed_at(&trigger(), t0 + Duration::from_secs(12));
     assert_eq!(agg.pending_count(), 1);
@@ -463,6 +494,35 @@ fn a_gone_actors_open_shots_are_discarded_like_a_timeout() {
     // After that the id is free again.
     agg.feed_at(&trigger(), t0 + Duration::from_secs(12));
     assert_eq!(agg.pending_count(), 1);
+}
+
+#[test]
+fn a_discarded_shot_is_dropped_like_a_timeout() {
+    let mut agg = ShotAggregator::new().with_timeout(Duration::from_secs(10));
+    let t0 = Instant::now();
+    let other = ShotKey::new("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 43);
+    agg.feed_at(&trigger(), t0);
+    agg.feed_at(&msg(LM, ShotTrigger::new(other.clone())), t0);
+    assert!(agg.discard_at(&key().shot_id, t0 + Duration::from_secs(1)));
+    assert!(!agg.discard_at(&key().shot_id, t0 + Duration::from_secs(1)));
+    // Only that shot goes; the other one is still in progress.
+    assert_eq!(agg.pending_count(), 1);
+    // Its late parts, a repeated trigger and its finish are ignored for one timeout.
+    let late = shot_flight(PHYSICS, flight(Basis::Modeled, "m", 1.0));
+    assert_eq!(agg.feed_at(&late, t0 + Duration::from_secs(2)), None);
+    agg.feed_at(&trigger(), t0 + Duration::from_secs(2));
+    assert_eq!(agg.pending_count(), 1);
+    assert_eq!(agg.feed_at(&finished(), t0 + Duration::from_secs(3)), None);
+    let done = agg.feed_at(
+        &msg(LM, ShotFinished { key: other }),
+        t0 + Duration::from_secs(3),
+    );
+    assert!(matches!(done, Some(ShotEvent::Finished(_))));
+    // A finished shot is not discarded.
+    assert!(!agg.discard_at(
+        "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        t0 + Duration::from_secs(4)
+    ));
 }
 
 #[test]
