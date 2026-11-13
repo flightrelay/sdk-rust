@@ -14,11 +14,15 @@
 //! - A shot carries the [`Source`] its launch monitor declares in the
 //!   `device` block of its `bus.actor`, the `golfer.turn` current when its
 //!   trigger arrived, and the open `practice.block` of that turn's golfer.
-//! - A message for a shot that has finished is attached if the shot is still
-//!   remembered (for one timeout after it finished). When it changed the
-//!   shot (a flight, or a launch, club or impact the shot did not have yet)
-//!   it yields a [`ShotEvent::Late`] for the caller to log as a warning; one
-//!   that changed nothing yields nothing.
+//! - A finished shot is remembered for one timeout after it finished, and a
+//!   message for it is attached while it is. A message from the shot's own
+//!   launch monitor (the actor that sent its `shot.finished`) is out of order
+//!   and yields a [`ShotEvent::Late`] for the caller to log as a warning. A
+//!   message from any other actor, such as a flight model's `shot.flight`,
+//!   is an addendum: when it changed the shot (a flight, or a launch, club or
+//!   impact the shot did not have yet) it yields a [`ShotEvent::Updated`]
+//!   with the updated shot; one that changed nothing yields nothing. A
+//!   message for a finished shot no longer remembered is ignored.
 //! - A shot that has not finished within the accumulator timeout
 //!   ([`DEFAULT_SHOT_TIMEOUT`] unless set with
 //!   [`ShotAggregator::with_timeout`]) is discarded, and its messages are
@@ -140,17 +144,22 @@ impl CompletedShot {
 pub enum ShotEvent {
     /// `shot.finished` arrived for a shot in progress.
     Finished(CompletedShot),
-    /// A message for a shot that has already finished arrived, was attached
-    /// and changed the shot. Log it as a warning, and replace the shot you
-    /// stored.
+    /// An addendum: a message from an actor other than the shot's launch
+    /// monitor (e.g. a flight model's `shot.flight`) arrived after the shot
+    /// finished and changed it. Replace the shot you stored; this is not a
+    /// warning.
+    Updated(CompletedShot),
+    /// The shot's launch monitor sent a message for the shot after its own
+    /// `shot.finished`. The message is attached. Log it as a warning, and
+    /// replace the shot you stored.
     Late(LateMessage),
 }
 
-/// A shot message that arrived after its shot's `shot.finished`. Its
-/// `Display` is a warning line.
+/// A shot message that the shot's launch monitor sent after its own
+/// `shot.finished` for the shot. Its `Display` is a warning line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LateMessage {
-    /// The sender of the late message.
+    /// The sender of the late message: the shot's launch monitor.
     pub from: String,
     /// Its kind, e.g. `"shot.flight"`.
     pub kind: String,
@@ -196,7 +205,8 @@ struct InProgress {
 pub struct ShotAggregator {
     timeout: Duration,
     pending: HashMap<String, InProgress>,
-    /// Finished shots, remembered for late messages, with when they finished.
+    /// Finished shots, remembered for addenda and late messages, with when
+    /// they finished.
     finished: HashMap<String, (CompletedShot, Instant)>,
     /// Discarded shots, with when they were discarded.
     discarded: HashMap<String, Instant>,
@@ -228,7 +238,7 @@ impl ShotAggregator {
 
     /// Sets the accumulator timeout: how long a shot may take from
     /// `shot.trigger` to `shot.finished` before it is discarded, and how long
-    /// a finished shot is remembered for late messages.
+    /// a finished shot is remembered for addenda and late messages.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -282,14 +292,16 @@ impl ShotAggregator {
                     return None;
                 }
                 let (shot, _) = self.finished.get_mut(id)?;
-                if !shot.attach(from, body) {
-                    return None;
+                let changed = shot.attach(from, body);
+                if shot.from == from {
+                    Some(ShotEvent::Late(LateMessage {
+                        from: from.to_owned(),
+                        kind: msg.kind().to_owned(),
+                        shot: shot.clone(),
+                    }))
+                } else {
+                    changed.then(|| ShotEvent::Updated(shot.clone()))
                 }
-                Some(ShotEvent::Late(LateMessage {
-                    from: from.to_owned(),
-                    kind: msg.kind().to_owned(),
-                    shot: shot.clone(),
-                }))
             }
             FrpBody::BusActor(actor) => {
                 match actor.device.as_ref().and_then(|d| d.source) {
@@ -376,6 +388,23 @@ impl ShotAggregator {
             self.discarded.insert(id.clone(), now);
         }
         expired.len()
+    }
+
+    /// Discards the shot in progress with this `shot_id`, as on a timeout:
+    /// its later messages are ignored for one timeout. Returns whether such a
+    /// shot was in progress; a finished or unknown shot is left alone. For a
+    /// consumer that gives up on one shot, e.g. when its launch monitor
+    /// starts the next one.
+    pub fn discard(&mut self, shot_id: &str) -> bool {
+        self.discard_at(shot_id, Instant::now())
+    }
+
+    fn discard_at(&mut self, shot_id: &str, now: Instant) -> bool {
+        if self.pending.remove(shot_id).is_none() {
+            return false;
+        }
+        self.discarded.insert(shot_id.to_owned(), now);
+        true
     }
 
     /// Forgets what came from `actor`: its declared source, its turn and

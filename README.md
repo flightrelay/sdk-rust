@@ -11,7 +11,7 @@ This crate implements FRP 0.3.0 (`SPEC_VERSION`).
 
 - **Message types** — one Rust type per FRP kind (all 21), in a flat `FrpMessage { from, body }`; unknown and extension kinds (`x.<vendor>.*`) parse as `FrpBody::Unknown` and serialize back unchanged
 - **Unit-tagged values** — `Distance` and `Velocity` serialize as unit-tagged strings (`"180.5m"`, `"67.2mps"`) with unit conversion
-- **Shot accumulator** — `ShotAggregator` composes a shot from its `shot.*` messages by `shot_id`, whoever sent each part, keeps every `shot.flight`, stamps the `golfer.turn` and `practice.block` current at the trigger, and reports a message that arrives after `shot.finished` as a warning
+- **Shot accumulator** — `ShotAggregator` composes a shot from its `shot.*` messages by `shot_id`, whoever sent each part, keeps every `shot.flight`, stamps the `golfer.turn` and `practice.block` current at the trigger, delivers another actor's addendum to a finished shot (e.g. a flight model's `shot.flight`) as an update, and reports a message the launch monitor sends after its own `shot.finished` as a warning
 - **Bus state** — `BusState` keeps the current state of the bus by (kind, from, id), applies removals, and drops an actor after three missed heartbeats
 - **WebSocket binding** — `FrpEndpoint` listens or dials and yields `FrpConnection`s with synchronous send/recv (`recv_timeout` waits no longer than a heartbeat is due); `greet` sends what a side sends on connecting (its `bus.actor`s, their state, then `bus.sync`)
 - **Hub** — `Hub` forwards every message to every other connection, never back to its source
@@ -90,6 +90,7 @@ loop {
                     println!("{golfer:?}: carry {carry}");
                 }
             }
+            Some(ShotEvent::Updated(shot)) => println!("shot {} updated", shot.key.shot_number),
             Some(ShotEvent::Late(late)) => eprintln!("warning: {late}"),
             None => {}
         }
@@ -171,9 +172,9 @@ A shot may have several flights: its launch monitor's own and any flight model's
 
 A receiver that needs measured data only (e.g. a tournament round) keeps shots whose `source` is `Source::Measured` — the source the launch monitor declares in its `bus.actor` — and ignores the flights.
 
-### Late messages and the accumulator timeout
+### Addenda, late messages and the accumulator timeout
 
-`ShotAggregator` discards a shot that has no `shot.finished` within 30 s of its trigger. A message for a finished shot that arrives within the timeout after it finished (e.g. a slow flight model's `shot.flight`) is attached; when it changed the shot, `feed` returns `ShotEvent::Late` with the updated shot, for the caller to log as a warning. Later than that, or for a discarded shot, it is ignored. Only the actor that sent a shot's `shot.trigger` can finish it, and the open shots of an actor that leaves are discarded.
+`ShotAggregator` discards a shot that has no `shot.finished` within 30 s of its trigger. A finished shot is remembered for 30 s after it finished, and a message for it is attached while it is. A message from another actor (e.g. a flight model's `shot.flight`) is an addendum: when it changed the shot, `feed` returns `ShotEvent::Updated` with the updated shot. A message from the shot's own launch monitor after its `shot.finished` is out of order: `feed` returns `ShotEvent::Late` with the shot, for the caller to log as a warning. A message for a finished shot no longer remembered, or for a discarded shot, is ignored. Only the actor that sent a shot's `shot.trigger` can finish it, and the open shots of an actor that leaves are discarded.
 
 ### Raw frames
 

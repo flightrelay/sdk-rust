@@ -334,7 +334,8 @@ fn padded(from: &str, pad: usize, n: u64) -> String {
 /// Peer A stops reading while peer B floods the hub (and, with `with_c`, peer
 /// C sends small messages and reads everything). The hub drops A once its
 /// queue passes the write buffer limit, in the middle of forwarding B's
-/// messages. The hub must not panic, must attribute every message to the
+/// messages. The limit holds 16 of B's messages, so C, which reads
+/// everything, never fills its queue on a slow machine. The hub must not panic, must attribute every message to the
 /// peer that sent it, and must never echo a message to its source.
 // One scenario, read top to bottom: splitting it would scatter the setup.
 #[allow(clippy::too_many_lines)]
@@ -348,7 +349,7 @@ fn a_stalled_peer_is_dropped_mid_forward(with_c: bool) {
     let (mut ep, addr) = {
         let ep = FrpEndpoint::open(
             EndpointConfig::new(Transport::listen("127.0.0.1:0"))
-                .with_write_buffer_limit(64 * 1024),
+                .with_write_buffer_limit(1024 * 1024),
         )
         .expect("listen");
         let addr = ep.local_addr().unwrap().unwrap().to_string();
