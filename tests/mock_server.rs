@@ -79,7 +79,12 @@ fn a_collector_receives_complete_virtual_shots_from_the_mock() {
             panic!("unexpected alert: {}", alert.message);
         }
         bus.apply(&msg);
-        if let Some(ShotEvent::Finished(shot)) = shots.feed(&msg) {
+        // The mock shoots on its own clock from the moment it listens, so a
+        // shot can finish before our turn reaches it. Count only shots made
+        // under our turn.
+        if let Some(ShotEvent::Finished(shot)) = shots.feed(&msg)
+            && shot.turn.as_ref() == Some(&turn)
+        {
             done.push(shot);
         }
     }
@@ -98,9 +103,9 @@ fn a_collector_receives_complete_virtual_shots_from_the_mock() {
     }
     assert!(bus.actor(MOCK).is_none(), "the actor removed itself");
 
-    for (i, shot) in done.iter().enumerate() {
+    assert_eq!(done[1].key.shot_number, done[0].key.shot_number + 1);
+    for shot in &done {
         assert_eq!(shot.from, MOCK);
-        assert_eq!(shot.key.shot_number as usize, i + 1);
         assert_eq!(shot.source, Some(Source::Virtual));
         assert_eq!(shot.turn.as_ref(), Some(&turn));
         assert!(shot.timestamp.is_some());
