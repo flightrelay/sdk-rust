@@ -238,7 +238,6 @@ impl FrpEndpoint {
                 finish(socket).map(Some)
             }
             (Target::Connect(url), _) => {
-                let deadline = self.config.handshake_timeout.map(|t| Instant::now() + t);
                 let Some(stream) = dial(
                     url,
                     self.config.handshake_timeout,
@@ -247,6 +246,8 @@ impl FrpEndpoint {
                 else {
                     return Ok(None);
                 };
+                // The upgrade clock starts when the connection opens.
+                let deadline = self.config.handshake_timeout.map(|t| Instant::now() + t);
                 let request = url.as_str().into_client_request().map_err(websocket)?;
                 arm(&stream, deadline)?;
                 let socket = tungstenite::client::client_with_config(
