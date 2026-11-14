@@ -73,8 +73,9 @@ pub enum DeviceEvent {
     /// changed.
     StatusChange(StatusChange),
     /// Where a connect or a (re)configure is, for status displays:
-    /// `"discovering"`, `"connecting"`, `"handshaking"`, `"configuring"`,
-    /// `"arming"`, `"measuring"`. Host-only.
+    /// `"discovering"`, `"listening"` (waiting for the device to connect),
+    /// `"connecting"`, `"handshaking"`, `"configuring"`, `"arming"`,
+    /// `"measuring"`. Host-only.
     Phase(&'static str),
     /// A log line for the host's logger. Host-only.
     Log(Level, String),

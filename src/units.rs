@@ -17,11 +17,17 @@ use crate::types::InvalidUnitValue;
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum Distance {
+    /// Feet (`ft`).
     Feet(f64),
+    /// Inches (`in`).
     Inches(f64),
+    /// Meters (`m`).
     Meters(f64),
+    /// Centimeters (`cm`).
     Centimeters(f64),
+    /// Yards (`yd`).
     Yards(f64),
+    /// Millimeters (`mm`).
     Millimeters(f64),
 }
 
@@ -67,6 +73,7 @@ impl std::str::FromStr for Distance {
 }
 
 impl Distance {
+    /// The number, in this value's own unit.
     #[must_use]
     pub fn value(self) -> f64 {
         match self {
@@ -79,6 +86,7 @@ impl Distance {
         }
     }
 
+    /// The unit suffix this value is written with on the wire, e.g. `"m"`.
     #[must_use]
     pub fn unit_suffix(self) -> &'static str {
         match self {
@@ -91,6 +99,7 @@ impl Distance {
         }
     }
 
+    /// This distance in feet.
     #[must_use]
     pub fn as_feet(self) -> f64 {
         match self {
@@ -103,6 +112,7 @@ impl Distance {
         }
     }
 
+    /// This distance in inches.
     #[must_use]
     pub fn as_inches(self) -> f64 {
         match self {
@@ -115,6 +125,7 @@ impl Distance {
         }
     }
 
+    /// This distance in meters.
     #[must_use]
     pub fn as_meters(self) -> f64 {
         match self {
@@ -127,6 +138,7 @@ impl Distance {
         }
     }
 
+    /// This distance in centimeters.
     #[must_use]
     pub fn as_centimeters(self) -> f64 {
         match self {
@@ -139,6 +151,7 @@ impl Distance {
         }
     }
 
+    /// This distance in yards.
     #[must_use]
     pub fn as_yards(self) -> f64 {
         match self {
@@ -151,6 +164,7 @@ impl Distance {
         }
     }
 
+    /// This distance in millimeters.
     #[must_use]
     pub fn as_millimeters(self) -> f64 {
         match self {
@@ -175,9 +189,13 @@ impl fmt::Display for Distance {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum Velocity {
+    /// Miles per hour (`mph`).
     MilesPerHour(f64),
+    /// Feet per second (`fps`).
     FeetPerSecond(f64),
+    /// Meters per second (`mps`).
     MetersPerSecond(f64),
+    /// Kilometers per hour (`kph`).
     KilometersPerHour(f64),
 }
 
@@ -221,6 +239,7 @@ impl std::str::FromStr for Velocity {
 }
 
 impl Velocity {
+    /// The number, in this value's own unit.
     #[must_use]
     pub fn value(self) -> f64 {
         match self {
@@ -231,6 +250,7 @@ impl Velocity {
         }
     }
 
+    /// The unit suffix this value is written with on the wire, e.g. `"mps"`.
     #[must_use]
     pub fn unit_suffix(self) -> &'static str {
         match self {
@@ -241,6 +261,7 @@ impl Velocity {
         }
     }
 
+    /// This velocity in miles per hour.
     #[must_use]
     pub fn as_mph(self) -> f64 {
         match self {
@@ -251,6 +272,7 @@ impl Velocity {
         }
     }
 
+    /// This velocity in feet per second.
     #[must_use]
     pub fn as_fps(self) -> f64 {
         match self {
@@ -261,6 +283,7 @@ impl Velocity {
         }
     }
 
+    /// This velocity in meters per second.
     #[must_use]
     pub fn as_mps(self) -> f64 {
         match self {
@@ -271,6 +294,7 @@ impl Velocity {
         }
     }
 
+    /// This velocity in kilometers per hour.
     #[must_use]
     pub fn as_kph(self) -> f64 {
         match self {

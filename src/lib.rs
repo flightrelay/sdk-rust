@@ -4,6 +4,18 @@
 //! [Flight Relay Protocol](https://github.com/flightrelay/spec) and optional
 //! WebSocket transport, a hub, and a framework for launch monitor drivers.
 //!
+//! The message types need no feature:
+//!
+//! ```
+//! use flightrelay::{FrpBody, FrpMessage, ShotKey, ShotTrigger};
+//!
+//! let msg = FrpMessage::new("7d2f9a41c03be856", ShotTrigger::new(ShotKey::new("id", 1)));
+//! let json = msg.to_json()?;
+//! assert_eq!(FrpMessage::parse(&json)?, msg);
+//! assert!(matches!(msg.body, FrpBody::ShotTrigger(_)));
+//! # Ok::<(), flightrelay::FrpError>(())
+//! ```
+//!
 //! # The bus
 //!
 //! FRP is a multi-producer, multi-consumer bus of **actors**. Every message
@@ -63,6 +75,11 @@
 //!   `ctrlc`)
 //! - **`mock`** — `mock::MockDriver`, a simulated launch monitor (implies
 //!   `driver`)
+//! - **`testing`** — `testing::TestHost`, a host for driver tests (one
+//!   thread, no sockets, time in steps), and readers of the events a driver
+//!   emitted (implies `driver`)
+//!
+//! No feature is on by default; the message types need none.
 //!
 //! # A collector
 //!
@@ -143,6 +160,8 @@
 //! [`RawFrame`]s (`shot.raw`), for debugging, when its own configuration
 //! turns them on. Raw frames never carry device or user identity, and never
 //! affect a shot.
+
+#![warn(missing_docs)]
 
 use std::time::Duration;
 
