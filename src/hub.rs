@@ -288,7 +288,7 @@ impl Hub {
 /// Why a connection was dropped, in words.
 pub(crate) fn describe(e: &FrpError) -> String {
     match e {
-        FrpError::WebSocket(inner) if matches!(**inner, tungstenite::Error::WriteBufferFull(_)) => {
+        FrpError::WebSocket(inner) if inner.is_write_buffer_full() => {
             "write buffer full: the peer reads too slowly".into()
         }
         FrpError::Closed => "closed".into(),

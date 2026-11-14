@@ -171,6 +171,8 @@ pub mod mock;
 pub use driver::testing;
 
 pub use error::FrpError;
+#[cfg(feature = "transport")]
+pub use error::WebSocketError;
 pub use kinds::{
     AimAction, BusActor, BusAlert, BusReply, BusSync, Course, DeviceInfo, EndReason, GameAim,
     GameBall, GameRound, GameScores, GameStroke, GolferProfile, GolferSelect, GolferTurn, Hole,

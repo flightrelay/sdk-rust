@@ -2,6 +2,7 @@
 
 /// Errors from FRP message parsing and transport.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FrpError {
     /// Text that is not an FRP message: not JSON, or not an object with a
     /// string `kind` and `from`. About that one message only.
@@ -20,7 +21,7 @@ pub enum FrpError {
     /// The WebSocket failed.
     #[cfg(feature = "transport")]
     #[error("websocket: {0}")]
-    WebSocket(Box<tungstenite::Error>),
+    WebSocket(WebSocketError),
 }
 
 impl FrpError {
@@ -33,11 +34,27 @@ impl FrpError {
     }
 }
 
+/// A failure of the WebSocket layer under an FRP connection: an I/O error,
+/// a protocol violation by the peer, or a full write buffer. Its text says
+/// which.
 #[cfg(feature = "transport")]
-impl From<tungstenite::Error> for FrpError {
-    fn from(e: tungstenite::Error) -> Self {
-        Self::WebSocket(Box::new(e))
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct WebSocketError(Box<tungstenite::Error>);
+
+#[cfg(feature = "transport")]
+impl WebSocketError {
+    /// Whether the connection's write buffer limit was reached: the peer
+    /// reads too slowly.
+    pub(crate) fn is_write_buffer_full(&self) -> bool {
+        matches!(*self.0, tungstenite::Error::WriteBufferFull(_))
     }
+}
+
+/// Wraps a WebSocket failure as an [`FrpError`].
+#[cfg(feature = "transport")]
+pub(crate) fn websocket(e: tungstenite::Error) -> FrpError {
+    FrpError::WebSocket(WebSocketError(Box::new(e)))
 }
 
 #[cfg(test)]
@@ -50,5 +67,16 @@ mod tests {
         assert!(!FrpError::Json(json).is_fatal());
         assert!(FrpError::Closed.is_fatal());
         assert!(FrpError::Handshake("refused".into()).is_fatal());
+    }
+
+    #[cfg(feature = "transport")]
+    #[test]
+    fn a_full_write_buffer_is_told_apart() {
+        let full = super::websocket(tungstenite::Error::WriteBufferFull(
+            tungstenite::Message::text("x"),
+        ));
+        assert!(matches!(&full, FrpError::WebSocket(e) if e.is_write_buffer_full()));
+        let closed = super::websocket(tungstenite::Error::ConnectionClosed);
+        assert!(matches!(&closed, FrpError::WebSocket(e) if !e.is_write_buffer_full()));
     }
 }
