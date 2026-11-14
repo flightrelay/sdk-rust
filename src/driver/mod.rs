@@ -12,14 +12,14 @@
 //!    (a shot counter, a retry clock).
 //! 2. [`FrpDriver::connect`] opens one [`FrpSession`]: transport,
 //!    handshake, identity. The host then steps the session until it fails or
-//!    the host stops, and calls [`FrpSession::close`] to release the
-//!    device.
+//!    the host stops, and always calls [`FrpSession::close`] to release the
+//!    device, after a failed step too.
 //!
 //! Time is an input. A session implements [`FrpSession::step`], which
 //! takes `now`, handles what has arrived and what is due, and returns
-//! without blocking; every timer compares against that `now`. A host runs it
-//! with the provided [`FrpSession::poll`], or calls `step` itself, which
-//! is also how a test drives a session in virtual time
+//! without blocking; every timer compares against that `now`. A host calls
+//! `step` in a loop, waiting up to [`IDLE`] after a step that found nothing
+//! to do, and a test drives a session the same way in virtual time
 //! (`flightrelay::testing::TestHost`, feature `testing`). A connect reads the
 //! time with [`ConnectCtx::now`] and lets it pass with [`ConnectCtx::wait`],
 //! so its deadlines are the host's too.
@@ -162,7 +162,7 @@ pub use util::{Backoff, Live, STABLE_SESSION, ShotIds, Stop, connect_tcp};
 use crate::types::roles;
 use crate::{Club, FrpMessage, GolferTurn, Handedness, Mode, RawFrame, Source};
 
-/// How long [`FrpSession::poll`] waits before the next step after one
+/// How long a host waits before the next [`FrpSession::step`] after one
 /// that returned [`Activity::Idle`]. Also the longest slice of
 /// [`ConnectCtx::wait`].
 pub const IDLE: Duration = Duration::from_millis(5);
@@ -289,29 +289,6 @@ pub trait FrpSession: Sized {
     /// Returns what ended the session.
     fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Self::Error>;
 
-    /// Step for about `timeout` of real time, waiting [`IDLE`] after a step
-    /// that returned [`Activity::Idle`]. Always steps at least once, so a zero
-    /// timeout still sees a dead device. It does not return early: a host
-    /// that wants to act between steps calls [`step`](Self::step) itself.
-    /// Drivers implement `step` and leave this alone.
-    ///
-    /// # Errors
-    ///
-    /// Returns what ended the session.
-    fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), Self::Error> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let activity = self.step(Instant::now(), out)?;
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Ok(());
-            }
-            if activity == Activity::Idle {
-                std::thread::sleep(left.min(IDLE));
-            }
-        }
-    }
-
     /// The tracking hints of a new `golfer.turn`: the complete set, which
     /// replaces every earlier one. A field that is `None` is no hint for
     /// that field. Apply each field the device supports and ignore the
@@ -357,8 +334,13 @@ pub trait FrpSession: Sized {
     fn identity(&self) -> &DeviceIdentity;
 
     /// Release the device (disarm, disconnect), bounded by
-    /// [`STOP_WAIT`](FrpDriver::STOP_WAIT). Dropping a session without
-    /// `close` must still free the transport, only less politely.
+    /// [`STOP_WAIT`](FrpDriver::STOP_WAIT). The host always calls `close`
+    /// when a session ends: on a stop, and after a [`step`](Self::step),
+    /// [`hints`](Self::hints), [`bus`](Self::bus) or
+    /// [`action`](Self::action) returned `Err`. So a session releases the
+    /// device here and nowhere else. Dropping a session without `close`
+    /// (a panic, a host that broke the rule) must still free the transport,
+    /// only less politely.
     ///
     /// # Errors
     ///

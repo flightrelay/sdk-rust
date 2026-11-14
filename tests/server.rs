@@ -792,6 +792,8 @@ fn a_lost_session_finishes_its_open_shot_and_raises_not_armed() {
     // The driver's own alert about the loss, from `retry_delay`.
     let rest = peer.until(|v| kind(v) == "bus.alert");
     assert_eq!(rest.last().unwrap()["message"], "failed: cable pulled");
+    // `retry_delay` runs after the close: the failed session was closed.
+    assert_eq!(h.control.inner.closes.load(Ordering::SeqCst), 1);
 }
 
 #[test]

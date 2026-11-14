@@ -191,9 +191,9 @@ impl TestHost {
         f(self.clock.now, &mut Events::new(&mut sink, &self.flags))
     }
 
-    /// Step through `d` of time as [`poll`](super::FrpSession::poll)
-    /// does: after [`Activity::Active`] step again at the same instant, after
-    /// [`Activity::Idle`] move the clock by [`IDLE`]. A session whose clock is
+    /// Step through `d` of time as a host does: after [`Activity::Active`]
+    /// step again at the same instant, after [`Activity::Idle`] move the
+    /// clock by [`IDLE`]. A session whose clock is
     /// its input's (a fast replay that returns `Active` on every step) is
     /// stepped with [`with`](Self::with) instead.
     ///

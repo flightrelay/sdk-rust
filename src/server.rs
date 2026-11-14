@@ -1,6 +1,6 @@
 //! [`FrpServer`]: run a [`FrpDriver`] as a launch monitor actor on the bus.
 //!
-//! Requires the `server` feature. The server connects the driver, polls its
+//! Requires the `server` feature. The server connects the driver, steps its
 //! session and publishes what the driver emits as one launch monitor actor,
 //! with the actor id the host gives it ([`ServerConfig::actor_id`]). It
 //! listens for peers (listen mode, a hub of its own) or dials one (bridge
@@ -11,7 +11,7 @@
 //! # Threads
 //!
 //! The caller's thread is the device thread: [`connect`](FrpDriver::connect),
-//! [`poll`](FrpSession::poll), [`hints`](FrpSession::hints),
+//! [`step`](FrpSession::step), [`hints`](FrpSession::hints),
 //! [`close`](FrpSession::close) and the retry sleeps all run on it, so a
 //! session can be `!Send`. A network thread owns every connection, as a
 //! [`Hub`], so peers are served while a connect blocks. An acceptor thread
@@ -53,8 +53,9 @@
 //!   next connect through
 //!   [`ConnectCtx::hints`](crate::driver::ConnectCtx::hints). The hints of
 //!   the last complete turn stay when the session actor goes away.
-//! - On a stop, the session is closed and the actor's removal
-//!   (`bus.actor` with `"removed": true`) goes out.
+//! - A session is always closed when it ends: after an error, and on a
+//!   stop. On a stop the actor's removal (`bus.actor` with
+//!   `"removed": true`) then goes out.
 //!
 //! The launch monitor role owns no command, so the server answers none.
 //!
@@ -101,8 +102,9 @@ use std::sync::mpsc::{
 use std::time::{Duration, Instant};
 
 use crate::driver::{
-    Backoff, ConnectCtx, ConnectHost, DeviceEvent, DeviceIdentity, DeviceStatus, DriverInfo,
-    Events, FrpDriver, FrpSession, HostFlags, Level, SessionEnd, StatusChange, Stop, TurnHints,
+    Activity, Backoff, ConnectCtx, ConnectHost, DeviceEvent, DeviceIdentity, DeviceStatus,
+    DriverInfo, Events, FrpDriver, FrpSession, HostFlags, IDLE, Level, SessionEnd, StatusChange,
+    Stop, TurnHints,
 };
 use crate::endpoint::DEFAULT_WRITE_BUFFER_LIMIT;
 use crate::{
@@ -122,7 +124,8 @@ const FULL_QUEUE_PATIENCE: Duration = Duration::from_secs(1);
 /// over the connections.
 const NET_TICK: Duration = Duration::from_millis(10);
 
-/// The device thread's poll timeout.
+/// How long the device thread steps the session between looks at its
+/// inputs.
 const POLL: Duration = Duration::from_millis(20);
 
 /// How often the device thread looks at its inputs while it sleeps.
@@ -448,9 +451,8 @@ impl<D: FrpDriver> FrpServer<D> {
                             failed = Some(e);
                         }
                         if failed.is_none() {
-                            failed = session
-                                .poll(POLL, &mut Events::new(&mut sink, &flags))
-                                .err();
+                            failed =
+                                poll(&mut session, POLL, &mut Events::new(&mut sink, &flags)).err();
                         }
                         if failed.is_some() {
                             break failed;
@@ -583,6 +585,27 @@ impl ConnectHost for Host<'_, '_> {
 
     fn hints(&self) -> &TurnHints {
         self.hints
+    }
+}
+
+/// Step `session` for about `timeout` of real time, waiting [`IDLE`] after a
+/// step that returned [`Activity::Idle`]. Always steps at least once, so a
+/// zero timeout still sees a dead device.
+fn poll<S: FrpSession>(
+    session: &mut S,
+    timeout: Duration,
+    out: &mut Events<'_>,
+) -> Result<(), S::Error> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let activity = session.step(Instant::now(), out)?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(());
+        }
+        if activity == Activity::Idle {
+            std::thread::sleep(left.min(IDLE));
+        }
     }
 }
 
