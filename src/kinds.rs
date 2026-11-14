@@ -339,6 +339,14 @@ pub struct ShotLaunch {
     pub launch: Launch,
 }
 
+impl ShotLaunch {
+    /// The launch of shot `key`.
+    #[must_use]
+    pub fn new(key: ShotKey, launch: Launch) -> Self {
+        Self { key, launch }
+    }
+}
+
 /// `shot.club` (occurrence, launch monitor): the measured club delivery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShotClub {
@@ -346,6 +354,14 @@ pub struct ShotClub {
     pub key: ShotKey,
     /// The measured club values.
     pub club: ClubData,
+}
+
+impl ShotClub {
+    /// The club delivery of shot `key`.
+    #[must_use]
+    pub fn new(key: ShotKey, club: ClubData) -> Self {
+        Self { key, club }
+    }
 }
 
 /// `shot.impact` (occurrence, launch monitor): where on the face the ball
@@ -356,6 +372,14 @@ pub struct ShotImpact {
     pub key: ShotKey,
     /// The impact location.
     pub impact: FaceImpact,
+}
+
+impl ShotImpact {
+    /// The face impact of shot `key`.
+    #[must_use]
+    pub fn new(key: ShotKey, impact: FaceImpact) -> Self {
+        Self { key, impact }
+    }
 }
 
 /// `shot.flight` (occurrence, launch monitor or any flight model): results
@@ -369,12 +393,28 @@ pub struct ShotFlight {
     pub flight: FlightResult,
 }
 
+impl ShotFlight {
+    /// A flight result of shot `key`.
+    #[must_use]
+    pub fn new(key: ShotKey, flight: FlightResult) -> Self {
+        Self { key, flight }
+    }
+}
+
 /// `shot.finished` (occurrence, launch monitor): the launch monitor has sent
 /// everything it will for the shot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShotFinished {
     /// The shot.
     pub key: ShotKey,
+}
+
+impl ShotFinished {
+    /// The end of shot `key`.
+    #[must_use]
+    pub fn new(key: ShotKey) -> Self {
+        Self { key }
+    }
 }
 
 // --------------------------------------------------------------- golfer
@@ -572,6 +612,28 @@ pub struct PracticeBlock {
     pub started_at: u64,
 }
 
+impl PracticeBlock {
+    /// A block with every required field.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        golfer: Option<GolferId>,
+        club: Option<Club>,
+        number: u32,
+        session: u32,
+        started_at: u64,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            golfer,
+            club,
+            number,
+            session,
+            started_at,
+        }
+    }
+}
+
 /// `practice.new_block` (command, to `practice`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PracticeNewBlock {
@@ -590,6 +652,18 @@ pub struct PracticeNewBlock {
     /// Close every open block and count the session up.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub new_session: bool,
+}
+
+impl PracticeNewBlock {
+    /// A new block for the golfer in `golfer.turn`, in the current session.
+    #[must_use]
+    pub fn new(r#ref: impl Into<String>) -> Self {
+        Self {
+            r#ref: r#ref.into(),
+            golfer: None,
+            new_session: false,
+        }
+    }
 }
 
 // ----------------------------------------------------------------- game
@@ -624,6 +698,30 @@ pub struct GameRound {
     /// The hole being played; `None` (`null`) between holes.
     #[serde(default)]
     pub hole: Option<Hole>,
+}
+
+impl GameRound {
+    /// A round with every required field and no end reason, course or
+    /// scoring.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        status: RoundStatus,
+        players: Vec<RoundPlayer>,
+        up: Option<GolferId>,
+        hole: Option<Hole>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            status,
+            end_reason: None,
+            course: None,
+            scoring: None,
+            players,
+            up,
+            hole,
+        }
+    }
 }
 
 /// [`GameRound::status`].
@@ -683,6 +781,20 @@ pub struct RoundPlayer {
     pub local: bool,
 }
 
+impl RoundPlayer {
+    /// A player with no team or handicap.
+    #[must_use]
+    pub fn new(golfer: GolferId, name: impl Into<String>, local: bool) -> Self {
+        Self {
+            golfer,
+            name: name.into(),
+            team: None,
+            handicap: None,
+            local,
+        }
+    }
+}
+
 /// [`GameRound::hole`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hole {
@@ -702,6 +814,20 @@ pub struct Hole {
     pub pin: Option<Position>,
 }
 
+impl Hole {
+    /// Hole `number` with nothing else known.
+    #[must_use]
+    pub fn new(number: u32) -> Self {
+        Self {
+            number,
+            par: None,
+            stroke_index: None,
+            length: None,
+            pin: None,
+        }
+    }
+}
+
 /// `game.scores` (state, `game`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GameScores {
@@ -709,6 +835,17 @@ pub struct GameScores {
     pub round: String,
     /// Per golfer.
     pub players: Vec<PlayerScore>,
+}
+
+impl GameScores {
+    /// The scores of round `round`.
+    #[must_use]
+    pub fn new(round: impl Into<String>, players: Vec<PlayerScore>) -> Self {
+        Self {
+            round: round.into(),
+            players,
+        }
+    }
 }
 
 /// One entry of [`GameScores::players`].
@@ -734,6 +871,22 @@ pub struct PlayerScore {
     /// Per hole.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holes: Vec<HoleScore>,
+}
+
+impl PlayerScore {
+    /// The score of `golfer` with no totals or holes yet.
+    #[must_use]
+    pub fn new(golfer: GolferId) -> Self {
+        Self {
+            golfer,
+            strokes: None,
+            to_par: None,
+            net_to_par: None,
+            points: None,
+            rank: None,
+            holes: Vec::new(),
+        }
+    }
 }
 
 /// One entry of [`PlayerScore::holes`].
@@ -769,6 +922,24 @@ pub struct HoleScore {
     /// Whether the score won't change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r#final: Option<bool>,
+}
+
+impl HoleScore {
+    /// The score on hole `number` with nothing recorded yet.
+    #[must_use]
+    pub fn new(number: u32) -> Self {
+        Self {
+            number,
+            strokes: None,
+            putts: None,
+            to_par: None,
+            net_to_par: None,
+            points: None,
+            result: None,
+            holed_out: None,
+            r#final: None,
+        }
+    }
 }
 
 /// [`HoleScore::result`].
@@ -819,6 +990,25 @@ pub struct GameBall {
     /// e.g. "Take a drop?".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,
+}
+
+impl GameBall {
+    /// The ball of `golfer` on `hole` before stroke `stroke_number`, with
+    /// nothing else known.
+    #[must_use]
+    pub fn new(golfer: GolferId, hole: u32, stroke_number: u32) -> Self {
+        Self {
+            golfer,
+            hole,
+            stroke_number,
+            allowed_commands: None,
+            lie: None,
+            position: None,
+            aim: None,
+            distance_to_hole: None,
+            decision: None,
+        }
+    }
 }
 
 /// Where a ball lies, on [`GameBall`] and [`GameStroke`].
@@ -886,6 +1076,38 @@ pub struct GameStroke {
     pub end_distance_to_hole: Option<Distance>,
 }
 
+impl GameStroke {
+    /// A stroke with every required field and no shot, flight, penalty or
+    /// positions.
+    #[must_use]
+    pub fn new(
+        stroke_id: impl Into<String>,
+        golfer: GolferId,
+        hole: u32,
+        stroke_number: u32,
+        outcome: StrokeOutcome,
+    ) -> Self {
+        Self {
+            stroke_id: stroke_id.into(),
+            shot_id: None,
+            replaces: None,
+            golfer,
+            hole,
+            stroke_number,
+            flown: None,
+            flight: None,
+            outcome,
+            putt: None,
+            penalty_strokes: 0,
+            lie: None,
+            start_position: None,
+            end_position: None,
+            start_distance_to_hole: None,
+            end_distance_to_hole: None,
+        }
+    }
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)] // a `skip_serializing_if` function takes a reference
 fn is_zero(v: &u32) -> bool {
     *v == 0
@@ -932,6 +1154,19 @@ pub struct GameAim {
     /// With [`AimAction::Set`]: where to aim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<Position>,
+}
+
+impl GameAim {
+    /// An aim command with `ref` and `action`, and no degrees or target.
+    #[must_use]
+    pub fn new(r#ref: impl Into<String>, action: AimAction) -> Self {
+        Self {
+            r#ref: r#ref.into(),
+            action,
+            degrees: None,
+            target: None,
+        }
+    }
 }
 
 /// [`GameAim::action`].
