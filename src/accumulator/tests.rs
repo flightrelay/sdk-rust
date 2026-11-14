@@ -168,6 +168,28 @@ fn the_shown_flight_prefers_tracked() {
 }
 
 #[test]
+fn the_own_flight_is_the_launch_monitors_first() {
+    let mut agg = ShotAggregator::new();
+    agg.feed(&trigger());
+    agg.feed(&shot_flight(
+        PHYSICS,
+        flight(Basis::Tracked, "Fairway Physics 1.3", 181.2),
+    ));
+    let own = flight(Basis::Modeled, "Eagle One model", 179.0);
+    agg.feed(&shot_flight(LM, own.clone()));
+    agg.feed(&shot_flight(
+        LM,
+        flight(Basis::Modeled, "Eagle One model", 175.0),
+    ));
+    assert_eq!(finish(&mut agg).own_flight(), Some(&own));
+
+    let mut agg = ShotAggregator::new();
+    agg.feed(&trigger());
+    agg.feed(&shot_flight(PHYSICS, own));
+    assert_eq!(finish(&mut agg).own_flight(), None, "never another actor's");
+}
+
+#[test]
 fn another_actors_message_after_finished_is_an_update() {
     let mut agg = ShotAggregator::new();
     agg.feed(&trigger());

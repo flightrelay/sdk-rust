@@ -95,6 +95,16 @@ impl CompletedShot {
             .map(|f| &f.flight)
     }
 
+    /// The launch monitor's own flight result: the first one from
+    /// [`from`](Self::from), never another actor's.
+    #[must_use]
+    pub fn own_flight(&self) -> Option<&FlightResult> {
+        self.flights
+            .iter()
+            .find(|f| f.from == self.from)
+            .map(|f| &f.flight)
+    }
+
     /// Launch values for a receiver that flies the ball itself: each
     /// [`launch`](Self::launch) value, with a missing one filled from the
     /// `assumed` launch of [`flight`](Self::flight) when its basis is

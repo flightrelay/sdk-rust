@@ -37,7 +37,7 @@
 //! With the `server` feature, `FrpServer::new(driver, config)` runs it as a
 //! launch monitor actor on the bus.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -257,11 +257,7 @@ impl MockSession {
         );
         out.blockers([blockers::NOT_ARMED]);
         self.mode_telemetry(out, "idle");
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|d| u64::try_from(d.as_millis()).ok());
-        match now {
+        match crate::utc_ms() {
             Some(ms) => out.shot_trigger_at(key.clone(), ms),
             None => out.shot_trigger(key.clone()),
         }

@@ -99,6 +99,47 @@ impl Launch {
         }
     }
 
+    /// The ball's back and side spin, for a receiver that reads the spin
+    /// as components: the ones the launch has, else its total split by its
+    /// spin axis. A total spin with no axis is all backspin; no sidespin is
+    /// made up, so a receiver that needs one fills its own default.
+    #[must_use]
+    pub fn spin_components(&self) -> (Option<i32>, Option<i32>) {
+        if self.backspin_rpm.is_some() || self.sidespin_rpm.is_some() {
+            return (self.backspin_rpm, self.sidespin_rpm);
+        }
+        let Some(total) = self.total_spin_rpm else {
+            return (None, None);
+        };
+        let Some(axis) = self.spin_axis.filter(|a| a.is_finite()) else {
+            return (Some(total), None);
+        };
+        let mut spin = Launch {
+            total_spin_rpm: Some(total),
+            spin_axis: Some(axis),
+            ..Launch::default()
+        };
+        spin.complete_spin();
+        (spin.backspin_rpm, spin.sidespin_rpm)
+    }
+
+    /// The backspin for a receiver with a backspin field of its own: the
+    /// launch's, or, for a total spin with no axis and no components, the
+    /// total, all of it backspin. No sidespin or axis is made up for such a
+    /// total; a receiver that must send a number for them sends 0.
+    #[must_use]
+    pub fn output_backspin(&self) -> Option<i32> {
+        match (
+            self.backspin_rpm,
+            self.sidespin_rpm,
+            self.total_spin_rpm,
+            self.spin_axis,
+        ) {
+            (None, None, Some(total), None) => Some(total),
+            (back, ..) => back,
+        }
+    }
+
     /// Fill each value this launch lacks from the `assumed` launch of
     /// `flight`, when its [`basis`](FlightResult::basis) is
     /// [`Modeled`](Basis::Modeled). A value this launch has is kept, and a
@@ -915,6 +956,54 @@ pub mod blockers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn components(back: Option<i32>, side: Option<i32>) -> Launch {
+        Launch {
+            backspin_rpm: back,
+            sidespin_rpm: side,
+            ..Launch::default()
+        }
+    }
+
+    fn total(total: Option<i32>, axis: Option<f64>) -> Launch {
+        Launch {
+            total_spin_rpm: total,
+            spin_axis: axis,
+            ..Launch::default()
+        }
+    }
+
+    /// The launch's components as they are; else the total split by its
+    /// axis; a total with no axis is all backspin with no sidespin.
+    #[test]
+    fn spin_components_read_either_pair() {
+        let ball = components(Some(3200), Some(-450));
+        assert_eq!(ball.spin_components(), (Some(3200), Some(-450)));
+        let (back, side) = total(Some(3231), Some(-8.0)).spin_components();
+        assert_eq!((back, side), (Some(3200), Some(-450)));
+        assert_eq!(
+            total(Some(6897), None).spin_components(),
+            (Some(6897), None)
+        );
+        assert_eq!(total(None, Some(3.0)).spin_components(), (None, None));
+        assert_eq!(Launch::default().spin_components(), (None, None));
+    }
+
+    /// A total with no axis and no components is all backspin; any other
+    /// launch keeps its own backspin, none made up.
+    #[test]
+    fn output_backspin_takes_a_lone_total() {
+        assert_eq!(total(Some(6897), None).output_backspin(), Some(6897));
+        assert_eq!(total(Some(3231), Some(-8.0)).output_backspin(), None);
+        assert_eq!(total(None, None).output_backspin(), None);
+        assert_eq!(
+            components(Some(3200), Some(-450)).output_backspin(),
+            Some(3200)
+        );
+        let mut both = components(None, Some(-450));
+        both.total_spin_rpm = Some(3231);
+        assert_eq!(both.output_backspin(), None, "a partial pair is kept");
+    }
 
     #[test]
     fn complete_spin_from_components() {

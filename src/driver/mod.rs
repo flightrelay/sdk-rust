@@ -153,14 +153,18 @@ mod util;
 use std::error::Error;
 use std::fmt;
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::time::{Duration, Instant};
 
 pub use crate::config::{ConfigError, DriverConfig};
 pub use events::{DeviceEvent, DeviceStatus, Events, HostFlags, Level, StatusChange};
 pub use util::{Backoff, Live, STABLE_SESSION, ShotIds, Stop};
 
-use crate::types::roles;
-use crate::{Club, FrpMessage, GolferTurn, Handedness, Mode, RawFrame, Source};
+use crate::types::{blockers, roles};
+use crate::{
+    BusActor, Club, DeviceInfo, FrpMessage, GolferTurn, Handedness, Mode, RawFrame, Source,
+};
 
 /// How long a host waits before the next [`FrpSession::step`] after one
 /// that returned [`Activity::Idle`]. Also the longest slice of
@@ -179,6 +183,9 @@ pub enum Activity {
     /// the next step.
     Idle,
 }
+
+/// How often [`ConnectCtx::run_blocking`] ticks while its helper works.
+const HELPER_TICK: Duration = Duration::from_millis(50);
 
 /// The default [`FrpDriver::STOP_WAIT`].
 pub const DEFAULT_STOP_WAIT: Duration = Duration::from_secs(3);
@@ -484,6 +491,89 @@ impl<'a> ConnectCtx<'a> {
             Err(e) => Ok(Err(e)),
         }
     }
+
+    /// Run blocking work (a BLE scan and connect, a discovery) on a helper
+    /// thread, ticking about every 50 ms while it runs, so the host stays
+    /// live and sees a stop. `work` gets the stop flag, to give up early,
+    /// and a log function whose lines reach [`out`](Self::out) while this
+    /// waits.
+    ///
+    /// After a stop this waits up to `stop_wait` (a driver passes its
+    /// [`STOP_WAIT`](FrpDriver::STOP_WAIT)) for `work` to return. A result
+    /// that comes after a stop, then or later, is handed to `release` (on
+    /// the helper thread when it comes later), so a device found after
+    /// all is let go.
+    ///
+    /// The outer error is a stop; the inner one is the helper thread
+    /// failing to start or panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Stopped`] after a stop.
+    pub fn run_blocking<T: Send + 'static>(
+        &mut self,
+        stop_wait: Duration,
+        work: impl FnOnce(&AtomicBool, &mut dyn FnMut(Level, String)) -> T + Send + 'static,
+        release: fn(T),
+    ) -> Result<std::io::Result<T>, Stopped> {
+        enum Msg<T> {
+            Log(Level, String),
+            Done(T),
+        }
+        self.tick()?;
+        // A rendezvous channel: a result is either taken here or, once this
+        // side has gone, refused back to the helper, which releases it.
+        let (tx, rx) = sync_channel::<Msg<T>>(0);
+        let stop = self.stop.clone();
+        let spawned = std::thread::Builder::new()
+            .name("frp-connect-helper".into())
+            .spawn(move || {
+                let logs = tx.clone();
+                let mut log = |level, line| {
+                    let _ = logs.send(Msg::Log(level, line));
+                };
+                let result = work(stop.flag(), &mut log);
+                if let Err(std::sync::mpsc::SendError(Msg::Done(late))) = tx.send(Msg::Done(result))
+                {
+                    release(late);
+                }
+            });
+        if let Err(e) = spawned {
+            return Ok(Err(e));
+        }
+        let mut ticked = Instant::now();
+        loop {
+            match rx.recv_timeout(HELPER_TICK) {
+                Ok(Msg::Log(level, line)) => self.out.log(level, line),
+                Ok(Msg::Done(result)) if self.stop.is_stopped() => {
+                    release(result);
+                    return Err(Stopped);
+                }
+                Ok(Msg::Done(result)) => return Ok(Ok(result)),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Ok(Err(std::io::Error::other("the helper thread panicked")));
+                }
+            }
+            if ticked.elapsed() >= HELPER_TICK {
+                ticked = Instant::now();
+                if self.tick().is_err() {
+                    break;
+                }
+            }
+        }
+        let give_up = Instant::now() + stop_wait;
+        loop {
+            match rx.recv_timeout(give_up.saturating_duration_since(Instant::now())) {
+                Ok(Msg::Log(level, line)) => self.out.log(level, line),
+                Ok(Msg::Done(result)) => {
+                    release(result);
+                    return Err(Stopped);
+                }
+                Err(_) => return Err(Stopped),
+            }
+        }
+    }
 }
 
 impl fmt::Debug for ConnectCtx<'_> {
@@ -645,6 +735,71 @@ impl DriverInfo {
     pub fn with_raw(mut self, raw: RawProfile) -> Self {
         self.raw = Some(raw);
         self
+    }
+
+    /// The actor's default name: with an identified device, its
+    /// manufacturer (the identity's, else this driver's) and model joined
+    /// by a space, else [`name`](Self::name).
+    #[must_use]
+    pub fn actor_name(&self, identity: Option<&DeviceIdentity>) -> String {
+        let Some(identity) = identity else {
+            return self.name.to_owned();
+        };
+        let made: Vec<&str> = [
+            identity.manufacturer.as_deref().or(self.manufacturer),
+            identity.model.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if made.is_empty() {
+            self.name.to_owned()
+        } else {
+            made.join(" ")
+        }
+    }
+
+    /// The driver's `bus.actor`, as a host publishes it: named `name`,
+    /// republished every `heartbeat`, with this driver's
+    /// [`roles`](Self::roles) and [`namespaces`](Self::namespaces); a
+    /// `device` block with the manufacturer (the identity's, else this
+    /// driver's), the identity's model and firmware, this driver's
+    /// [`source`](Self::source), and the status's battery and attitude;
+    /// and the status's blockers and telemetry, exactly. `not_armed` is a
+    /// launch monitor's blocker, so an actor without that role leaves it
+    /// out. The device's own id and label never go on it.
+    #[must_use]
+    pub fn bus_actor(
+        &self,
+        name: impl Into<String>,
+        heartbeat: Duration,
+        identity: Option<&DeviceIdentity>,
+        status: &DeviceStatus,
+    ) -> BusActor {
+        let mut actor = BusActor::new(name, heartbeat.as_secs_f64());
+        for role in self.roles {
+            actor = actor.with_role(*role);
+        }
+        for namespace in self.namespaces {
+            actor = actor.with_namespace(*namespace);
+        }
+        let mut actor = actor.with_device(DeviceInfo {
+            manufacturer: identity
+                .and_then(|i| i.manufacturer.clone())
+                .or_else(|| self.manufacturer.map(str::to_owned)),
+            model: identity.and_then(|i| i.model.clone()),
+            firmware: identity.and_then(|i| i.firmware.clone()),
+            source: Some(self.source),
+            battery_pct: status.battery_pct.map(|p| p.min(100)),
+            tilt: status.tilt,
+            roll: status.roll,
+        });
+        actor.blockers.clone_from(&status.blockers);
+        if !self.roles.contains(&roles::LAUNCH_MONITOR) {
+            actor.blockers.retain(|b| b != blockers::NOT_ARMED);
+        }
+        actor.telemetry = (!status.telemetry.is_empty()).then(|| status.telemetry.clone());
+        actor
     }
 }
 
@@ -839,6 +994,92 @@ mod tests {
         assert_eq!(info.fixed_mode, Some(Mode::Putting));
         assert_eq!(info.manufacturer, Some("Birdie Labs"));
         assert!(info.raw.is_none());
+    }
+
+    #[test]
+    fn the_bus_actor_carries_the_facts_identity_and_status() {
+        let info = DriverInfo::new("beacon", "Beacon", Source::Measured)
+            .with_manufacturer("Birdie Labs")
+            .with_namespaces(&["range"]);
+        let status = DeviceStatus::not_armed()
+            .with_battery(80)
+            .with_telemetry("mode", "full");
+        let actor = info.bus_actor("Bay 3", Duration::from_secs(2), None, &status);
+        assert_eq!(actor.name, "Bay 3");
+        assert!(actor.has_role(roles::LAUNCH_MONITOR));
+        assert_eq!(actor.namespaces, ["range"]);
+        assert_eq!(actor.blockers, ["not_armed"]);
+        assert_eq!(actor.telemetry.as_ref().unwrap()["mode"], "full");
+        let device = actor.device.unwrap();
+        assert_eq!(device.manufacturer.as_deref(), Some("Birdie Labs"));
+        assert_eq!(device.source, Some(Source::Measured));
+        assert_eq!(device.battery_pct, Some(80));
+        assert_eq!(info.actor_name(None), "Beacon");
+
+        let identity = DeviceIdentity::new("SERIAL-1")
+            .with_model("Eagle One")
+            .with_firmware("2.4.1")
+            .with_label("Eagle One (SERIAL-1)");
+        assert_eq!(info.actor_name(Some(&identity)), "Birdie Labs Eagle One");
+        let actor = info.bus_actor("x", Duration::from_secs(2), Some(&identity), &status);
+        let device = actor.device.as_ref().unwrap();
+        assert_eq!(device.model.as_deref(), Some("Eagle One"));
+        assert_eq!(device.firmware.as_deref(), Some("2.4.1"));
+        let json = serde_json::to_string(&actor).unwrap();
+        assert!(!json.contains("SERIAL-1"), "{json}");
+        let theirs = identity.clone().with_manufacturer("Eagle Works");
+        assert_eq!(info.actor_name(Some(&theirs)), "Eagle Works Eagle One");
+    }
+
+    #[test]
+    fn not_armed_is_a_launch_monitors_blocker_only() {
+        let game = DriverInfo::new("game", "Game", Source::Virtual).with_roles(&[roles::GAME]);
+        let status = DeviceStatus::not_armed().with_blockers(["not_armed", "paused"]);
+        let actor = game.bus_actor("Game", Duration::from_secs(2), None, &status);
+        assert_eq!(actor.blockers, ["paused"]);
+    }
+
+    #[test]
+    fn blocking_work_reports_its_result_and_logs() {
+        let mut host = testing::TestHost::new();
+        let got = host.connect_with(|ctx| {
+            ctx.run_blocking(
+                Duration::from_secs(1),
+                |_, log| {
+                    log(Level::Info, "scanning".to_owned());
+                    7
+                },
+                |_| {},
+            )
+        });
+        assert_eq!(got.map(Result::ok), Ok(Some(7)));
+        assert!(matches!(
+            &host.take()[..],
+            [DeviceEvent::Log(Level::Info, line)] if line == "scanning"
+        ));
+    }
+
+    #[test]
+    fn blocking_work_found_after_a_stop_is_released() {
+        static RELEASED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let mut host = testing::TestHost::new();
+        let stop = host.stop().clone();
+        let got = host.connect_with(|ctx| {
+            ctx.run_blocking(
+                Duration::from_secs(60),
+                move |flag, _| {
+                    // The device turns up just as the host stops.
+                    stop.stop();
+                    assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+                    "device"
+                },
+                |_| {
+                    RELEASED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+        });
+        assert_eq!(got.map(Result::ok), Err(Stopped));
+        assert_eq!(RELEASED.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]

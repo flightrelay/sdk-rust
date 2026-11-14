@@ -230,6 +230,17 @@ pub const MISSED_HEARTBEATS: u32 = 3;
 /// The FRP spec version this crate implements, sent as `frp` in `bus.actor`.
 pub const SPEC_VERSION: &str = "0.3.0";
 
+/// The current UTC time in milliseconds since the Unix epoch, as
+/// [`RawFrame::timestamp`] and [`ShotTrigger::timestamp`] carry it; `None`
+/// for a system clock set before 1970.
+#[must_use]
+pub fn utc_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+}
+
 /// A new actor id: 16 random lowercase hexadecimal digits.
 ///
 /// Generate one once per actor and keep it across restarts; the host that

@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::types::blockers;
 use crate::{
@@ -461,11 +460,36 @@ impl<'a> Events<'a> {
             return;
         }
         let frame = RawFrame {
-            timestamp: now_ms(),
+            timestamp: crate::utc_ms(),
             label: Some(label.into()),
             ..RawFrame::new(dir, 0, data.to_vec())
         };
         self.frp(FrpBody::ShotRaw(frame));
+    }
+
+    /// One protocol message as it crossed the transport at `at_ms` (UTC
+    /// milliseconds, [`utc_ms`](crate::utc_ms) at capture): an
+    /// [`audit`](Self::audit) line when `private`, else a `shot.raw` with
+    /// `seq` left at 0 for the host to number, while raw frames are on. A
+    /// wire driver calls this once per captured message; a private message
+    /// never leaves the machine.
+    pub fn wire(
+        &mut self,
+        dir: RawDir,
+        label: impl Into<String>,
+        data: Vec<u8>,
+        at_ms: Option<u64>,
+        private: bool,
+    ) {
+        if private {
+            self.audit(dir, &label.into(), &data);
+        } else if self.wants_raw() {
+            self.frp(FrpBody::ShotRaw(RawFrame {
+                timestamp: at_ms,
+                label: Some(label.into()),
+                ..RawFrame::new(dir, 0, data)
+            }));
+        }
     }
 
     /// A message that must not leave the machine as a `shot.raw`, such as
@@ -490,14 +514,6 @@ impl fmt::Debug for Events<'_> {
             .field("flags", &self.flags)
             .finish_non_exhaustive()
     }
-}
-
-/// The current UTC time in milliseconds since the Unix epoch.
-fn now_ms() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
 }
 
 #[cfg(test)]
@@ -679,6 +695,44 @@ mod tests {
         assert_eq!(frame.label.as_deref(), Some("tx result"));
         assert_eq!(frame.data, [0xde, 0xad]);
         assert!(frame.timestamp.is_some_and(|t| t > 1_600_000_000_000));
+    }
+
+    #[test]
+    fn a_wire_message_is_an_audit_line_when_private_and_a_raw_frame_when_wanted() {
+        let flags = HostFlags::new();
+        let send = |out: &mut Events<'_>| {
+            out.wire(RawDir::Rx, "result", vec![0xab], Some(42), false);
+            out.wire(RawDir::Tx, "identity", vec![0x01], Some(43), true);
+        };
+        // Raw frames off: only the private message, as a trace line.
+        let seen = collect(&flags, send);
+        let [DeviceEvent::Log(Level::Trace, line)] = &seen[..] else {
+            panic!("{seen:?}");
+        };
+        assert_eq!(line, "tx identity 01");
+        flags.set_wants_raw(true);
+        let seen = collect(&flags, send);
+        let [
+            DeviceEvent::Frp(FrpBody::ShotRaw(frame)),
+            DeviceEvent::Log(..),
+        ] = &seen[..]
+        else {
+            panic!("{seen:?}");
+        };
+        assert_eq!(
+            frame,
+            &RawFrame {
+                timestamp: Some(42),
+                label: Some("result".into()),
+                ..RawFrame::new(RawDir::Rx, 0, vec![0xab])
+            }
+        );
+        // A private message stays local even while trace lines are hidden.
+        flags.set_min_level(Level::Info);
+        let seen = collect(&flags, |out| {
+            out.wire(RawDir::Tx, "identity", vec![0x01], None, true);
+        });
+        assert!(seen.is_empty(), "{seen:?}");
     }
 
     #[test]

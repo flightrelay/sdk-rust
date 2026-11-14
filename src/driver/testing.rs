@@ -18,14 +18,20 @@
 //! host.run_for(Duration::from_secs(5), |now, out| session.step(now, out)).unwrap();
 //! assert!(!host.take_frp().is_empty());
 //! ```
+//!
+//! The free functions read a slice of events the way a test asks about
+//! them: the message [`bodies`] and their [`kinds`], the [`alerts`],
+//! [`launches`], [`flights`], [`clubs`], [`raw_frames`] and [`logs`], and
+//! the device's [`status`] as a host holds it (or every one in turn,
+//! [`statuses`]).
 
 use std::time::{Duration, Instant};
 
 use super::{
-    Activity, ConnectCtx, ConnectHost, DeviceEvent, Events, FrpDriver, FrpSession, HostFlags, IDLE,
-    Stop, TurnHints,
+    Activity, ConnectCtx, ConnectHost, DeviceEvent, DeviceStatus, Events, FrpDriver, FrpSession,
+    HostFlags, IDLE, Level, Stop, TurnHints,
 };
-use crate::FrpMessage;
+use crate::{BusAlert, ClubData, FlightResult, FrpBody, FrpMessage, Launch, RawFrame};
 
 /// How many [`Activity::Active`] steps in a row [`TestHost::run_for`] takes before
 /// it decides the session never idles.
@@ -246,12 +252,133 @@ impl TestHost {
     }
 }
 
+/// The message bodies, in order.
+#[must_use]
+pub fn bodies(events: &[DeviceEvent]) -> Vec<&FrpBody> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            DeviceEvent::Frp(body) => Some(body),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The kind of each message body, in order: `"shot.trigger"`,
+/// `"bus.alert"`, … ([`FrpBody::kind`]).
+#[must_use]
+pub fn kinds(events: &[DeviceEvent]) -> Vec<&str> {
+    bodies(events).into_iter().map(FrpBody::kind).collect()
+}
+
+/// The `bus.alert`s, in order.
+#[must_use]
+pub fn alerts(events: &[DeviceEvent]) -> Vec<&BusAlert> {
+    bodies(events)
+        .into_iter()
+        .filter_map(|b| match b {
+            FrpBody::BusAlert(alert) => Some(alert),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The launch of each `shot.launch`, in order.
+#[must_use]
+pub fn launches(events: &[DeviceEvent]) -> Vec<&Launch> {
+    bodies(events)
+        .into_iter()
+        .filter_map(|b| match b {
+            FrpBody::ShotLaunch(m) => Some(&m.launch),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The flight result of each `shot.flight`, in order.
+#[must_use]
+pub fn flights(events: &[DeviceEvent]) -> Vec<&FlightResult> {
+    bodies(events)
+        .into_iter()
+        .filter_map(|b| match b {
+            FrpBody::ShotFlight(m) => Some(&m.flight),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The club data of each `shot.club`, in order.
+#[must_use]
+pub fn clubs(events: &[DeviceEvent]) -> Vec<&ClubData> {
+    bodies(events)
+        .into_iter()
+        .filter_map(|b| match b {
+            FrpBody::ShotClub(m) => Some(&m.club),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `shot.raw` frames, in order.
+#[must_use]
+pub fn raw_frames(events: &[DeviceEvent]) -> Vec<&RawFrame> {
+    bodies(events)
+        .into_iter()
+        .filter_map(|b| match b {
+            FrpBody::ShotRaw(frame) => Some(frame),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The log lines, in order.
+#[must_use]
+pub fn logs(events: &[DeviceEvent]) -> Vec<(Level, &str)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            DeviceEvent::Log(level, line) => Some((*level, line.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The status a host holds after each [`DeviceEvent::Status`] and
+/// [`DeviceEvent::StatusChange`], in order, starting from
+/// [`DeviceStatus::not_armed`] as a host does for a new session. Pass every
+/// event since the connect for the values to match the host's.
+#[must_use]
+pub fn statuses(events: &[DeviceEvent]) -> Vec<DeviceStatus> {
+    let mut status = DeviceStatus::not_armed();
+    events
+        .iter()
+        .filter_map(|e| {
+            match e {
+                DeviceEvent::Status(whole) => status = whole.clone(),
+                DeviceEvent::StatusChange(change) => status.apply(change.clone()),
+                _ => return None,
+            }
+            Some(status.clone())
+        })
+        .collect()
+}
+
+/// The status a host holds after `events`: the last of [`statuses`], or
+/// [`DeviceStatus::not_armed`] when there is no status event.
+#[must_use]
+pub fn status(events: &[DeviceEvent]) -> DeviceStatus {
+    statuses(events)
+        .pop()
+        .unwrap_or_else(DeviceStatus::not_armed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::DriverConfig;
+    use crate::driver::StatusChange;
     use crate::driver::{ConfigError, ConnectCtx, DeviceIdentity, DriverInfo, NoAction, Stopped};
-    use crate::{Club, FrpBody, Source};
+    use crate::{Club, Severity, ShotKey, Source};
 
     #[test]
     fn a_wait_moves_the_clock_in_ticked_slices_and_ends_with_a_stop() {
@@ -373,5 +500,70 @@ mod tests {
         assert_eq!(session.heard[0].from, "a1");
         assert!(matches!(session.heard[0].body, FrpBody::BusActor(_)));
         assert!(matches!(&host.take()[..], [DeviceEvent::Log(_, line)] if line == "heard"));
+    }
+
+    #[test]
+    fn the_readers_pick_their_part_of_the_events() {
+        let flags = HostFlags::new();
+        flags.set_wants_raw(true);
+        let mut events = Vec::new();
+        let mut sink = |e| events.push(e);
+        let mut out = Events::new(&mut sink, &flags);
+        let key = ShotKey::new("id", 1);
+        out.shot_trigger(key.clone());
+        out.launch(key.clone(), Launch::default());
+        out.club(key.clone(), ClubData::default());
+        out.alert(Severity::Warn, "careful");
+        out.wire(crate::RawDir::Rx, "result", vec![1], None, false);
+        out.log(Level::Info, "line");
+        out.shot_finished(key);
+        assert_eq!(
+            kinds(&events),
+            [
+                "shot.trigger",
+                "shot.launch",
+                "shot.club",
+                "bus.alert",
+                "shot.raw",
+                "shot.finished"
+            ]
+        );
+        assert_eq!(launches(&events).len(), 1);
+        assert_eq!(clubs(&events).len(), 1);
+        assert!(flights(&events).is_empty());
+        assert_eq!(alerts(&events)[0].message, "careful");
+        assert_eq!(raw_frames(&events)[0].label.as_deref(), Some("result"));
+        assert_eq!(logs(&events), [(Level::Info, "line")]);
+    }
+
+    #[test]
+    fn the_status_folds_whole_statuses_and_changes_from_not_armed() {
+        assert_eq!(status(&[]), DeviceStatus::not_armed());
+        let events = [
+            DeviceEvent::StatusChange(StatusChange::Battery(Some(80))),
+            DeviceEvent::Phase("arming"),
+            DeviceEvent::StatusChange(StatusChange::Blockers(vec![])),
+            DeviceEvent::Status(DeviceStatus::new().with_telemetry("mode", "full")),
+            DeviceEvent::StatusChange(StatusChange::Battery(Some(70))),
+        ];
+        let seen: Vec<(bool, Option<u8>)> = statuses(&events)
+            .iter()
+            .map(|s| (s.blockers.is_empty(), s.battery_pct))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (false, Some(80)),
+                (true, Some(80)),
+                (true, None),
+                (true, Some(70))
+            ]
+        );
+        assert_eq!(
+            status(&events),
+            DeviceStatus::new()
+                .with_telemetry("mode", "full")
+                .with_battery(70)
+        );
     }
 }

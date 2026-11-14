@@ -23,19 +23,19 @@
 //! - On each new connection it sends the actor's `bus.actor`, then
 //!   `bus.sync`. It republishes `bus.actor` when it changes, every
 //!   [`ServerConfig::heartbeat`], and in answer to any `bus.sync`.
-//! - The `bus.actor` has the role `launch_monitor`, the name
-//!   [`ServerConfig::name`] (else the identified device's manufacturer and
-//!   model, else [`DriverInfo::name`](crate::driver::DriverInfo::name)), and
-//!   a `device` block: manufacturer, model and firmware from the session's
-//!   identity, `source` from
-//!   [`DriverInfo::source`](crate::driver::DriverInfo::source), and the
-//!   battery and attitude the driver reports. Its `blockers`, battery,
-//!   attitude and telemetry are exactly the driver's current
-//!   [`DeviceStatus`]: a value the driver takes off (`battery(None)`, a
-//!   whole status without it) is off the next `bus.actor`. Before the first
-//!   session and whenever a session ends the status is
-//!   [`DeviceStatus::not_armed`]. The device's own id and card label never
-//!   go on the bus.
+//! - The `bus.actor` is [`DriverInfo::bus_actor`]: the driver's roles
+//!   (`launch_monitor` unless it says otherwise), the name
+//!   [`ServerConfig::name`] (else [`DriverInfo::actor_name`]: the
+//!   identified device's manufacturer and model, else
+//!   [`DriverInfo::name`]), and a `device` block: manufacturer, model and
+//!   firmware from the last session's identity, `source` from
+//!   [`DriverInfo::source`], and the battery and attitude the driver
+//!   reports. Its `blockers`, battery, attitude and telemetry are exactly
+//!   the driver's current [`DeviceStatus`]: a value the driver takes off
+//!   (`battery(None)`, a whole status without it) is off the next
+//!   `bus.actor`. Before the first session and whenever a session ends the
+//!   status is [`DeviceStatus::not_armed`]. The device's own id and card
+//!   label never go on the bus.
 //! - What the driver emits goes out under the actor id: `shot.*` messages
 //!   and `bus.alert`. A `shot.raw` is numbered per actor, across sessions,
 //!   and goes out only while [`ServerConfig::raw_frames`] is on; drivers
@@ -108,9 +108,9 @@ use crate::driver::{
 };
 use crate::endpoint::DEFAULT_WRITE_BUFFER_LIMIT;
 use crate::{
-    BusActor, DEFAULT_HEARTBEAT, DEFAULT_SHOT_TIMEOUT, DeviceInfo, EndpointConfig, FrpBody,
-    FrpConnection, FrpEndpoint, FrpError, FrpMessage, Hub, HubEvent, Removal, ShotFinished,
-    ShotKey, StateKind, Transport,
+    BusActor, DEFAULT_HEARTBEAT, DEFAULT_SHOT_TIMEOUT, EndpointConfig, FrpBody, FrpConnection,
+    FrpEndpoint, FrpError, FrpMessage, Hub, HubEvent, Removal, ShotFinished, ShotKey, StateKind,
+    Transport,
 };
 
 /// Capacity of the queue from the device thread to the network thread.
@@ -719,13 +719,15 @@ struct Net {
     hub: Hub,
     max_peers: usize,
     actor_id: String,
+    /// The actor as last built from `info`, `identity` and `status`.
     actor: BusActor,
+    info: DriverInfo,
+    /// The last session's identity; it stays after the session ends.
+    identity: Option<DeviceIdentity>,
     /// The driver's current status, which the actor carries exactly.
     status: DeviceStatus,
     /// The name from the config, which wins over any other.
     name: Option<String>,
-    /// The driver's name, until a device is identified.
-    fallback_name: String,
     heartbeat: Duration,
     /// The time of the current [`handle`](Self::handle) or
     /// [`tick`](Self::tick): what every timer compares against.
@@ -740,32 +742,16 @@ struct Net {
 impl Net {
     fn new(config: &ServerConfig, info: &DriverInfo, links: Links, now: Instant) -> Self {
         let heartbeat = config.heartbeat.max(MIN_HEARTBEAT);
-        let mut actor = BusActor::new(
-            config.name.clone().unwrap_or_else(|| info.name.to_owned()),
-            heartbeat.as_secs_f64(),
-        )
-        .with_device(DeviceInfo {
-            manufacturer: info.manufacturer.map(str::to_owned),
-            source: Some(info.source),
-            ..DeviceInfo::default()
-        });
-        for role in info.roles {
-            actor = actor.with_role(*role);
-        }
-        for namespace in info.namespaces {
-            actor = actor.with_namespace(*namespace);
-        }
-        let status = DeviceStatus::not_armed();
-        actor.blockers.clone_from(&status.blockers);
-        Self {
+        let mut net = Self {
             links,
             hub: Hub::new(),
             max_peers: config.max_peers,
             actor_id: config.actor_id.clone(),
-            actor,
-            status,
+            actor: BusActor::new(info.name, heartbeat.as_secs_f64()),
+            info: info.clone(),
+            identity: None,
+            status: DeviceStatus::not_armed(),
             name: config.name.clone(),
-            fallback_name: info.name.to_owned(),
             heartbeat,
             now,
             last_beat: now,
@@ -773,7 +759,9 @@ impl Net {
             shot_timeout: config.shot_timeout,
             seq: 0,
             open: HashMap::new(),
-        }
+        };
+        net.rebuild_actor();
+        net
     }
 
     fn run(mut self) {
@@ -971,51 +959,35 @@ impl Net {
     /// Takes a driver's whole status. Returns whether the actor changed.
     fn apply_status(&mut self, status: DeviceStatus) -> bool {
         self.status = status;
-        self.sync_status()
+        self.rebuild_actor()
     }
 
     /// Applies a change to the driver's status. Returns whether the actor
     /// changed.
     fn apply_change(&mut self, change: StatusChange) -> bool {
         self.status.apply(change);
-        self.sync_status()
+        self.rebuild_actor()
     }
 
-    /// Puts the driver's status on the actor, exactly: blockers, battery,
-    /// attitude and telemetry. Returns whether the actor changed.
-    fn sync_status(&mut self) -> bool {
-        let before = self.actor.clone();
-        let status = &self.status;
-        self.actor.blockers.clone_from(&status.blockers);
-        let device = self.actor.device.get_or_insert_with(DeviceInfo::default);
-        device.battery_pct = status.battery_pct.map(|p| p.min(100));
-        device.tilt = status.tilt;
-        device.roll = status.roll;
-        self.actor.telemetry = (!status.telemetry.is_empty()).then(|| status.telemetry.clone());
-        self.actor != before
+    /// Builds the actor from the driver's facts, the identity and the
+    /// status ([`DriverInfo::bus_actor`]). Returns whether it changed.
+    fn rebuild_actor(&mut self) -> bool {
+        let name = self
+            .name
+            .clone()
+            .unwrap_or_else(|| self.info.actor_name(self.identity.as_ref()));
+        let actor = self
+            .info
+            .bus_actor(name, self.heartbeat, self.identity.as_ref(), &self.status);
+        let changed = actor != self.actor;
+        self.actor = actor;
+        changed
     }
 
     /// Takes a session's identity into the actor. Returns whether it changed.
     fn apply_identity(&mut self, identity: &DeviceIdentity) -> bool {
-        let before = self.actor.clone();
-        let device = self.actor.device.get_or_insert_with(DeviceInfo::default);
-        if identity.manufacturer.is_some() {
-            device.manufacturer.clone_from(&identity.manufacturer);
-        }
-        device.model.clone_from(&identity.model);
-        device.firmware.clone_from(&identity.firmware);
-        let made: Vec<&str> = [device.manufacturer.as_deref(), device.model.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect();
-        self.actor.name = self.name.clone().unwrap_or_else(|| {
-            if made.is_empty() {
-                self.fallback_name.clone()
-            } else {
-                made.join(" ")
-            }
-        });
-        self.actor != before
+        self.identity = Some(identity.clone());
+        self.rebuild_actor()
     }
 
     /// Finishes the session's open shots and takes what the session
