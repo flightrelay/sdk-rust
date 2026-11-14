@@ -452,11 +452,11 @@ impl<'a> Events<'a> {
     }
 
     /// One protocol message as it crossed the transport at `at_ms` (UTC
-    /// milliseconds, [`utc_ms`](crate::utc_ms) at capture): an
-    /// [`audit`](Self::audit) line when `private`, else a `shot.raw` with
-    /// `seq` left at 0 for the host to number, while raw frames are on. A
-    /// wire driver calls this once per captured message; a private message
-    /// never leaves the machine.
+    /// milliseconds, [`utc_ms`](crate::utc_ms) at capture): a `shot.raw`
+    /// with `seq` left at 0 for the host to number while raw frames are on
+    /// ([`wants_raw`](Self::wants_raw)) and the message is not `private`,
+    /// else an [`audit`](Self::audit) line. A wire driver calls this once
+    /// per captured message; a private message never leaves the machine.
     pub fn wire(
         &mut self,
         dir: RawDir,
@@ -465,9 +465,9 @@ impl<'a> Events<'a> {
         at_ms: Option<u64>,
         private: bool,
     ) {
-        if private {
+        if private || !self.wants_raw() {
             self.audit(dir, &label.into(), &data);
-        } else if self.wants_raw() {
+        } else {
             self.frp(FrpBody::ShotRaw(RawFrame {
                 timestamp: at_ms,
                 label: Some(label.into()),
@@ -664,18 +664,23 @@ mod tests {
     }
 
     #[test]
-    fn a_wire_message_is_an_audit_line_when_private_and_a_raw_frame_when_wanted() {
+    fn a_wire_message_is_a_raw_frame_when_wanted_and_public_else_an_audit_line() {
         let flags = HostFlags::new();
         let send = |out: &mut Events<'_>| {
             out.wire(RawDir::Rx, "result", vec![0xab], Some(42), false);
             out.wire(RawDir::Tx, "identity", vec![0x01], Some(43), true);
         };
-        // Raw frames off: only the private message, as a trace line.
+        // Raw frames off: both messages, as trace lines.
         let seen = collect(&flags, send);
-        let [DeviceEvent::Log(Level::Trace, line)] = &seen[..] else {
+        let [
+            DeviceEvent::Log(Level::Trace, public),
+            DeviceEvent::Log(Level::Trace, private),
+        ] = &seen[..]
+        else {
             panic!("{seen:?}");
         };
-        assert_eq!(line, "tx identity 01");
+        assert_eq!(public, "rx result ab");
+        assert_eq!(private, "tx identity 01");
         flags.set_wants_raw(true);
         let seen = collect(&flags, send);
         let [
