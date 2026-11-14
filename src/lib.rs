@@ -29,7 +29,7 @@
 //!
 //! # Features
 //!
-//! - **`controller`** — `ShotAggregator`, which composes a shot from its
+//! - **`collector`** — `ShotAccumulator`, which composes a shot from its
 //!   `shot.*` messages, and `BusState`, the current state of the bus with
 //!   removals and heartbeat expiry applied
 //! - **`transport`** — `FrpEndpoint` / `FrpConnection`, the WebSocket
@@ -63,7 +63,7 @@
 //! use flightrelay::types::roles;
 //! use flightrelay::{
 //!     BusActor, DEFAULT_HEARTBEAT, EndpointConfig, FrpBody, FrpEndpoint, FrpMessage,
-//!     Transport,
+//!     Target,
 //! };
 //!
 //! // Generate the id once and keep it across restarts.
@@ -71,7 +71,7 @@
 //!     "e4a7136b9f02cd58",
 //!     BusActor::new("Shot Log", DEFAULT_HEARTBEAT.as_secs_f64()).with_role(roles::COLLECTOR),
 //! );
-//! let mut ep = FrpEndpoint::open(EndpointConfig::new(Transport::connect(
+//! let mut ep = FrpEndpoint::open(EndpointConfig::new(Target::connect(
 //!     "ws://localhost:5880/frp",
 //! )))?;
 //! let mut conn = ep.establish()?;
@@ -143,10 +143,10 @@ pub mod message;
 pub mod types;
 pub mod units;
 
-#[cfg(feature = "controller")]
+#[cfg(feature = "collector")]
 pub mod accumulator;
 
-#[cfg(feature = "controller")]
+#[cfg(feature = "collector")]
 pub mod bus;
 
 #[cfg(feature = "transport")]
@@ -188,14 +188,14 @@ pub use types::{
 };
 pub use units::{Distance, Velocity};
 
-#[cfg(feature = "controller")]
-pub use accumulator::{CompletedShot, Flight, LateMessage, ShotAggregator, ShotEvent};
+#[cfg(feature = "collector")]
+pub use accumulator::{CompletedShot, Flight, LateMessage, ShotAccumulator, ShotEvent};
 
-#[cfg(feature = "controller")]
+#[cfg(feature = "collector")]
 pub use bus::BusState;
 
 #[cfg(feature = "transport")]
-pub use endpoint::{EndpointConfig, FrpConnection, FrpEndpoint, Transport};
+pub use endpoint::{EndpointConfig, FrpConnection, FrpEndpoint, Target};
 
 #[cfg(feature = "transport")]
 pub use hub::{Hub, HubEvent, PeerId};

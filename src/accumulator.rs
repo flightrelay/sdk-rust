@@ -1,6 +1,6 @@
 //! Shot accumulator for collectors.
 //!
-//! Requires the `controller` feature. [`ShotAggregator`] composes a shot
+//! Requires the `collector` feature. [`ShotAccumulator`] composes a shot
 //! from its `shot.*` messages and yields it when `shot.finished` arrives.
 //!
 //! - A shot is identified by `key.shot_id` alone: its messages are
@@ -25,10 +25,10 @@
 //!   message for a finished shot no longer remembered is ignored.
 //! - A shot that has not finished within the accumulator timeout
 //!   ([`DEFAULT_SHOT_TIMEOUT`] unless set with
-//!   [`ShotAggregator::with_timeout`]) is discarded, and its messages are
+//!   [`ShotAccumulator::with_timeout`]) is discarded, and its messages are
 //!   ignored for one more timeout, so a late message never starts a new
 //!   partial shot. The open shots of an actor that is gone
-//!   ([`ShotAggregator::forget_actor`], or its `bus.actor` removal) are
+//!   ([`ShotAccumulator::forget_actor`], or its `bus.actor` removal) are
 //!   discarded the same way.
 //! - `shot.raw` is not part of a shot, even with a key.
 
@@ -204,16 +204,16 @@ struct InProgress {
 /// [`BusState::expire`](crate::BusState::expire) reports.
 ///
 /// ```
-/// use flightrelay::{FrpMessage, ShotAggregator, ShotEvent, ShotFinished, ShotKey, ShotTrigger};
+/// use flightrelay::{FrpMessage, ShotAccumulator, ShotEvent, ShotFinished, ShotKey, ShotTrigger};
 ///
-/// let mut shots = ShotAggregator::new();
+/// let mut shots = ShotAccumulator::new();
 /// let key = ShotKey::new("550e8400-e29b-41d4-a716-446655440000", 1);
 /// shots.feed(&FrpMessage::new("7d2f9a41c03be856", ShotTrigger::new(key.clone())));
 /// let done = shots.feed(&FrpMessage::new("7d2f9a41c03be856", ShotFinished { key }));
 /// assert!(matches!(done, Some(ShotEvent::Finished(_))));
 /// ```
 #[derive(Debug)]
-pub struct ShotAggregator {
+pub struct ShotAccumulator {
     timeout: Duration,
     pending: HashMap<String, InProgress>,
     /// Finished shots, remembered for addenda and late messages, with when
@@ -226,7 +226,7 @@ pub struct ShotAggregator {
     blocks: HashMap<String, (String, PracticeBlock)>,
 }
 
-impl Default for ShotAggregator {
+impl Default for ShotAccumulator {
     fn default() -> Self {
         Self {
             timeout: DEFAULT_SHOT_TIMEOUT,
@@ -240,8 +240,8 @@ impl Default for ShotAggregator {
     }
 }
 
-impl ShotAggregator {
-    /// An aggregator with the [`DEFAULT_SHOT_TIMEOUT`].
+impl ShotAccumulator {
+    /// An accumulator with the [`DEFAULT_SHOT_TIMEOUT`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use flightrelay::{
     BusActor, Club, EndpointConfig, FrpBody, FrpEndpoint, FrpError, FrpMessage, GolferTurn,
-    Handedness, Hub, HubEvent, Launch, Mode, PeerId, ShotKey, ShotLaunch, Transport, Velocity,
+    Handedness, Hub, HubEvent, Launch, Mode, PeerId, ShotKey, ShotLaunch, Target, Velocity,
 };
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
@@ -26,8 +26,7 @@ const C: &str = CLUBHOUSE;
 
 /// Bind an endpoint on an ephemeral port and report the address it got.
 fn listener() -> (FrpEndpoint, String) {
-    let ep =
-        FrpEndpoint::open(EndpointConfig::new(Transport::listen("127.0.0.1:0"))).expect("bind");
+    let ep = FrpEndpoint::open(EndpointConfig::new(Target::listen("127.0.0.1:0"))).expect("bind");
     let addr = ep
         .local_addr()
         .expect("addr")
@@ -37,7 +36,7 @@ fn listener() -> (FrpEndpoint, String) {
 }
 
 fn dialer(addr: &str) -> FrpEndpoint {
-    FrpEndpoint::open(EndpointConfig::new(Transport::connect(format!(
+    FrpEndpoint::open(EndpointConfig::new(Target::connect(format!(
         "ws://{addr}/frp"
     ))))
     .expect("open")
@@ -374,7 +373,7 @@ fn a_flood_past_a_stalled_peer(with_c: bool, limit: usize) {
     let n = if with_c { 3 } else { 2 };
     let (mut ep, addr) = {
         let ep = FrpEndpoint::open(
-            EndpointConfig::new(Transport::listen("127.0.0.1:0")).with_write_buffer_limit(limit),
+            EndpointConfig::new(Target::listen("127.0.0.1:0")).with_write_buffer_limit(limit),
         )
         .expect("listen");
         let addr = ep.local_addr().unwrap().unwrap().to_string();

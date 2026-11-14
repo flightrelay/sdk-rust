@@ -17,9 +17,9 @@
 //! [`write_buffer_limit`](crate::EndpointConfig::write_buffer_limit).
 //!
 //! ```no_run
-//! use flightrelay::{BusActor, EndpointConfig, FrpEndpoint, FrpMessage, Hub, HubEvent, Transport};
+//! use flightrelay::{BusActor, EndpointConfig, FrpEndpoint, FrpMessage, Hub, HubEvent, Target};
 //!
-//! let mut endpoint = FrpEndpoint::open(EndpointConfig::new(Transport::listen("0.0.0.0:5880")))?;
+//! let mut endpoint = FrpEndpoint::open(EndpointConfig::new(Target::listen("0.0.0.0:5880")))?;
 //! let me = FrpMessage::new("a1b2c3d4e5f60718", BusActor::new("Range hub", 2.0));
 //! let mut hub = Hub::new();
 //! let mut conn = endpoint.establish()?;

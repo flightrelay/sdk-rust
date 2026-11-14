@@ -1,7 +1,7 @@
 //! The mock driver run by `FrpServer`, read by a collector the way an
 //! application would: greet, publish a turn, collect shots and bus state.
 
-#![cfg(all(feature = "mock", feature = "server", feature = "controller"))]
+#![cfg(all(feature = "mock", feature = "server", feature = "collector"))]
 
 use std::time::{Duration, Instant};
 
@@ -10,8 +10,8 @@ use flightrelay::mock::{MockConfig, MockDriver};
 use flightrelay::types::roles;
 use flightrelay::{
     Basis, BusActor, BusState, EndpointConfig, FrpBody, FrpEndpoint, FrpMessage, FrpServer,
-    GolferTurn, Handedness, Mode, ServerConfig, ServerEvent, ShotAggregator, ShotEvent, Source,
-    Transport,
+    GolferTurn, Handedness, Mode, ServerConfig, ServerEvent, ShotAccumulator, ShotEvent, Source,
+    Target,
 };
 
 const MOCK: &str = "7d2f9a41c03be856";
@@ -33,7 +33,7 @@ fn a_collector_receives_complete_virtual_shots_from_the_mock() {
     let server = std::thread::spawn(move || {
         FrpServer::new(
             driver,
-            ServerConfig::new(Transport::listen("127.0.0.1:0"), MOCK),
+            ServerConfig::new(Target::listen("127.0.0.1:0"), MOCK),
         )
         .on_event(move |event| {
             if let ServerEvent::Listening(addr) = event {
@@ -46,7 +46,7 @@ fn a_collector_receives_complete_virtual_shots_from_the_mock() {
         .recv_timeout(Duration::from_secs(5))
         .expect("listening");
 
-    let mut endpoint = FrpEndpoint::open(EndpointConfig::new(Transport::connect(format!(
+    let mut endpoint = FrpEndpoint::open(EndpointConfig::new(Target::connect(format!(
         "ws://{addr}/frp"
     ))))
     .expect("open");
@@ -66,8 +66,8 @@ fn a_collector_receives_complete_virtual_shots_from_the_mock() {
         .expect("turn");
 
     let mut bus = BusState::new();
-    let mut shots = ShotAggregator::new();
-    // Our own turn, as the aggregator would have heard it on the bus.
+    let mut shots = ShotAccumulator::new();
+    // Our own turn, as the accumulator would have heard it on the bus.
     shots.feed(&FrpMessage::new(COLLECTOR, turn.clone()));
     let mut done = Vec::new();
     let give_up = Instant::now() + Duration::from_secs(10);

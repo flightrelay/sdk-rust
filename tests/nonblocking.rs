@@ -10,14 +10,12 @@ use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::Duration;
 
-use flightrelay::{
-    BusAlert, EndpointConfig, FrpEndpoint, FrpError, FrpMessage, Severity, Transport,
-};
+use flightrelay::{BusAlert, EndpointConfig, FrpEndpoint, FrpError, FrpMessage, Severity, Target};
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 
 fn listener(tweak: impl FnOnce(EndpointConfig) -> EndpointConfig) -> (FrpEndpoint, String) {
-    let ep = FrpEndpoint::open(tweak(EndpointConfig::new(Transport::listen("127.0.0.1:0"))))
-        .expect("bind");
+    let ep =
+        FrpEndpoint::open(tweak(EndpointConfig::new(Target::listen("127.0.0.1:0")))).expect("bind");
     let addr = ep
         .local_addr()
         .expect("addr")
@@ -75,14 +73,14 @@ fn establish_until_serves_a_connection_that_arrives() {
 fn a_stopped_dial_gives_up_at_once() {
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("ws://{}/frp", taken.local_addr().unwrap());
-    let mut ep = FrpEndpoint::open(EndpointConfig::new(Transport::connect(url))).unwrap();
+    let mut ep = FrpEndpoint::open(EndpointConfig::new(Target::connect(url))).unwrap();
     let stop = AtomicBool::new(true);
     assert!(matches!(ep.establish_until(&stop), Ok(None)));
 }
 
 #[test]
 fn only_ws_urls_can_be_dialed() {
-    let mut ep = FrpEndpoint::open(EndpointConfig::new(Transport::connect(
+    let mut ep = FrpEndpoint::open(EndpointConfig::new(Target::connect(
         "wss://127.0.0.1:1/frp",
     )))
     .unwrap();
@@ -108,7 +106,7 @@ fn a_peer_that_never_answers_times_out_a_dial() {
     let silent = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("ws://{}/frp", silent.local_addr().unwrap());
     let mut ep = FrpEndpoint::open(
-        EndpointConfig::new(Transport::connect(url))
+        EndpointConfig::new(Target::connect(url))
             .with_handshake_timeout(Duration::from_millis(300)),
     )
     .unwrap();

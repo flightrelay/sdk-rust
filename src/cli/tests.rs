@@ -543,7 +543,7 @@ fn a_driver_that_gives_up_exits_1() {
 fn a_ws_target_dials_and_anything_else_listens() {
     // A hub that listens: the server dials it.
     let mut hub =
-        FrpEndpoint::open(EndpointConfig::new(crate::Transport::listen("127.0.0.1:0"))).unwrap();
+        FrpEndpoint::open(EndpointConfig::new(crate::Target::listen("127.0.0.1:0"))).unwrap();
     let addr = hub.local_addr().unwrap().unwrap();
     let stop = Stop::new();
     let runner_stop = stop.clone();
@@ -907,7 +907,7 @@ fn runner_keys_are_checked() {
 #[test]
 fn the_runner_publishes_with_the_configured_actor_id() {
     let mut hub =
-        FrpEndpoint::open(EndpointConfig::new(crate::Transport::listen("127.0.0.1:0"))).unwrap();
+        FrpEndpoint::open(EndpointConfig::new(crate::Target::listen("127.0.0.1:0"))).unwrap();
     let addr = hub.local_addr().unwrap().unwrap();
     let stop = Stop::new();
     let runner_stop = stop.clone();

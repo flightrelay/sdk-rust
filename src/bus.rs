@@ -1,6 +1,6 @@
 //! [`BusState`]: the current state of the bus, for collectors and UIs.
 //!
-//! Requires the `controller` feature. Feed it every message; it keeps the
+//! Requires the `collector` feature. Feed it every message; it keeps the
 //! newest state message for each (kind, from, id), applies removals, and
 //! forgets everything from an actor whose `bus.actor` it has not heard for
 //! three heartbeats. Occurrences and commands pass through untouched.
@@ -84,7 +84,7 @@ impl BusState {
     /// forgotten here. Call it
     /// regularly, e.g. once a second, and pass each id to anything else that
     /// keeps per-actor state (such as
-    /// [`ShotAggregator::forget_actor`](crate::ShotAggregator::forget_actor)).
+    /// [`ShotAccumulator::forget_actor`](crate::ShotAccumulator::forget_actor)).
     pub fn expire(&mut self) -> Vec<String> {
         self.expire_at(Instant::now())
     }

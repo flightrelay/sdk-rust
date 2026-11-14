@@ -67,7 +67,7 @@ use serde_json::{Map, Value};
 
 use crate::config::{ConfigError, DriverConfig};
 use crate::driver::{DeviceEvent, FrpDriver, Level, Stop};
-use crate::{FrpBody, FrpServer, ServerConfig, ServerEvent, Transport};
+use crate::{FrpBody, FrpServer, ServerConfig, ServerEvent, Target};
 
 /// The table of the config file that holds the runner's own settings.
 const RUNNER_TABLE: &str = "frp";
@@ -350,13 +350,13 @@ pub enum ActorIdOrigin {
 /// the `[frp]` table are not checked.
 ///
 /// ```no_run
-/// use flightrelay::{ActorIdOrigin, ServerConfig, Transport, config_actor_id};
+/// use flightrelay::{ActorIdOrigin, ServerConfig, Target, config_actor_id};
 ///
 /// let kept = config_actor_id("launch-monitor.toml")?;
 /// if !matches!(kept.origin, ActorIdOrigin::Read | ActorIdOrigin::Saved) {
 ///     eprintln!("new actor id {} for this run only", kept.id);
 /// }
-/// let config = ServerConfig::new(Transport::listen("0.0.0.0:5880"), kept.id);
+/// let config = ServerConfig::new(Target::listen("0.0.0.0:5880"), kept.id);
 /// # Ok::<(), flightrelay::config::ConfigError>(())
 /// ```
 ///
@@ -733,9 +733,9 @@ fn execute<D: FrpDriver>(
         return 2;
     }
     let transport = if target.starts_with("ws://") {
-        Transport::connect(target)
+        Target::connect(target)
     } else {
-        Transport::listen(target)
+        Target::listen(target)
     };
     let actor_id = runner
         .actor_id

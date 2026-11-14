@@ -77,11 +77,11 @@
 //! ```no_run
 //! # use flightrelay::driver::{FrpDriver, Stop};
 //! # fn serve<D: FrpDriver>(driver: D) -> Result<(), Box<dyn std::error::Error>> {
-//! use flightrelay::{FrpServer, ServerConfig, Transport};
+//! use flightrelay::{FrpServer, ServerConfig, Target};
 //!
 //! // Generated once with `flightrelay::new_actor_id()` and kept by the host.
 //! let actor_id = "7d2f9a41c03be856";
-//! let config = ServerConfig::new(Transport::listen("0.0.0.0:5880"), actor_id);
+//! let config = ServerConfig::new(Target::listen("0.0.0.0:5880"), actor_id);
 //! let stop = Stop::new();
 //! FrpServer::new(driver, config)
 //!     .on_event(|event| eprintln!("{event:?}"))
@@ -110,7 +110,7 @@ use crate::endpoint::DEFAULT_WRITE_BUFFER_LIMIT;
 use crate::{
     BusActor, DEFAULT_HEARTBEAT, DEFAULT_SHOT_TIMEOUT, EndpointConfig, FrpBody, FrpConnection,
     FrpEndpoint, FrpError, FrpMessage, Hub, HubEvent, Removal, ShotFinished, ShotKey, StateKind,
-    Transport,
+    Target,
 };
 
 /// Capacity of the queue from the device thread to the network thread.
@@ -140,9 +140,9 @@ pub const MIN_HEARTBEAT: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ServerConfig {
-    /// [`Transport::Listen`] to serve peers that connect, or
-    /// [`Transport::Connect`] to dial one (a bridge).
-    pub target: Transport,
+    /// [`Target::Listen`] to serve peers that connect, or
+    /// [`Target::Connect`] to dial one (a bridge).
+    pub target: Target,
     /// The actor's id: generated once ([`new_actor_id`](crate::new_actor_id))
     /// and kept across restarts by the host.
     pub actor_id: String,
@@ -174,7 +174,7 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// A config for `target` and the actor `actor_id`, with the defaults.
     #[must_use]
-    pub fn new(target: Transport, actor_id: impl Into<String>) -> Self {
+    pub fn new(target: Target, actor_id: impl Into<String>) -> Self {
         Self {
             target,
             actor_id: actor_id.into(),
@@ -328,8 +328,8 @@ impl<D: FrpDriver> FrpServer<D> {
         flags.set_wants_raw(config.raw_frames);
         let inner = Stop::new();
 
-        let bridge = matches!(config.target, Transport::Connect(_));
-        if let Transport::Connect(url) = &config.target
+        let bridge = matches!(config.target, Target::Connect(_));
+        if let Target::Connect(url) = &config.target
             && !url
                 .get(..5)
                 .is_some_and(|s| s.eq_ignore_ascii_case("ws://"))
@@ -1061,7 +1061,7 @@ mod tests {
     use crate::Source;
 
     fn net(name: Option<&str>) -> Net {
-        let mut config = ServerConfig::new(Transport::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let mut config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
         config.name = name.map(str::to_owned);
         net_with(&config)
     }
@@ -1100,7 +1100,7 @@ mod tests {
 
     #[test]
     fn a_drivers_namespaces_reach_its_actor() {
-        let config = ServerConfig::new(Transport::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
         let info = DriverInfo::new("beacon", "Beacon", Source::Virtual)
             .with_namespaces(&["clubhouse", "range"]);
         let (with, _notes) = net_with_info(&config, &info);
@@ -1129,7 +1129,7 @@ mod tests {
 
     #[test]
     fn a_shot_left_open_is_finished_at_the_shot_timeout() {
-        let config = ServerConfig::new(Transport::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
         let (mut net, notes) = net_with_notes(&config);
         let (t0, timeout) = (net.now, net.shot_timeout);
         let key = crate::driver::ShotIds::new().next_key();
@@ -1274,7 +1274,7 @@ mod tests {
 
     #[test]
     fn a_short_heartbeat_is_raised_once_and_advertised() {
-        let mut config = ServerConfig::new(Transport::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let mut config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
         config.heartbeat = Duration::from_millis(1);
         let net = net_with(&config);
         assert_eq!(net.heartbeat, MIN_HEARTBEAT);
@@ -1292,7 +1292,7 @@ mod tests {
         off.on_driver_message(raw());
         assert_eq!(off.seq, 0, "not numbered, not sent");
 
-        let mut config = ServerConfig::new(Transport::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let mut config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
         config.raw_frames = true;
         let mut on = net_with(&config);
         on.on_driver_message(raw());

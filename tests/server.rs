@@ -18,7 +18,7 @@ use flightrelay::driver::{
 };
 use flightrelay::{
     Club, EndpointConfig, FrpEndpoint, FrpMessage, FrpServer, Handedness, Launch, Mode, RawDir,
-    ServerConfig, ServerError, ServerEvent, Severity, ShotKey, Source, Transport, Velocity,
+    ServerConfig, ServerError, ServerEvent, Severity, ShotKey, Source, Target, Velocity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -255,7 +255,7 @@ struct Harness {
 }
 
 impl Harness {
-    fn start(target: Transport, tweak: impl FnOnce(&mut ServerConfig)) -> Self {
+    fn start(target: Target, tweak: impl FnOnce(&mut ServerConfig)) -> Self {
         let (driver, control) = fake();
         Self::start_with(driver, control, target, tweak)
     }
@@ -263,7 +263,7 @@ impl Harness {
     fn start_with(
         driver: Fake,
         control: Control,
-        target: Transport,
+        target: Target,
         tweak: impl FnOnce(&mut ServerConfig),
     ) -> Self {
         let mut config = ServerConfig::new(target, ACTOR);
@@ -286,7 +286,7 @@ impl Harness {
     }
 
     fn listen() -> Self {
-        Self::start(Transport::listen("127.0.0.1:0"), |_| {})
+        Self::start(Target::listen("127.0.0.1:0"), |_| {})
     }
 
     fn log(&self) -> Vec<String> {
@@ -526,7 +526,7 @@ fn the_actor_takes_the_identity_and_never_publishes_the_device_id() {
 
 #[test]
 fn a_named_actor_keeps_its_name() {
-    let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| {
+    let h = Harness::start(Target::listen("127.0.0.1:0"), |c| {
         c.name = Some("Bay 3".into());
     });
     let mut peer = Peer::connect(&h.addr());
@@ -540,7 +540,7 @@ fn a_named_actor_keeps_its_name() {
 
 #[test]
 fn a_sync_from_any_peer_is_answered_with_the_actor() {
-    let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| {
+    let h = Harness::start(Target::listen("127.0.0.1:0"), |c| {
         c.heartbeat = Duration::from_secs(60);
     });
     let (mut peer, hello) = h.peer_and_greeting();
@@ -681,7 +681,7 @@ fn a_turn_reaches_the_driver_as_hints_that_replace_the_last() {
 fn the_last_turns_hints_reach_the_next_connect_and_outlive_the_session_actor() {
     let (driver, control) = fake();
     control.plan(Plan::BlockUntilClub);
-    let h = Harness::start_with(driver, control, Transport::listen("127.0.0.1:0"), |_| {});
+    let h = Harness::start_with(driver, control, Target::listen("127.0.0.1:0"), |_| {});
     let mut session = h.peer();
     // A turn served while the connect blocks.
     session.send(&turn(Some("PW"), "rh", "chipping"));
@@ -707,7 +707,7 @@ fn a_sync_is_answered_while_a_connect_blocks() {
         release: Arc::clone(&release),
         alert: None,
     });
-    let h = Harness::start_with(driver, control, Transport::listen("127.0.0.1:0"), |c| {
+    let h = Harness::start_with(driver, control, Target::listen("127.0.0.1:0"), |c| {
         c.heartbeat = Duration::from_secs(60);
     });
     let mut peer = h.peer();
@@ -728,7 +728,7 @@ fn an_alert_while_connecting_goes_out_at_once() {
         release: Arc::clone(&release),
         alert: Some(("press the pairing button", Arc::clone(&go))),
     });
-    let h = Harness::start_with(driver, control, Transport::listen("127.0.0.1:0"), |_| {});
+    let h = Harness::start_with(driver, control, Target::listen("127.0.0.1:0"), |_| {});
     let mut peer = h.peer();
     go.store(true, Ordering::SeqCst);
     let seen = peer.until(|v| kind(v) == "bus.alert");
@@ -740,7 +740,7 @@ fn an_alert_while_connecting_goes_out_at_once() {
 
 #[test]
 fn driver_status_is_merged_into_the_actor() {
-    let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| {
+    let h = Harness::start(Target::listen("127.0.0.1:0"), |c| {
         c.heartbeat = Duration::from_secs(60);
     });
     let mut peer = h.peer();
@@ -824,7 +824,7 @@ fn raw_frames_go_out_only_when_configured_and_count_on_across_sessions() {
     assert!(!kinds(&seen).contains(&"shot.raw"), "{seen:#?}");
     drop(off);
 
-    let on = Harness::start(Transport::listen("127.0.0.1:0"), |c| c.raw_frames = true);
+    let on = Harness::start(Target::listen("127.0.0.1:0"), |c| c.raw_frames = true);
     let mut peer = on.peer();
     on.wait_for("device+ ");
     on.control.run(|out| {
@@ -854,7 +854,7 @@ fn flood(control: &Control, count: usize) {
 
 #[test]
 fn a_peer_that_falls_behind_the_write_buffer_cap_is_dropped() {
-    let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| {
+    let h = Harness::start(Target::listen("127.0.0.1:0"), |c| {
         c.write_buffer_limit = 512 * 1024;
     });
     let stalled = h.peer(); // never reads again
@@ -867,7 +867,7 @@ fn a_peer_that_falls_behind_the_write_buffer_cap_is_dropped() {
 
 #[test]
 fn a_silent_client_cannot_hold_up_the_acceptor() {
-    let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| {
+    let h = Harness::start(Target::listen("127.0.0.1:0"), |c| {
         c.log_level = Level::Debug;
     });
     let addr = h.addr();
@@ -888,7 +888,7 @@ fn a_silent_client_cannot_hold_up_the_acceptor() {
 
 #[test]
 fn peers_past_the_limit_are_refused() {
-    let h = Harness::start(Transport::listen("127.0.0.1:0"), |c| c.max_peers = 1);
+    let h = Harness::start(Target::listen("127.0.0.1:0"), |c| c.max_peers = 1);
     let _first = h.peer();
     let (mut ws, _) = tungstenite::connect(format!("ws://{}/frp", h.addr())).unwrap();
     let mut refused = false;
@@ -913,7 +913,7 @@ fn a_driver_that_gives_up_ends_the_server_with_its_error() {
     let (driver, control) = fake();
     control.inner.give_up.store(true, Ordering::SeqCst);
     control.plan(Plan::Fail("no such device"));
-    let h = Harness::start_with(driver, control, Transport::listen("127.0.0.1:0"), |_| {});
+    let h = Harness::start_with(driver, control, Target::listen("127.0.0.1:0"), |_| {});
     let line = h.wait_for("lost ");
     assert!(
         line.contains("failed: no such device") && line.ends_with("retry=None"),
@@ -935,7 +935,7 @@ fn a_failed_connect_is_retried_after_the_advised_delay() {
     let (driver, control) = fake();
     control.plan(Plan::Fail("first"));
     control.plan(Plan::Fail("second"));
-    let h = Harness::start_with(driver, control, Transport::listen("127.0.0.1:0"), |_| {});
+    let h = Harness::start_with(driver, control, Target::listen("127.0.0.1:0"), |_| {});
     h.wait_for("device+ ");
     let lost: Vec<String> = h
         .log()
@@ -953,7 +953,7 @@ fn a_failed_connect_is_retried_after_the_advised_delay() {
 fn an_endpoint_that_cannot_open_is_a_fatal_error() {
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = taken.local_addr().unwrap().to_string();
-    let h = Harness::start(Transport::listen(addr), |_| {});
+    let h = Harness::start(Target::listen(addr), |_| {});
     let give_up = Instant::now() + Duration::from_secs(5);
     while !h.handle.as_ref().unwrap().is_finished() {
         assert!(Instant::now() < give_up);
@@ -970,7 +970,7 @@ fn hub_endpoint(
     n: usize,
     drop_first: bool,
 ) -> (String, Receiver<flightrelay::FrpConnection>, JoinHandle<()>) {
-    let mut hub = FrpEndpoint::open(EndpointConfig::new(Transport::listen("127.0.0.1:0"))).unwrap();
+    let mut hub = FrpEndpoint::open(EndpointConfig::new(Target::listen("127.0.0.1:0"))).unwrap();
     let addr = hub.local_addr().unwrap().unwrap();
     let (tx, rx) = channel();
     let accepting = std::thread::spawn(move || {
@@ -989,7 +989,7 @@ fn hub_endpoint(
 #[test]
 fn a_bridge_dials_greets_and_redials_when_the_link_drops() {
     let (url, rx, accepting) = hub_endpoint(2, false);
-    let h = Harness::start(Transport::connect(url), |_| {});
+    let h = Harness::start(Target::connect(url), |_| {});
     let mut conn = rx.recv_timeout(Duration::from_secs(10)).expect("dialed");
     let hello = conn.recv().unwrap();
     assert_eq!(hello.kind(), "bus.actor");
@@ -1014,7 +1014,7 @@ fn a_bridge_dials_greets_and_redials_when_the_link_drops() {
 #[test]
 fn a_bridge_dials_again_after_a_hub_that_closes_at_once() {
     let (url, rx, accepting) = hub_endpoint(2, true);
-    let h = Harness::start(Transport::connect(url), |_| {});
+    let h = Harness::start(Target::connect(url), |_| {});
     let mut conn = rx
         .recv_timeout(Duration::from_secs(20))
         .expect("dialed again");
@@ -1026,7 +1026,7 @@ fn a_bridge_dials_again_after_a_hub_that_closes_at_once() {
 
 #[test]
 fn a_wss_target_is_refused_before_anything_starts() {
-    let h = Harness::start(Transport::connect("wss://127.0.0.1:1/frp"), |_| {});
+    let h = Harness::start(Target::connect("wss://127.0.0.1:1/frp"), |_| {});
     let give_up = Instant::now() + Duration::from_secs(5);
     while !h.handle.as_ref().unwrap().is_finished() {
         assert!(

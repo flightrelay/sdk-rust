@@ -53,7 +53,7 @@ fn shot_flight(from: &str, f: FlightResult) -> FrpMessage {
     )
 }
 
-fn finish(agg: &mut ShotAggregator) -> CompletedShot {
+fn finish(agg: &mut ShotAccumulator) -> CompletedShot {
     match agg.feed(&finished()) {
         Some(ShotEvent::Finished(shot)) => shot,
         other => panic!("{other:?}"),
@@ -62,7 +62,7 @@ fn finish(agg: &mut ShotAggregator) -> CompletedShot {
 
 #[test]
 fn a_shot_is_composed_from_every_part_whoever_sends_it() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     assert!(agg.feed(&trigger()).is_none());
     assert_eq!(agg.pending_count(), 1);
     agg.feed(&msg(
@@ -113,7 +113,7 @@ fn a_shot_is_composed_from_every_part_whoever_sends_it() {
 
 #[test]
 fn a_shot_keeps_every_flight() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&trigger());
     let own = flight(Basis::Modeled, "Eagle One model 2.1", 180.0);
     let physics = flight(Basis::Modeled, "Fairway Physics 1.3", 181.2);
@@ -150,7 +150,7 @@ fn a_shot_keeps_every_flight() {
 
 #[test]
 fn the_shown_flight_prefers_tracked() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&trigger());
     agg.feed(&shot_flight(
         PHYSICS,
@@ -160,7 +160,7 @@ fn the_shown_flight_prefers_tracked() {
     agg.feed(&shot_flight(LM, tracked.clone()));
     assert_eq!(finish(&mut agg).flight(), Some(&tracked));
 
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&trigger());
     let other = flight(Basis::Modeled, "Fairway Physics 1.3", 181.2);
     agg.feed(&shot_flight(PHYSICS, other.clone()));
@@ -169,7 +169,7 @@ fn the_shown_flight_prefers_tracked() {
 
 #[test]
 fn the_own_flight_is_the_launch_monitors_first() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&trigger());
     agg.feed(&shot_flight(
         PHYSICS,
@@ -183,7 +183,7 @@ fn the_own_flight_is_the_launch_monitors_first() {
     ));
     assert_eq!(finish(&mut agg).own_flight(), Some(&own));
 
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&trigger());
     agg.feed(&shot_flight(PHYSICS, own));
     assert_eq!(finish(&mut agg).own_flight(), None, "never another actor's");
@@ -191,7 +191,7 @@ fn the_own_flight_is_the_launch_monitors_first() {
 
 #[test]
 fn another_actors_message_after_finished_is_an_update() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&trigger());
     agg.feed(&msg(
         LM,
@@ -243,7 +243,7 @@ fn another_actors_message_after_finished_is_an_update() {
 
 #[test]
 fn the_launch_monitors_own_message_after_finished_is_late() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&trigger());
     finish(&mut agg);
 
@@ -286,7 +286,7 @@ fn the_launch_monitors_own_message_after_finished_is_late() {
 
 #[test]
 fn a_message_for_a_shot_no_longer_remembered_is_ignored() {
-    let mut agg = ShotAggregator::new().with_timeout(Duration::from_secs(10));
+    let mut agg = ShotAccumulator::new().with_timeout(Duration::from_secs(10));
     let t0 = Instant::now();
     agg.feed_at(&trigger(), t0);
     assert!(matches!(
@@ -308,7 +308,7 @@ fn a_message_for_a_shot_no_longer_remembered_is_ignored() {
 
 #[test]
 fn an_expired_shot_is_discarded_and_its_late_messages_ignored() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     assert_eq!(agg.timeout(), DEFAULT_SHOT_TIMEOUT);
     let t0 = Instant::now();
     agg.feed_at(&trigger(), t0);
@@ -333,7 +333,7 @@ fn an_expired_shot_is_discarded_and_its_late_messages_ignored() {
 
 #[test]
 fn a_shot_keeps_the_first_launch_club_and_impact() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&trigger());
     agg.feed(&msg(
         LM,
@@ -354,7 +354,7 @@ fn a_shot_keeps_the_first_launch_club_and_impact() {
 
 #[test]
 fn parts_before_the_trigger_or_for_unknown_shots_are_ignored() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     assert!(
         agg.feed(&msg(
             LM,
@@ -372,7 +372,7 @@ fn parts_before_the_trigger_or_for_unknown_shots_are_ignored() {
 
 #[test]
 fn raw_frames_never_touch_a_shot() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     let raw = RawFrame {
         key: Some(key()),
         ..RawFrame::new(RawDir::Rx, 0, vec![1, 2])
@@ -398,7 +398,7 @@ fn actor(source: Option<Source>) -> FrpMessage {
 
 #[test]
 fn shots_carry_the_source_their_launch_monitor_declares() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&actor(Some(Source::Measured)));
     assert_eq!(agg.source(LM), Some(Source::Measured));
     agg.feed(&trigger());
@@ -430,7 +430,7 @@ fn block(id: &str, golfer: Option<GolferId>) -> FrpMessage {
 
 #[test]
 fn shots_take_golfer_club_and_block_from_the_turn_current_at_the_trigger() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     let turn = GolferTurn::new(Some(sam()), Some(Club::Iron7), Handedness::Left, Mode::Full);
     agg.feed(&msg(CLUBHOUSE, turn.clone()));
     agg.feed(&block("b-sam", Some(sam())));
@@ -461,7 +461,7 @@ fn shots_take_golfer_club_and_block_from_the_turn_current_at_the_trigger() {
 
 #[test]
 fn removals_clear_the_turn_and_blocks() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&msg(
         CLUBHOUSE,
         GolferTurn::new(Some(sam()), None, Handedness::Right, Mode::Full),
@@ -483,7 +483,7 @@ fn removals_clear_the_turn_and_blocks() {
 
 #[test]
 fn an_actor_that_leaves_is_forgotten() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&actor(Some(Source::Measured)));
     agg.feed(&msg(
         CLUBHOUSE,
@@ -502,7 +502,7 @@ fn an_actor_that_leaves_is_forgotten() {
 
 #[test]
 fn a_gone_actors_open_shots_are_discarded_like_a_timeout() {
-    let mut agg = ShotAggregator::new().with_timeout(Duration::from_secs(10));
+    let mut agg = ShotAccumulator::new().with_timeout(Duration::from_secs(10));
     let t0 = Instant::now();
     agg.feed_at(&trigger(), t0);
     agg.forget_actor_at(LM, t0 + Duration::from_secs(1));
@@ -520,7 +520,7 @@ fn a_gone_actors_open_shots_are_discarded_like_a_timeout() {
 
 #[test]
 fn a_discarded_shot_is_dropped_like_a_timeout() {
-    let mut agg = ShotAggregator::new().with_timeout(Duration::from_secs(10));
+    let mut agg = ShotAccumulator::new().with_timeout(Duration::from_secs(10));
     let t0 = Instant::now();
     let other = ShotKey::new("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 43);
     agg.feed_at(&trigger(), t0);
@@ -549,7 +549,7 @@ fn a_discarded_shot_is_dropped_like_a_timeout() {
 
 #[test]
 fn only_the_triggering_actor_finishes_a_shot() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&trigger());
     assert_eq!(agg.feed(&msg(PHYSICS, ShotFinished { key: key() })), None);
     assert_eq!(agg.pending_count(), 1, "still open");
@@ -559,7 +559,7 @@ fn only_the_triggering_actor_finishes_a_shot() {
 
 #[test]
 fn launch_for_flight_fills_from_the_shown_modeled_flight() {
-    let mut agg = ShotAggregator::new();
+    let mut agg = ShotAccumulator::new();
     agg.feed(&trigger());
     let chip = Launch {
         launch_speed: Some(Velocity::MetersPerSecond(20.0)),

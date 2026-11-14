@@ -18,7 +18,7 @@ toml = { version = "1", default-features = false, features = ["std", "serde", "p
 ctrlc = { version = "3", features = ["termination"], optional = true }
 
 [features]
-controller = []
+collector = []
 transport = ["dep:tungstenite"]
 config = []
 driver = ["config"]
