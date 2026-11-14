@@ -184,6 +184,12 @@ impl fmt::Display for Distance {
     }
 }
 
+/// Meters per second in one mile per hour, exactly.
+const MPS_PER_MPH: f64 = 0.44704;
+
+/// Meters in one foot, exactly.
+const M_PER_FT: f64 = 0.3048;
+
 /// A velocity value with unit. Serializes as a suffix string: `"67.2mps"`,
 /// `"150.3mph"`, `"108.0kph"`, `"100.0fps"`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -266,9 +272,9 @@ impl Velocity {
     pub fn as_mph(self) -> f64 {
         match self {
             Self::MilesPerHour(v) => v,
-            Self::FeetPerSecond(v) => v * 0.681_818,
-            Self::MetersPerSecond(v) => v * 2.23694,
-            Self::KilometersPerHour(v) => v * 0.621_371,
+            Self::FeetPerSecond(v) => v * M_PER_FT / MPS_PER_MPH,
+            Self::MetersPerSecond(v) => v / MPS_PER_MPH,
+            Self::KilometersPerHour(v) => v / 3.6 / MPS_PER_MPH,
         }
     }
 
@@ -276,10 +282,10 @@ impl Velocity {
     #[must_use]
     pub fn as_fps(self) -> f64 {
         match self {
-            Self::MilesPerHour(v) => v * 1.46667,
+            Self::MilesPerHour(v) => v * MPS_PER_MPH / M_PER_FT,
             Self::FeetPerSecond(v) => v,
-            Self::MetersPerSecond(v) => v * 3.28084,
-            Self::KilometersPerHour(v) => v * 0.911_344,
+            Self::MetersPerSecond(v) => v / M_PER_FT,
+            Self::KilometersPerHour(v) => v / 3.6 / M_PER_FT,
         }
     }
 
@@ -287,8 +293,8 @@ impl Velocity {
     #[must_use]
     pub fn as_mps(self) -> f64 {
         match self {
-            Self::MilesPerHour(v) => v * 0.44704,
-            Self::FeetPerSecond(v) => v * 0.3048,
+            Self::MilesPerHour(v) => v * MPS_PER_MPH,
+            Self::FeetPerSecond(v) => v * M_PER_FT,
             Self::MetersPerSecond(v) => v,
             Self::KilometersPerHour(v) => v / 3.6,
         }
@@ -298,8 +304,8 @@ impl Velocity {
     #[must_use]
     pub fn as_kph(self) -> f64 {
         match self {
-            Self::MilesPerHour(v) => v * 1.60934,
-            Self::FeetPerSecond(v) => v * 1.09728,
+            Self::MilesPerHour(v) => v * MPS_PER_MPH * 3.6,
+            Self::FeetPerSecond(v) => v * M_PER_FT * 3.6,
             Self::MetersPerSecond(v) => v * 3.6,
             Self::KilometersPerHour(v) => v,
         }
@@ -372,5 +378,22 @@ mod tests {
         assert!((d.as_feet() - 3.28084).abs() < 0.001);
         assert!((d.as_yards() - 1.09361).abs() < 0.001);
         assert!((d.as_millimeters() - 1000.0).abs() < 0.001);
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-12 * b.abs()
+    }
+
+    #[test]
+    fn velocity_conversions_use_exact_factors() {
+        assert!(close(Velocity::MilesPerHour(60.0).as_fps(), 88.0));
+        assert!(close(Velocity::FeetPerSecond(88.0).as_mph(), 60.0));
+        assert!(close(Velocity::MilesPerHour(1.0).as_kph(), 1.609_344));
+        assert!(close(Velocity::KilometersPerHour(1.609_344).as_mph(), 1.0));
+        assert!(close(Velocity::MetersPerSecond(0.44704).as_mph(), 1.0));
+        assert!(close(
+            Velocity::KilometersPerHour(3.6).as_fps(),
+            1.0 / 0.3048
+        ));
     }
 }
