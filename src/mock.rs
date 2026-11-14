@@ -273,7 +273,8 @@ impl MockSession {
 }
 
 impl FrpSession for MockSession {
-    type Driver = MockDriver;
+    type Error = MockError;
+    type Action = NoAction;
 
     fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, MockError> {
         let c = self.config.clone();

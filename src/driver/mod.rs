@@ -62,7 +62,7 @@
 //! ```
 //! use std::time::Instant;
 //! use flightrelay::driver::{
-//!     ConfigError, ConnectCtx, FrpDriver, DeviceIdentity, FrpSession, DriverError,
+//!     ConfigError, ConnectCtx, FrpDriver, DeviceIdentity, FrpSession,
 //!     DriverInfo, Events, Activity, NoAction, ShotIds, Stopped,
 //! };
 //! use flightrelay::{Launch, Source, Velocity};
@@ -126,7 +126,8 @@
 //! }
 //!
 //! impl FrpSession for BeaconSession {
-//!     type Driver = Beacon;
+//!     type Error = Error;
+//!     type Action = NoAction;
 //!
 //!     fn step(&mut self, _now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
 //!         if !self.armed {
@@ -192,8 +193,8 @@ pub trait FrpDriver: Send + Sized + 'static {
     /// Device-specific operations, e.g. "find mat". [`NoAction`] when there
     /// are none.
     type Action: fmt::Debug + Send + 'static;
-    /// The connected device. Names this driver back.
-    type Session: FrpSession<Driver = Self>;
+    /// The connected device. Its error and action types are the driver's.
+    type Session: FrpSession<Error = Self::Error, Action = Self::Action>;
 
     /// Longest time from [`Stop::stop`] until [`connect`](Self::connect)
     /// returns or [`close`](FrpSession::close) ends.
@@ -258,9 +259,17 @@ pub trait FrpDriver: Send + Sized + 'static {
 }
 
 /// One connection to a device.
+///
+/// A session names its own error and action types, which are its driver's
+/// ([`FrpDriver::Session`] binds them), so a session generic over its
+/// transport (`impl<S> FrpSession for MySession<S>`) implements this trait
+/// directly.
 pub trait FrpSession: Sized {
-    /// The driver this session belongs to.
-    type Driver: FrpDriver<Session = Self>;
+    /// What a step or a close can fail with: the driver's
+    /// [`FrpDriver::Error`].
+    type Error;
+    /// Device-specific operations: the driver's [`FrpDriver::Action`].
+    type Action;
 
     /// Handle what has arrived and what is due at `now`, push events into
     /// `out`, and return without blocking. Every timer of the session
@@ -278,11 +287,7 @@ pub trait FrpSession: Sized {
     /// # Errors
     ///
     /// Returns what ended the session.
-    fn step(
-        &mut self,
-        now: Instant,
-        out: &mut Events<'_>,
-    ) -> Result<Activity, DriverError<Self::Driver>>;
+    fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Self::Error>;
 
     /// Step for about `timeout` of real time, waiting [`IDLE`] after a step
     /// that returned [`Activity::Idle`]. Always steps at least once, so a zero
@@ -293,11 +298,7 @@ pub trait FrpSession: Sized {
     /// # Errors
     ///
     /// Returns what ended the session.
-    fn poll(
-        &mut self,
-        timeout: Duration,
-        out: &mut Events<'_>,
-    ) -> Result<(), DriverError<Self::Driver>> {
+    fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), Self::Error> {
         let deadline = Instant::now() + timeout;
         loop {
             let activity = self.step(Instant::now(), out)?;
@@ -322,7 +323,7 @@ pub trait FrpSession: Sized {
     /// # Errors
     ///
     /// Returns what ended the session.
-    fn hints(&mut self, _hints: &TurnHints) -> Result<(), DriverError<Self::Driver>> {
+    fn hints(&mut self, _hints: &TurnHints) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -335,7 +336,7 @@ pub trait FrpSession: Sized {
     /// # Errors
     ///
     /// Returns what ended the session.
-    fn bus(&mut self, _msg: &FrpMessage) -> Result<(), DriverError<Self::Driver>> {
+    fn bus(&mut self, _msg: &FrpMessage) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -346,10 +347,7 @@ pub trait FrpSession: Sized {
     /// # Errors
     ///
     /// Returns what ended the session.
-    fn action(
-        &mut self,
-        _action: &DriverAction<Self::Driver>,
-    ) -> Result<(), DriverError<Self::Driver>> {
+    fn action(&mut self, _action: &Self::Action) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -364,13 +362,8 @@ pub trait FrpSession: Sized {
     /// # Errors
     ///
     /// Returns why the device could not be released cleanly.
-    fn close(self, out: &mut Events<'_>) -> Result<(), DriverError<Self::Driver>>;
+    fn close(self, out: &mut Events<'_>) -> Result<(), Self::Error>;
 }
-
-/// A driver's error type.
-pub type DriverError<D> = <D as FrpDriver>::Error;
-/// A driver's action type.
-pub type DriverAction<D> = <D as FrpDriver>::Action;
 
 /// Returned by [`ConnectCtx::tick`] after a stop; every driver error converts
 /// from it.
@@ -600,7 +593,7 @@ pub struct DriverInfo {
     /// How a host captures this device's raw frames; `None` for a device
     /// with no wire protocol.
     pub raw: Option<RawProfile>,
-    /// The FRP roles of the driver's actor, from [`roles`](crate::types::roles).
+    /// The FRP roles of the driver's actor, from [`roles`].
     /// A launch monitor is `&[roles::LAUNCH_MONITOR]`.
     pub roles: &'static [&'static str],
     /// The golfer id namespaces the driver's actor issues, as in
@@ -877,7 +870,8 @@ mod tests {
     }
 
     struct Plain(Nothing);
-    struct PlainSession(DeviceIdentity);
+    /// Generic over its transport, as a real session is over its stream.
+    struct PlainSession<T = ()>(DeviceIdentity, T);
 
     impl FrpDriver for Plain {
         type Config = Nothing;
@@ -897,12 +891,13 @@ mod tests {
             self.0 = new.clone();
         }
         fn connect(&mut self, _: &mut ConnectCtx<'_>) -> Result<PlainSession, Oops> {
-            Ok(PlainSession(DeviceIdentity::new("Plain-1")))
+            Ok(PlainSession(DeviceIdentity::new("Plain-1"), ()))
         }
     }
 
-    impl FrpSession for PlainSession {
-        type Driver = Plain;
+    impl<T> FrpSession for PlainSession<T> {
+        type Error = Oops;
+        type Action = NoAction;
         fn step(&mut self, _: Instant, _: &mut Events<'_>) -> Result<Activity, Oops> {
             Ok(Activity::Idle)
         }
@@ -958,7 +953,7 @@ mod tests {
             ]
         );
         // `hints` and `action` default to ignoring what they are given.
-        let mut session = PlainSession(DeviceIdentity::new("Plain-1"));
+        let mut session = PlainSession(DeviceIdentity::new("Plain-1"), ());
         assert!(session.hints(&TurnHints::default()).is_ok());
         driver.apply_config(&Nothing {});
     }

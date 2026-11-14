@@ -218,7 +218,8 @@ impl FrpDriver for Fake {
 }
 
 impl FrpSession for FakeSession {
-    type Driver = Fake;
+    type Error = FakeError;
+    type Action = NoAction;
 
     fn step(&mut self, _: Instant, out: &mut Events<'_>) -> Result<Activity, FakeError> {
         let msg = self.jobs.lock().unwrap().try_recv();

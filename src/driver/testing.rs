@@ -18,17 +18,12 @@
 //! host.run_for(Duration::from_secs(5), |now, out| session.step(now, out)).unwrap();
 //! assert!(!host.take_frp().is_empty());
 //! ```
-//!
-//! A session type that does not implement [`FrpSession`] (one generic
-//! over a fake transport) is stepped and closed the same way, through
-//! [`with`](TestHost::with) and [`run_for`](TestHost::run_for), which take
-//! the call as a closure.
 
 use std::time::{Duration, Instant};
 
 use super::{
-    Activity, ConnectCtx, ConnectHost, DeviceEvent, DriverError, Events, FrpDriver, FrpSession,
-    HostFlags, IDLE, Stop, TurnHints,
+    Activity, ConnectCtx, ConnectHost, DeviceEvent, Events, FrpDriver, FrpSession, HostFlags, IDLE,
+    Stop, TurnHints,
 };
 use crate::FrpMessage;
 
@@ -183,7 +178,7 @@ impl TestHost {
         &mut self,
         session: &mut S,
         msg: &FrpMessage,
-    ) -> Result<(), DriverError<S::Driver>> {
+    ) -> Result<(), S::Error> {
         session.bus(msg)
     }
 
@@ -349,7 +344,8 @@ mod tests {
     }
 
     impl FrpSession for ListenerSession {
-        type Driver = Listener;
+        type Error = Stopped;
+        type Action = NoAction;
         fn step(&mut self, _: Instant, _: &mut Events<'_>) -> Result<Activity, Stopped> {
             Ok(Activity::Idle)
         }
