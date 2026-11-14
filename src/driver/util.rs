@@ -42,6 +42,11 @@ impl Stop {
         &self.0
     }
 
+    /// The shared flag itself, for work that hands it on.
+    pub(crate) fn shared(&self) -> &Arc<AtomicBool> {
+        &self.0
+    }
+
     /// Sleep for `duration`, waking early on a stop. Returns `true` when the
     /// full duration passed and `false` when a stop cut it short (or was
     /// already requested).

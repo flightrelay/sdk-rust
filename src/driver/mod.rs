@@ -153,6 +153,7 @@ mod util;
 use std::error::Error;
 use std::fmt;
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::time::{Duration, Instant};
@@ -494,9 +495,9 @@ impl<'a> ConnectCtx<'a> {
 
     /// Run blocking work (a BLE scan and connect, a discovery) on a helper
     /// thread, ticking about every 50 ms while it runs, so the host stays
-    /// live and sees a stop. `work` gets the stop flag, to give up early,
-    /// and a log function whose lines reach [`out`](Self::out) while this
-    /// waits.
+    /// live and sees a stop. `work` gets the stop flag (shared, so it can
+    /// hand a clone on to a transport that keeps one), to give up early, and
+    /// a log function whose lines reach [`out`](Self::out) while this waits.
     ///
     /// After a stop this waits up to `stop_wait` (a driver passes its
     /// [`STOP_WAIT`](FrpDriver::STOP_WAIT)) for `work` to return. A result
@@ -513,7 +514,7 @@ impl<'a> ConnectCtx<'a> {
     pub fn run_blocking<T: Send + 'static>(
         &mut self,
         stop_wait: Duration,
-        work: impl FnOnce(&AtomicBool, &mut dyn FnMut(Level, String)) -> T + Send + 'static,
+        work: impl FnOnce(&Arc<AtomicBool>, &mut dyn FnMut(Level, String)) -> T + Send + 'static,
         release: fn(T),
     ) -> Result<std::io::Result<T>, Stopped> {
         enum Msg<T> {
@@ -532,7 +533,7 @@ impl<'a> ConnectCtx<'a> {
                 let mut log = |level, line| {
                     let _ = logs.send(Msg::Log(level, line));
                 };
-                let result = work(stop.flag(), &mut log);
+                let result = work(stop.shared(), &mut log);
                 if let Err(std::sync::mpsc::SendError(Msg::Done(late))) = tx.send(Msg::Done(result))
                 {
                     release(late);
