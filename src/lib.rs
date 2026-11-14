@@ -56,6 +56,14 @@
 //! strings on the wire (`"67.2mps"`, `"180.5m"`), read as [`Distance`] and
 //! [`Velocity`].
 //!
+//! The spec adds optional fields to a kind without changing its version, so
+//! this crate adds them in minor releases. Build a message type with its
+//! `new` (the required fields) or `Default`, set the optional fields you
+//! need with struct update syntax (`Kind { field, ..Kind::new(..) }`), and
+//! match it with `..`; code written that way keeps compiling when a field is
+//! added. [`FrpBody`] and the enums of wire values are
+//! `#[non_exhaustive]` for the same reason.
+//!
 //! # Features
 //!
 //! - **`collector`** — `ShotAccumulator`, which composes a shot from its
