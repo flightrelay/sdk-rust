@@ -183,7 +183,8 @@ pub use kinds::{
 pub use message::{Class, FrpBody, FrpMessage, Removal, StateKey, StateKind, UnknownBody};
 pub use types::{
     AssumedLaunch, Basis, Club, ClubData, FaceImpact, FlightResult, GolferId, Handedness,
-    InvalidGolferId, Launch, Mode, Position, RawDir, RawFrame, Severity, Sex, ShotKey, Source,
+    InvalidGolferId, InvalidUnitValue, Launch, Mode, Position, RawDir, RawFrame, Severity, Sex,
+    ShotKey, Source, UnknownClub,
 };
 pub use units::{Distance, Velocity};
 

@@ -10,6 +10,8 @@ use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
+use crate::types::InvalidUnitValue;
+
 /// A distance value with unit. Serializes as a suffix string: `"1.5in"`,
 /// `"9ft"`, `"3m"`, `"30cm"`, `"100yd"`, `"42mm"`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,7 +39,7 @@ impl<'de> Deserialize<'de> for Distance {
 }
 
 impl std::str::FromStr for Distance {
-    type Err = String;
+    type Err = InvalidUnitValue;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
@@ -54,13 +56,13 @@ impl std::str::FromStr for Distance {
                 let v: f64 = num
                     .trim()
                     .parse()
-                    .map_err(|_| format!("invalid number in distance: {s:?}"))?;
+                    .map_err(|_| InvalidUnitValue(format!("invalid number in distance: {s:?}")))?;
                 return Ok(ctor(v));
             }
         }
-        Err(format!(
+        Err(InvalidUnitValue(format!(
             "invalid distance {s:?}: expected number with suffix (ft, in, m, cm, yd, mm)"
-        ))
+        )))
     }
 }
 
@@ -193,7 +195,7 @@ impl<'de> Deserialize<'de> for Velocity {
 }
 
 impl std::str::FromStr for Velocity {
-    type Err = String;
+    type Err = InvalidUnitValue;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
@@ -208,13 +210,13 @@ impl std::str::FromStr for Velocity {
                 let v: f64 = num
                     .trim()
                     .parse()
-                    .map_err(|_| format!("invalid number in velocity: {s:?}"))?;
+                    .map_err(|_| InvalidUnitValue(format!("invalid number in velocity: {s:?}")))?;
                 return Ok(ctor(v));
             }
         }
-        Err(format!(
+        Err(InvalidUnitValue(format!(
             "invalid velocity {s:?}: expected number with suffix (mph, mps, kph, fps)"
-        ))
+        )))
     }
 }
 

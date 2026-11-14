@@ -781,14 +781,14 @@ impl fmt::Display for Club {
 }
 
 impl FromStr for Club {
-    type Err = String;
+    type Err = UnknownClub;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::ALL
             .iter()
             .copied()
             .find(|club| club.code() == s)
-            .ok_or_else(|| format!("unknown club code: {s:?}"))
+            .ok_or_else(|| UnknownClub(s.to_owned()))
     }
 }
 
@@ -816,6 +816,18 @@ pub struct GolferId(String);
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("not a golfer id (<namespace>.<id>): {0:?}")]
 pub struct InvalidGolferId(pub String);
+
+/// A string that is not the code of a [`Club`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown club code: {0:?}")]
+pub struct UnknownClub(pub String);
+
+/// A string that is not a unit-tagged [`Distance`] or [`Velocity`]: a
+/// number followed by a known unit suffix. Its text says which value was
+/// expected and why it failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidUnitValue(pub(crate) String);
 
 impl GolferId {
     /// The id `local` in `namespace`.
