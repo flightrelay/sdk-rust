@@ -309,7 +309,7 @@ impl FrpSession for MockSession {
         Ok(Activity::Idle)
     }
 
-    fn hints(&mut self, hints: &TurnHints) -> Result<(), MockError> {
+    fn hints(&mut self, hints: &TurnHints, _: &mut Events<'_>) -> Result<(), MockError> {
         // The new mode shows in the telemetry of the next arm; a mode change
         // leaves the timers alone. No mode hint is a full swing.
         self.mode = hints.mode.unwrap_or(Mode::Full);
@@ -602,13 +602,10 @@ mod tests {
         let mut h = host(Some(Mode::Full));
         let mut session = h.connect(&mut driver).unwrap();
         let _ = drive(&mut h, &mut session, |s| blocker_values(s).len() >= 2);
-        session
-            .hints(
-                &TurnHints::default()
-                    .with_mode(Mode::Putting)
-                    .with_handedness(crate::Handedness::Left),
-            )
-            .unwrap();
+        let hints = TurnHints::default()
+            .with_mode(Mode::Putting)
+            .with_handedness(crate::Handedness::Left);
+        h.with(|_, out| session.hints(&hints, out)).unwrap();
         let seen = drive(&mut h, &mut session, |s| kinds(s).contains(&"finished"));
         let launch = bodies(&seen).find_map(|b| match b {
             FrpBody::ShotLaunch(m) => Some(&m.launch),
@@ -628,7 +625,8 @@ mod tests {
         let mut h = host(Some(Mode::Putting));
         let mut session = h.connect(&mut driver).unwrap();
         let _ = drive(&mut h, &mut session, |s| blocker_values(s).len() >= 2);
-        session.hints(&TurnHints::default()).unwrap();
+        h.with(|_, out| session.hints(&TurnHints::default(), out))
+            .unwrap();
         let seen = drive(&mut h, &mut session, |s| kinds(s).contains(&"finished"));
         let launch = bodies(&seen).find_map(|b| match b {
             FrpBody::ShotLaunch(m) => Some(&m.launch),

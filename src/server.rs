@@ -442,7 +442,8 @@ impl<D: FrpDriver> FrpServer<D> {
                         }
                         let mut failed = None;
                         if inputs.drain(&mut hints)
-                            && let Err(e) = session.hints(&hints)
+                            && let Err(e) =
+                                session.hints(&hints, &mut Events::new(&mut sink, &flags))
                         {
                             failed = Some(e);
                         }

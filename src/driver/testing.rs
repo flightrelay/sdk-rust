@@ -179,7 +179,7 @@ impl TestHost {
         session: &mut S,
         msg: &FrpMessage,
     ) -> Result<(), S::Error> {
-        session.bus(msg)
+        self.with(|_, out| session.bus(msg, out))
     }
 
     /// Call `f` once with the current time and the sink: one step
@@ -349,7 +349,8 @@ mod tests {
         fn step(&mut self, _: Instant, _: &mut Events<'_>) -> Result<Activity, Stopped> {
             Ok(Activity::Idle)
         }
-        fn bus(&mut self, msg: &FrpMessage) -> Result<(), Stopped> {
+        fn bus(&mut self, msg: &FrpMessage, out: &mut Events<'_>) -> Result<(), Stopped> {
+            out.log(crate::driver::Level::Info, "heard");
             self.heard.push(msg.clone());
             Ok(())
         }
@@ -371,5 +372,6 @@ mod tests {
         assert_eq!(session.heard.len(), 1);
         assert_eq!(session.heard[0].from, "a1");
         assert!(matches!(session.heard[0].body, FrpBody::BusActor(_)));
+        assert!(matches!(&host.take()[..], [DeviceEvent::Log(_, line)] if line == "heard"));
     }
 }

@@ -230,7 +230,7 @@ impl FrpSession for FakeSession {
         }
         Ok(Activity::Active)
     }
-    fn hints(&mut self, hints: &TurnHints) -> Result<(), FakeError> {
+    fn hints(&mut self, hints: &TurnHints, _: &mut Events<'_>) -> Result<(), FakeError> {
         self.inner.hints.lock().unwrap().push(*hints);
         Ok(())
     }

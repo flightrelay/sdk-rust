@@ -318,36 +318,37 @@ pub trait FrpSession: Sized {
     /// rest; act only when a field differs from what the device has. The
     /// host calls this whenever the hints change. It records what was asked
     /// and reads no clock; anything timed happens in the next
-    /// [`step`](Self::step). The default ignores them.
+    /// [`step`](Self::step). What it has to say at once (a log line, an
+    /// alert) goes into `out`. The default ignores them.
     ///
     /// # Errors
     ///
     /// Returns what ended the session.
-    fn hints(&mut self, _hints: &TurnHints) -> Result<(), Self::Error> {
+    fn hints(&mut self, _hints: &TurnHints, _out: &mut Events<'_>) -> Result<(), Self::Error> {
         Ok(())
     }
 
     /// A bus message the host routes to this session: a finished shot, an
     /// actor's `bus.actor`, a `golfer.turn`. It records the message and reads
     /// no clock; anything timed happens in the next [`step`](Self::step).
-    /// Which messages a host routes is the host's choice. The default
-    /// ignores it.
+    /// Events go into `out`. Which messages a host routes is the host's
+    /// choice. The default ignores it.
     ///
     /// # Errors
     ///
     /// Returns what ended the session.
-    fn bus(&mut self, _msg: &FrpMessage) -> Result<(), Self::Error> {
+    fn bus(&mut self, _msg: &FrpMessage, _out: &mut Events<'_>) -> Result<(), Self::Error> {
         Ok(())
     }
 
     /// A device-specific operation. Like [`hints`](Self::hints), it reads no
-    /// clock; anything timed happens in the next [`step`](Self::step). The
-    /// default ignores it.
+    /// clock; anything timed happens in the next [`step`](Self::step), and
+    /// events go into `out`. The default ignores it.
     ///
     /// # Errors
     ///
     /// Returns what ended the session.
-    fn action(&mut self, _action: &Self::Action) -> Result<(), Self::Error> {
+    fn action(&mut self, _action: &Self::Action, _out: &mut Events<'_>) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -954,7 +955,9 @@ mod tests {
         );
         // `hints` and `action` default to ignoring what they are given.
         let mut session = PlainSession(DeviceIdentity::new("Plain-1"), ());
-        assert!(session.hints(&TurnHints::default()).is_ok());
+        let mut sink = |_| {};
+        let mut out = Events::new(&mut sink, &flags);
+        assert!(session.hints(&TurnHints::default(), &mut out).is_ok());
         driver.apply_config(&Nothing {});
     }
 
