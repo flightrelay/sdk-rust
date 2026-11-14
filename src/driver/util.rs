@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::ShotKey;
 use crate::rand::Rng;
@@ -14,6 +14,7 @@ use crate::rand::Rng;
 pub struct Stop(Arc<AtomicBool>);
 
 /// How often [`Stop::sleep`] looks at the flag.
+#[cfg(feature = "server")]
 const SLEEP_SLICE: Duration = Duration::from_millis(20);
 
 impl Stop {
@@ -44,14 +45,15 @@ impl Stop {
     /// Sleep for `duration`, waking early on a stop. Returns `true` when the
     /// full duration passed and `false` when a stop cut it short (or was
     /// already requested).
+    #[cfg(feature = "server")]
     #[must_use]
     pub(crate) fn sleep(&self, duration: Duration) -> bool {
-        let end = Instant::now() + duration;
+        let end = std::time::Instant::now() + duration;
         loop {
             if self.is_stopped() {
                 return false;
             }
-            let left = end.saturating_duration_since(Instant::now());
+            let left = end.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 return true;
             }
@@ -334,7 +336,8 @@ mod tests {
         other.stop();
         assert!(stop.is_stopped());
         assert!(stop.flag().load(Ordering::SeqCst));
-        assert!(!stop.sleep(secs(10)));
+        #[cfg(feature = "server")]
+        assert!(!stop.sleep(secs(10)), "a stopped token never sleeps");
     }
 
     #[test]
