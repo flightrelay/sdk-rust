@@ -1,93 +1,4 @@
 //! [`FrpServer`]: run a [`FrpDriver`] as a launch monitor actor on the bus.
-//!
-//! Requires the `server` feature. The server connects the driver, steps its
-//! session and publishes what the driver emits as one launch monitor actor,
-//! with the actor id the host gives it ([`ServerConfig::actor_id`]). It
-//! listens for peers (listen mode, a hub of its own) or dials one (bridge
-//! mode), and reconnects the driver with the driver's advised delay, so a
-//! host's `main` is a driver, a config and one call; `run` (feature `main`)
-//! is that `main`.
-//!
-//! # Threads
-//!
-//! The caller's thread is the device thread: [`connect`](FrpDriver::connect),
-//! [`step`](FrpSession::step), [`hints`](FrpSession::hints),
-//! [`close`](FrpSession::close) and the retry sleeps all run on it, so a
-//! session can be `!Send`. A network thread owns every connection, as a
-//! [`Hub`], so peers are served while a connect blocks. An acceptor thread
-//! obtains connections: it accepts in listen mode and dials, and redials, in
-//! bridge mode.
-//!
-//! # What the server does on the bus
-//!
-//! - On each new connection it sends the actor's `bus.actor`, then
-//!   `bus.sync`. It republishes `bus.actor` when it changes, every
-//!   [`ServerConfig::heartbeat`], and in answer to any `bus.sync`.
-//! - The `bus.actor` is [`DriverInfo::bus_actor`]: the driver's roles
-//!   (`launch_monitor` unless it says otherwise), the name
-//!   [`ServerConfig::name`] (else [`DriverInfo::actor_name`]: the
-//!   identified device's manufacturer and model, else
-//!   [`DriverInfo::name`]), and a `device` block: manufacturer, model and
-//!   firmware from the last session's identity, `source` from
-//!   [`DriverInfo::source`], and the battery and attitude the driver
-//!   reports. Its `blockers`, battery, attitude and telemetry are exactly
-//!   the driver's current [`DeviceStatus`]: a value the driver takes off
-//!   (`battery(None)`, a whole status without it) is off the next
-//!   `bus.actor`. Before the first session and whenever a session ends the
-//!   status is [`DeviceStatus::not_armed`]. The device's own id and card
-//!   label never go on the bus.
-//! - What the driver emits goes out under the actor id: `shot.*` messages
-//!   and `bus.alert`. A `shot.raw` is numbered per actor, across sessions,
-//!   and goes out only while [`ServerConfig::raw_frames`] is on; drivers
-//!   are asked not to build one otherwise, and one that arrives anyway is
-//!   dropped.
-//! - A `shot.finished` for every shot a lost session left open, and for any
-//!   shot still open after [`ServerConfig::shot_timeout`] (default
-//!   [`DEFAULT_SHOT_TIMEOUT`]).
-//! - Every message a peer sends is forwarded to every other peer, never back
-//!   to its source.
-//! - Each `golfer.turn` replaces all the hints ([`TurnHints::from_turn`]):
-//!   a `null` or unrecognized field is no hint for it, and nothing is
-//!   carried over from an earlier turn. Whenever the resulting hints change,
-//!   the session gets them through [`hints`](FrpSession::hints), and the
-//!   next connect through
-//!   [`ConnectCtx::hints`](crate::driver::ConnectCtx::hints). The hints of
-//!   the last complete turn stay when the session actor goes away.
-//! - A session is always closed when it ends: after an error, and on a
-//!   stop. On a stop the actor's removal (`bus.actor` with
-//!   `"removed": true`) then goes out.
-//!
-//! The launch monitor role owns no command, so the server answers none.
-//!
-//! A peer that stops reading is not disconnected while the kernel buffers
-//! it: the server queues its messages, and drops it only once the queue
-//! passes [`ServerConfig::write_buffer_limit`].
-//!
-//! The device thread and the network thread are joined by a bounded queue.
-//! When it is full, a `shot.raw` is dropped (debug data; `seq` is numbered
-//! on the network thread, after the queue, so the loss leaves no gap) and
-//! anything else waits briefly.
-//!
-//! In bridge mode the server dials its peer again whenever the link drops.
-//! A dial that fails is logged at [`Level::Info`] the first time and
-//! whenever the error changes, and at [`Level::Debug`] while the same error
-//! repeats. The target must be a `ws://` URL; `wss://` is refused when the
-//! server starts.
-//!
-//! ```no_run
-//! # use flightrelay::driver::{FrpDriver, Stop};
-//! # fn serve<D: FrpDriver>(driver: D) -> Result<(), Box<dyn std::error::Error>> {
-//! use flightrelay::{FrpServer, ServerConfig, Target};
-//!
-//! // Generated once with `flightrelay::new_actor_id()` and kept by the host.
-//! let actor_id = "7d2f9a41c03be856";
-//! let config = ServerConfig::new(Target::listen("0.0.0.0:5880"), actor_id);
-//! let stop = Stop::new();
-//! FrpServer::new(driver, config)
-//!     .on_event(|event| eprintln!("{event:?}"))
-//!     .run(&stop)?;
-//! # Ok(()) }
-//! ```
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -245,8 +156,96 @@ pub enum ServerError<E: Error + 'static> {
 
 type Observer = Box<dyn FnMut(&ServerEvent<'_>)>;
 
-/// Runs a driver as a launch monitor actor on the bus. See the
-/// [module docs](self).
+/// Runs a driver as a launch monitor actor on the bus.
+///
+/// Requires the `server` feature. The server connects the driver, steps its
+/// session and publishes what the driver emits as one launch monitor actor,
+/// with the actor id the host gives it ([`ServerConfig::actor_id`]). It
+/// listens for peers (listen mode, a hub of its own) or dials one (bridge
+/// mode), and reconnects the driver with the driver's advised delay, so a
+/// host's `main` is a driver, a config and one call; `run` (feature `main`)
+/// is that `main`.
+///
+/// # Threads
+///
+/// The caller's thread is the device thread: [`connect`](FrpDriver::connect),
+/// [`step`](FrpSession::step), [`hints`](FrpSession::hints),
+/// [`close`](FrpSession::close) and the retry sleeps all run on it, so a
+/// session can be `!Send`. A network thread owns every connection, as a
+/// [`Hub`], so peers are served while a connect blocks. An acceptor thread
+/// obtains connections: it accepts in listen mode and dials, and redials, in
+/// bridge mode.
+///
+/// # What the server does on the bus
+///
+/// - On each new connection it sends the actor's `bus.actor`, then
+///   `bus.sync`. It republishes `bus.actor` when it changes, every
+///   [`ServerConfig::heartbeat`], and in answer to any `bus.sync`.
+/// - The `bus.actor` is [`DriverInfo::bus_actor`]: the driver's roles
+///   (`launch_monitor` unless it says otherwise), the name
+///   [`ServerConfig::name`] (else [`DriverInfo::actor_name`]: the
+///   identified device's manufacturer and model, else
+///   [`DriverInfo::name`]), and a `device` block: manufacturer, model and
+///   firmware from the last session's identity, `source` from
+///   [`DriverInfo::source`], and the battery and attitude the driver
+///   reports. Its `blockers`, battery, attitude and telemetry are exactly
+///   the driver's current [`DeviceStatus`]: a value the driver takes off
+///   (`battery(None)`, a whole status without it) is off the next
+///   `bus.actor`. Before the first session and whenever a session ends the
+///   status is [`DeviceStatus::not_armed`]. The device's own id and card
+///   label never go on the bus.
+/// - What the driver emits goes out under the actor id: `shot.*` messages
+///   and `bus.alert`. A `shot.raw` is numbered per actor, across sessions,
+///   and goes out only while [`ServerConfig::raw_frames`] is on; drivers
+///   are asked not to build one otherwise, and one that arrives anyway is
+///   dropped.
+/// - A `shot.finished` for every shot a lost session left open, and for any
+///   shot still open after [`ServerConfig::shot_timeout`] (default
+///   [`DEFAULT_SHOT_TIMEOUT`]).
+/// - Every message a peer sends is forwarded to every other peer, never back
+///   to its source.
+/// - Each `golfer.turn` replaces all the hints ([`TurnHints::from_turn`]):
+///   a `null` or unrecognized field is no hint for it, and nothing is
+///   carried over from an earlier turn. Whenever the resulting hints change,
+///   the session gets them through [`hints`](FrpSession::hints), and the
+///   next connect through
+///   [`ConnectCtx::hints`](crate::driver::ConnectCtx::hints). The hints of
+///   the last complete turn stay when the session actor goes away.
+/// - A session is always closed when it ends: after an error, and on a
+///   stop. On a stop the actor's removal (`bus.actor` with
+///   `"removed": true`) then goes out.
+///
+/// The launch monitor role owns no command, so the server answers none.
+///
+/// A peer that stops reading is not disconnected while the kernel buffers
+/// it: the server queues its messages, and drops it only once the queue
+/// passes [`ServerConfig::write_buffer_limit`].
+///
+/// The device thread and the network thread are joined by a bounded queue.
+/// When it is full, a `shot.raw` is dropped (debug data; `seq` is numbered
+/// on the network thread, after the queue, so the loss leaves no gap) and
+/// anything else waits briefly.
+///
+/// In bridge mode the server dials its peer again whenever the link drops.
+/// A dial that fails is logged at [`Level::Info`] the first time and
+/// whenever the error changes, and at [`Level::Debug`] while the same error
+/// repeats. The target must be a `ws://` URL; `wss://` is refused when the
+/// server starts.
+///
+/// ```no_run
+/// # use flightrelay::driver::{FrpDriver, Stop};
+/// # fn serve<D: FrpDriver>(driver: D) -> Result<(), Box<dyn std::error::Error>> {
+/// use flightrelay::{FrpServer, ServerConfig, Target};
+///
+/// // Generated once with `flightrelay::new_actor_id()` and kept by the host.
+/// let actor_id = "7d2f9a41c03be856";
+/// let config = ServerConfig::new(Target::listen("0.0.0.0:5880"), actor_id);
+/// let stop = Stop::new();
+/// FrpServer::new(driver, config)
+///     .on_event(|event| eprintln!("{event:?}"))
+///     .run(&stop)?;
+/// # Ok(()) }
+/// ```
 pub struct FrpServer<D: FrpDriver> {
     driver: D,
     config: ServerConfig,

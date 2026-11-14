@@ -1,28 +1,4 @@
-//! [`BusState`]: the current state of the bus, for collectors and UIs.
-//!
-//! Requires the `collector` feature. Feed it every message; it keeps the
-//! newest state message for each (kind, from, id), applies removals, and
-//! forgets everything from an actor whose `bus.actor` it has not heard for
-//! three heartbeats. Occurrences and commands pass through untouched.
-//!
-//! An actor has a heartbeat clock once its `bus.actor` arrives with a
-//! positive `heartbeat`. State from an actor with no clock (no `bus.actor`
-//! heard yet, or one whose `heartbeat` is zero, negative or not a number)
-//! never expires: it is kept until it is removed, the actor's `bus.actor`
-//! is removed, [`BusState::forget_actor`] is called, or the actor sends a
-//! `bus.actor` with a positive `heartbeat`, which starts its clock.
-//!
-//! ```
-//! use flightrelay::{BusActor, BusState, FrpMessage, Removal, StateKind};
-//!
-//! let mut bus = BusState::new();
-//! let actor = FrpMessage::new("7d2f9a41c03be856", BusActor::new("Eagle One X4K2", 2.0));
-//! assert!(bus.apply(&actor));
-//! assert!(!bus.apply(&actor), "a heartbeat changes nothing");
-//! assert_eq!(bus.actor("7d2f9a41c03be856").map(|a| a.name.as_str()), Some("Eagle One X4K2"));
-//! bus.apply(&FrpMessage::new("7d2f9a41c03be856", Removal::of(StateKind::BusActor)));
-//! assert!(bus.is_empty());
-//! ```
+//! [`BusState`]: the current state of the bus.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -31,7 +7,31 @@ use crate::MISSED_HEARTBEATS;
 use crate::kinds::BusActor;
 use crate::message::{FrpBody, FrpMessage, StateKey, StateKind};
 
-/// The current state of the bus. See the [module docs](self).
+/// The current state of the bus, for collectors and UIs.
+///
+/// Requires the `collector` feature. Feed it every message; it keeps the
+/// newest state message for each (kind, from, id), applies removals, and
+/// forgets everything from an actor whose `bus.actor` it has not heard for
+/// three heartbeats. Occurrences and commands pass through untouched.
+///
+/// An actor has a heartbeat clock once its `bus.actor` arrives with a
+/// positive `heartbeat`. State from an actor with no clock (no `bus.actor`
+/// heard yet, or one whose `heartbeat` is zero, negative or not a number)
+/// never expires: it is kept until it is removed, the actor's `bus.actor`
+/// is removed, [`BusState::forget_actor`] is called, or the actor sends a
+/// `bus.actor` with a positive `heartbeat`, which starts its clock.
+///
+/// ```
+/// use flightrelay::{BusActor, BusState, FrpMessage, Removal, StateKind};
+///
+/// let mut bus = BusState::new();
+/// let actor = FrpMessage::new("7d2f9a41c03be856", BusActor::new("Eagle One X4K2", 2.0));
+/// assert!(bus.apply(&actor));
+/// assert!(!bus.apply(&actor), "a heartbeat changes nothing");
+/// assert_eq!(bus.actor("7d2f9a41c03be856").map(|a| a.name.as_str()), Some("Eagle One X4K2"));
+/// bus.apply(&FrpMessage::new("7d2f9a41c03be856", Removal::of(StateKind::BusActor)));
+/// assert!(bus.is_empty());
+/// ```
 #[derive(Debug, Default)]
 pub struct BusState {
     states: BTreeMap<StateKey, FrpMessage>,
@@ -80,10 +80,9 @@ impl BusState {
 
     /// Forgets every actor whose `bus.actor` has not been heard for three of
     /// its heartbeats, with all its state, and returns their ids. An actor
-    /// with no heartbeat clock (see the [module docs](self)) is never
-    /// forgotten here. Call it
-    /// regularly, e.g. once a second, and pass each id to anything else that
-    /// keeps per-actor state (such as
+    /// with no heartbeat clock (see [`BusState`]) is never forgotten here.
+    /// Call it regularly, e.g. once a second, and pass each id to anything
+    /// else that keeps per-actor state (such as
     /// [`ShotAccumulator::forget_actor`](crate::ShotAccumulator::forget_actor)).
     pub fn expire(&mut self) -> Vec<String> {
         self.expire_at(Instant::now())

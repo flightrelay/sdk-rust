@@ -27,6 +27,23 @@
 //! forget all its state. An actor id is a random string generated once by
 //! the host that runs the actor and kept across restarts ([`new_actor_id`]).
 //!
+//! # Message types
+//!
+//! Each kind has one Rust type ([`ShotLaunch`], [`GolferTurn`], …) that
+//! holds the kind's own fields; the envelope fields `kind` and `from` live on
+//! [`FrpMessage`]. Optional fields are left out on the wire while `None`. A
+//! field that is required but may be `null` (e.g. `golfer.turn` `club`) is
+//! an `Option` that writes `null` for `None`. A field that may be absent,
+//! `null` or a value (e.g. `golfer.select` `club`) is an `Option<Option<_>>`:
+//! `None` absent, `Some(None)` null.
+//!
+//! Where a field holds a value from a closed set (a club code, handedness,
+//! mode, sex, a reply error, a match result) or a golfer id, a value that is
+//! not recognized reads as absent and the rest of the message still applies.
+//! Unknown fields are ignored. Distances and velocities are unit-tagged
+//! strings on the wire (`"67.2mps"`, `"180.5m"`), read as [`Distance`] and
+//! [`Velocity`].
+//!
 //! # Features
 //!
 //! - **`collector`** — `ShotAccumulator`, which composes a shot from its
@@ -136,23 +153,23 @@ mod lenient;
 mod net;
 mod rand;
 
-pub mod error;
-pub mod kinds;
-pub mod message;
+mod error;
+mod kinds;
+mod message;
 pub mod types;
-pub mod units;
+mod units;
 
 #[cfg(feature = "collector")]
-pub mod accumulator;
+mod accumulator;
 
 #[cfg(feature = "collector")]
-pub mod bus;
+mod bus;
 
 #[cfg(feature = "transport")]
-pub mod endpoint;
+mod endpoint;
 
 #[cfg(feature = "transport")]
-pub mod hub;
+mod hub;
 
 #[cfg(feature = "config")]
 pub mod config;
@@ -161,7 +178,7 @@ pub mod config;
 pub mod driver;
 
 #[cfg(feature = "server")]
-pub mod server;
+mod server;
 
 #[cfg(feature = "mock")]
 pub mod mock;
@@ -179,7 +196,7 @@ pub use kinds::{
     RoundPlayer, RoundStatus, ShotClub, ShotFinished, ShotFlight, ShotImpact, ShotLaunch,
     ShotTrigger, StrokeOutcome,
 };
-pub use message::{Class, FrpBody, FrpMessage, Removal, StateKey, StateKind, UnknownBody};
+pub use message::{Class, FrpBody, FrpMessage, KINDS, Removal, StateKey, StateKind, UnknownBody};
 pub use types::{
     AssumedLaunch, Basis, Club, ClubData, FaceImpact, FlightResult, GolferId, Handedness,
     InvalidGolferId, InvalidUnitValue, Launch, Mode, Position, RawDir, RawFrame, Severity, Sex,
@@ -194,7 +211,9 @@ pub use accumulator::{CompletedShot, Flight, LateMessage, ShotAccumulator, ShotE
 pub use bus::BusState;
 
 #[cfg(feature = "transport")]
-pub use endpoint::{EndpointConfig, FrpConnection, FrpEndpoint, Target};
+pub use endpoint::{
+    DEFAULT_WRITE_BUFFER_LIMIT, EndpointConfig, FrpConnection, FrpEndpoint, Target,
+};
 
 #[cfg(feature = "transport")]
 pub use hub::{Hub, HubEvent, PeerId};

@@ -1,16 +1,4 @@
-//! One Rust type per FRP message kind.
-//!
-//! Each type holds the kind's own fields; the envelope fields `kind` and
-//! `from` live on [`FrpMessage`](crate::FrpMessage). Optional fields are left
-//! out on the wire while `None`. A field that is required but may be `null`
-//! (e.g. `golfer.turn` `club`) is an `Option` that writes `null` for `None`.
-//! A field that may be absent, `null` or a value (e.g. `golfer.select`
-//! `club`) is an `Option<Option<_>>`: `None` absent, `Some(None)` null.
-//!
-//! Where a field holds a value from a closed set (a club code, handedness,
-//! mode, sex, a reply error, a match result) or a golfer id, a value that is
-//! not recognized reads as absent and the rest of the message still applies.
-//! Unknown fields are ignored.
+//! One Rust type per FRP message kind; see the crate docs.
 
 #![allow(clippy::option_option)] // absent, null and a value are three different things on the wire
 

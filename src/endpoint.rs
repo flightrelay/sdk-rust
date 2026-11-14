@@ -1,32 +1,4 @@
 //! The WebSocket binding of FRP.
-//!
-//! Requires the `transport` feature. One message per text frame; the default
-//! URL is `ws://localhost:5880/frp`. There is no handshake beyond the
-//! WebSocket upgrade: on connecting, each side sends `bus.actor` for each
-//! actor it hosts, then the state those actors own, then `bus.sync`
-//! ([`FrpConnection::greet`]).
-//!
-//! Either side may open the socket. [`Target`] picks whether an endpoint
-//! listens or dials; once connected, both sides are peers on the bus.
-//!
-//! An actor that stays connected republishes its `bus.actor` every heartbeat
-//! and in answer to `bus.sync`; [`FrpConnection::recv_timeout`] lets one
-//! blocking loop do that between messages (see the collector loop in the
-//! [crate docs](crate#a-collector)).
-//!
-//! ```no_run
-//! use flightrelay::{BusActor, EndpointConfig, FrpEndpoint, FrpMessage, Target};
-//!
-//! let mut ep = FrpEndpoint::open(EndpointConfig::new(Target::connect("ws://hub:5880/frp")))?;
-//! let mut conn = ep.establish()?;
-//! let me = FrpMessage::new("e4a7136b9f02cd58", BusActor::new("Fairway Physics", 2.0));
-//! conn.greet(&[me], &[])?; // `bus.actor`, no state of its own, then `bus.sync`
-//! loop {
-//!     let msg = conn.recv()?;
-//!     println!("{} from {}", msg.kind(), msg.from);
-//! }
-//! # Ok::<(), flightrelay::FrpError>(())
-//! ```
 
 use std::fmt;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -128,7 +100,36 @@ impl EndpointConfig {
     }
 }
 
-/// A way of obtaining FRP connections: a listener, or a URL to dial.
+/// A way of obtaining FRP connections: a listener, or a URL to dial. The
+/// WebSocket binding of FRP.
+///
+/// Requires the `transport` feature. One message per text frame; the default
+/// URL is `ws://localhost:5880/frp`. There is no handshake beyond the
+/// WebSocket upgrade: on connecting, each side sends `bus.actor` for each
+/// actor it hosts, then the state those actors own, then `bus.sync`
+/// ([`FrpConnection::greet`]).
+///
+/// Either side may open the socket. [`Target`] picks whether an endpoint
+/// listens or dials; once connected, both sides are peers on the bus.
+///
+/// An actor that stays connected republishes its `bus.actor` every heartbeat
+/// and in answer to `bus.sync`; [`FrpConnection::recv_timeout`] lets one
+/// blocking loop do that between messages (see the collector loop in the
+/// [crate docs](crate#a-collector)).
+///
+/// ```no_run
+/// use flightrelay::{BusActor, EndpointConfig, FrpEndpoint, FrpMessage, Target};
+///
+/// let mut ep = FrpEndpoint::open(EndpointConfig::new(Target::connect("ws://hub:5880/frp")))?;
+/// let mut conn = ep.establish()?;
+/// let me = FrpMessage::new("e4a7136b9f02cd58", BusActor::new("Fairway Physics", 2.0));
+/// conn.greet(&[me], &[])?; // `bus.actor`, no state of its own, then `bus.sync`
+/// loop {
+///     let msg = conn.recv()?;
+///     println!("{} from {}", msg.kind(), msg.from);
+/// }
+/// # Ok::<(), flightrelay::FrpError>(())
+/// ```
 ///
 /// An endpoint is long-lived and outlives the connections it produces. Call
 /// [`establish`](Self::establish) again to reconnect — the caller owns any

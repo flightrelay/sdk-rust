@@ -1,36 +1,4 @@
 //! Shot accumulator for collectors.
-//!
-//! Requires the `collector` feature. [`ShotAccumulator`] composes a shot
-//! from its `shot.*` messages and yields it when `shot.finished` arrives.
-//!
-//! - A shot is identified by `key.shot_id` alone: its messages are
-//!   accumulated whoever sent them. `shot.trigger` opens it; the actor that
-//!   sent the trigger is the shot's [`from`](CompletedShot::from), and only
-//!   that actor's `shot.finished` finishes it (one from any other actor is
-//!   ignored).
-//! - A shot keeps the first `shot.launch`, `shot.club` and `shot.impact` it
-//!   receives, and every `shot.flight`, in the order they arrive; each
-//!   [`Flight`] records its sender, and its flight result its model.
-//! - A shot carries the [`Source`] its launch monitor declares in the
-//!   `device` block of its `bus.actor`, the `golfer.turn` current when its
-//!   trigger arrived, and the open `practice.block` of that turn's golfer.
-//! - A finished shot is remembered for one timeout after it finished, and a
-//!   message for it is attached while it is. A message from the shot's own
-//!   launch monitor (the actor that sent its `shot.finished`) is out of order
-//!   and yields a [`ShotEvent::Late`] for the caller to log as a warning. A
-//!   message from any other actor, such as a flight model's `shot.flight`,
-//!   is an addendum: when it changed the shot (a flight, or a launch, club or
-//!   impact the shot did not have yet) it yields a [`ShotEvent::Updated`]
-//!   with the updated shot; one that changed nothing yields nothing. A
-//!   message for a finished shot no longer remembered is ignored.
-//! - A shot that has not finished within the accumulator timeout
-//!   ([`DEFAULT_SHOT_TIMEOUT`] unless set with
-//!   [`ShotAccumulator::with_timeout`]) is discarded, and its messages are
-//!   ignored for one more timeout, so a late message never starts a new
-//!   partial shot. The open shots of an actor that is gone
-//!   ([`ShotAccumulator::forget_actor`], or its `bus.actor` removal) are
-//!   discarded the same way.
-//! - `shot.raw` is not part of a shot, even with a key.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -214,8 +182,37 @@ struct InProgress {
     started: Instant,
 }
 
-/// Composes shots from `shot.*` messages, keyed by `shot_id`. See the
-/// [module docs](self).
+/// Composes shots from `shot.*` messages, keyed by `shot_id`, and yields
+/// each when `shot.finished` arrives. Requires the `collector` feature.
+///
+/// - A shot is identified by `key.shot_id` alone: its messages are
+///   accumulated whoever sent them. `shot.trigger` opens it; the actor that
+///   sent the trigger is the shot's [`from`](CompletedShot::from), and only
+///   that actor's `shot.finished` finishes it (one from any other actor is
+///   ignored).
+/// - A shot keeps the first `shot.launch`, `shot.club` and `shot.impact` it
+///   receives, and every `shot.flight`, in the order they arrive; each
+///   [`Flight`] records its sender, and its flight result its model.
+/// - A shot carries the [`Source`] its launch monitor declares in the
+///   `device` block of its `bus.actor`, the `golfer.turn` current when its
+///   trigger arrived, and the open `practice.block` of that turn's golfer.
+/// - A finished shot is remembered for one timeout after it finished, and a
+///   message for it is attached while it is. A message from the shot's own
+///   launch monitor (the actor that sent its `shot.finished`) is out of order
+///   and yields a [`ShotEvent::Late`] for the caller to log as a warning. A
+///   message from any other actor, such as a flight model's `shot.flight`,
+///   is an addendum: when it changed the shot (a flight, or a launch, club or
+///   impact the shot did not have yet) it yields a [`ShotEvent::Updated`]
+///   with the updated shot; one that changed nothing yields nothing. A
+///   message for a finished shot no longer remembered is ignored.
+/// - A shot that has not finished within the accumulator timeout
+///   ([`DEFAULT_SHOT_TIMEOUT`] unless set with
+///   [`ShotAccumulator::with_timeout`]) is discarded, and its messages are
+///   ignored for one more timeout, so a late message never starts a new
+///   partial shot. The open shots of an actor that is gone
+///   ([`ShotAccumulator::forget_actor`], or its `bus.actor` removal) are
+///   discarded the same way.
+/// - `shot.raw` is not part of a shot, even with a key.
 ///
 /// Feed every message with [`feed`](Self::feed). Besides shot messages it
 /// reads `bus.actor` (each launch monitor's source), `golfer.turn` and
