@@ -367,8 +367,9 @@ pub struct Stopped;
 pub enum NoAction {}
 
 /// How a session ended, as [`FrpDriver::retry_delay`] sees it. A host
-/// builds it with a struct literal.
+/// builds it with [`new`](Self::new).
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct SessionEnd<'a, E> {
     /// What ended the session or failed the connect; `None` after a clean
     /// stop.
@@ -379,6 +380,19 @@ pub struct SessionEnd<'a, E> {
     /// Failed connects since the last session that connected, this one
     /// included; 0 right after a session that did connect.
     pub attempts: u32,
+}
+
+impl<'a, E> SessionEnd<'a, E> {
+    /// How a session ended: its `error`, how long it was `connected_for`,
+    /// and the failed connect `attempts` (see the fields).
+    #[must_use]
+    pub const fn new(error: Option<&'a E>, connected_for: Option<Duration>, attempts: u32) -> Self {
+        Self {
+            error,
+            connected_for,
+            attempts,
+        }
+    }
 }
 
 /// The host side of a connect: what [`ConnectCtx`] asks of it.
@@ -1149,11 +1163,7 @@ mod tests {
         let mut backoff = Backoff::default();
         let mut out = Events::new(&mut sink, &flags);
         let boom = Oops("boom");
-        let failed = |attempts| SessionEnd {
-            error: Some(&boom),
-            connected_for: None,
-            attempts,
-        };
+        let failed = |attempts| SessionEnd::new(Some(&boom), None, attempts);
         assert_eq!(
             driver.retry_delay(&failed(1), &mut backoff, &mut out),
             Some(Duration::from_secs(1))

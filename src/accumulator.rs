@@ -43,6 +43,7 @@ use crate::types::{Basis, ClubData, FaceImpact, FlightResult, Launch, ShotKey, S
 
 /// A shot with all the data its messages carried.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CompletedShot {
     /// The actor that sent `shot.trigger`: the launch monitor that saw the
     /// strike.
@@ -83,6 +84,24 @@ pub struct Flight {
 }
 
 impl CompletedShot {
+    /// A shot `key` triggered by `from`, with no data yet: every other field
+    /// empty. For tests of code that reads shots.
+    #[must_use]
+    pub fn new(from: impl Into<String>, key: ShotKey) -> Self {
+        Self {
+            from: from.into(),
+            key,
+            timestamp: None,
+            launch: None,
+            club: None,
+            impact: None,
+            flights: Vec::new(),
+            source: None,
+            turn: None,
+            block: None,
+        }
+    }
+
     /// The flight result to show: the first [`Tracked`](Basis::Tracked) one,
     /// else the first from the shot's launch monitor, else the first.
     #[must_use]
@@ -169,6 +188,7 @@ pub enum ShotEvent {
 /// A shot message that the shot's launch monitor sent after its own
 /// `shot.finished` for the shot. Its `Display` is a warning line.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct LateMessage {
     /// The sender of the late message: the shot's launch monitor.
     pub from: String,
@@ -364,16 +384,11 @@ impl ShotAccumulator {
             .find(|(_, b)| b.golfer.as_ref() == golfer)
             .map(|(_, b)| b.id.clone());
         CompletedShot {
-            from: from.to_owned(),
-            key,
             timestamp,
-            launch: None,
-            club: None,
-            impact: None,
-            flights: Vec::new(),
             source: self.source(from),
             turn,
             block,
+            ..CompletedShot::new(from, key)
         }
     }
 

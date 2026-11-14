@@ -19,14 +19,12 @@ const COLLECTOR: &str = "c19e04b7a2d5f318";
 
 #[test]
 fn a_collector_receives_complete_virtual_shots_from_the_mock() {
-    let driver = MockDriver::new(MockConfig {
-        shot_interval_s: 0.05,
-        arm_delay_s: 0.02,
-        ball_ready_delay_s: 0.02,
-        post_shot_delay_s: 0.02,
-        ..MockConfig::default()
-    })
-    .expect("config");
+    let mut config = MockConfig::default();
+    config.shot_interval_s = 0.05;
+    config.arm_delay_s = 0.02;
+    config.ball_ready_delay_s = 0.02;
+    config.post_shot_delay_s = 0.02;
+    let driver = MockDriver::new(config).expect("config");
     let stop = Stop::new();
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     let server_stop = stop.clone();

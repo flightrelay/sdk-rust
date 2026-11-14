@@ -72,7 +72,9 @@ use crate::{FrpBody, FrpServer, ServerConfig, ServerEvent, Target};
 /// The table of the config file that holds the runner's own settings.
 const RUNNER_TABLE: &str = "frp";
 
-/// What differs between binaries that run on [`run`].
+/// What differs between binaries that run on [`run`]. Start from
+/// [`RunOptions::default`] and set the fields that differ.
+#[non_exhaustive]
 pub struct RunOptions<D: FrpDriver> {
     /// The config the file and `--set` flags apply over. Default:
     /// `D::Config::default`.

@@ -69,6 +69,7 @@ impl Target {
 
 /// Configuration for an [`FrpEndpoint`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EndpointConfig {
     /// Where this endpoint listens, or whom it dials.
     pub target: Target,

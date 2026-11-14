@@ -29,7 +29,9 @@
 //! use flightrelay::Source;
 //!
 //! // A shot every 5 seconds, for a demo.
-//! let driver = MockDriver::new(MockConfig { shot_interval_s: 5.0, ..MockConfig::default() })?;
+//! let mut config = MockConfig::default();
+//! config.shot_interval_s = 5.0;
+//! let driver = MockDriver::new(config)?;
 //! assert_eq!(MockDriver::info(driver.config()).source, Source::Virtual);
 //! # Ok::<(), flightrelay::config::ConfigError>(())
 //! ```
@@ -60,6 +62,7 @@ const MAX_DELAY_S: f64 = 86_400.0;
 /// Settings of the [`MockDriver`]. All delays are in seconds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct MockConfig {
     /// Time from the ball being ready to the shot. Default 30.
     #[serde(skip_serializing_if = "is_default_interval")]

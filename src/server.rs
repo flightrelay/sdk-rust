@@ -479,11 +479,7 @@ impl<D: FrpDriver> FrpServer<D> {
                 break Err(ServerError::Network);
             }
             let delay = driver.retry_delay(
-                &SessionEnd {
-                    error: error.as_ref(),
-                    connected_for,
-                    attempts,
-                },
+                &SessionEnd::new(error.as_ref(), connected_for, attempts),
                 &mut backoff,
                 &mut Events::new(&mut sink, &flags),
             );
