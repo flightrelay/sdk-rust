@@ -271,6 +271,7 @@ impl BusReply {
 /// Why an owner refused a command, on [`BusReply::error`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ReplyError {
     /// Invalid fields.
     BadRequest,
@@ -640,6 +641,7 @@ pub struct GameRound {
 /// [`GameRound::status`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RoundStatus {
     /// The round is loading.
     Loading,
@@ -654,6 +656,7 @@ pub enum RoundStatus {
 /// [`GameRound::end_reason`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum EndReason {
     /// Every hole was played.
     Completed,
@@ -783,6 +786,7 @@ pub struct HoleScore {
 /// [`HoleScore::result`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MatchResult {
     /// The hole was won.
     Won,
@@ -902,6 +906,7 @@ fn is_zero(v: &u32) -> bool {
 /// [`GameStroke::outcome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StrokeOutcome {
     /// In play.
     InPlay,
@@ -944,6 +949,7 @@ pub struct GameAim {
 /// [`GameAim::action`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AimAction {
     /// Turn the aim by `degrees`.
     Nudge,

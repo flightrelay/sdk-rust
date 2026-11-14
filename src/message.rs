@@ -197,6 +197,7 @@ macro_rules! bodies {
         // gap between variants costs nothing.
         #[allow(clippy::large_enum_variant)]
         #[derive(Debug, Clone, PartialEq)]
+        #[non_exhaustive]
         pub enum FrpBody {
             $( $(#[$doc])* $variant($ty), )*
             /// The removal of a state: the owner's last message for it, with
@@ -378,6 +379,7 @@ impl FrpBody {
 
 /// The message classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Class {
     /// A complete object its owner republishes on change, at start and in
     /// answer to `bus.sync`. The newest replaces the older one.
@@ -391,6 +393,7 @@ pub enum Class {
 
 /// The state kinds: the kinds a [`Removal`] can remove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum StateKind {
     /// `bus.actor`.
     BusActor,

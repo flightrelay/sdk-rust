@@ -151,6 +151,7 @@ impl CompletedShot {
 
 /// What feeding a message produced.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ShotEvent {
     /// `shot.finished` arrived for a shot in progress.
     Finished(CompletedShot),

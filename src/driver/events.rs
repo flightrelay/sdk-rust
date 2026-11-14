@@ -12,6 +12,7 @@ use crate::{
 
 /// Log severity of a [`DeviceEvent::Log`] line, lowest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Level {
     /// Wire-level detail, e.g. the hex of a frame.
     Trace,

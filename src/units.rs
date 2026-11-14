@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 /// A distance value with unit. Serializes as a suffix string: `"1.5in"`,
 /// `"9ft"`, `"3m"`, `"30cm"`, `"100yd"`, `"42mm"`.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum Distance {
     Feet(f64),
     Inches(f64),
@@ -170,6 +171,7 @@ impl fmt::Display for Distance {
 /// A velocity value with unit. Serializes as a suffix string: `"67.2mps"`,
 /// `"150.3mph"`, `"108.0kph"`, `"100.0fps"`.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum Velocity {
     MilesPerHour(f64),
     FeetPerSecond(f64),

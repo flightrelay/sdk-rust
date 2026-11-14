@@ -62,6 +62,7 @@ impl fmt::Display for PeerId {
 // the small variants costs nothing; boxing would only complicate matching.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum HubEvent {
     /// A message arrived on `peer` and was forwarded to every other
     /// connection.

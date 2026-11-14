@@ -220,6 +220,7 @@ fn a_hub_forwards_to_every_other_peer_and_never_back() {
                 HubEvent::Message { peer, message } => format!("{peer}: {}", message.kind()),
                 HubEvent::Invalid { peer, .. } => format!("{peer}: invalid"),
                 HubEvent::Left { peer, .. } => format!("{peer}: left"),
+                other => format!("{other:?}"),
             });
         }
     }
@@ -346,7 +347,7 @@ impl Tally {
                     assert_eq!(peer, pa, "only the stalled peer is dropped");
                     self.left = Some(peer);
                 }
-                HubEvent::Invalid { .. } => panic!("everything sent is FRP"),
+                other => panic!("everything sent is FRP: {other:?}"),
             }
         }
     }

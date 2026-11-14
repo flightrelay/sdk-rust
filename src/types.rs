@@ -516,6 +516,7 @@ mod hex {
 /// Alert severity level, on `bus.alert`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Severity {
     /// Something went wrong that the sender handled.
     Warn,
@@ -565,6 +566,7 @@ impl fmt::Display for Source {
 /// `golfer.select`. A launch monitor may tune its detection to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Mode {
     /// A full swing.
     Full,
@@ -607,6 +609,7 @@ impl fmt::Display for Handedness {
 /// A golfer's sex on `golfer.profile`, for published norms that depend on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Sex {
     /// `"male"`.
     Male,

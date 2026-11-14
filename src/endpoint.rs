@@ -44,6 +44,7 @@ use crate::message::FrpMessage;
 
 /// How this endpoint obtains a WebSocket connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Transport {
     /// Bind a TCP listener and accept incoming connections.
     Listen(String),
