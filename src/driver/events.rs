@@ -295,16 +295,6 @@ impl<'a> Events<'a> {
         Self { sink, flags }
     }
 
-    /// A shorter-lived sink over the same closure and flags, to hand to a
-    /// callee while this one stays usable afterwards.
-    #[must_use]
-    pub fn reborrow(&mut self) -> Events<'_> {
-        Events {
-            sink: &mut *self.sink,
-            flags: self.flags,
-        }
-    }
-
     /// Push any event.
     pub fn emit(&mut self, event: DeviceEvent) {
         (self.sink)(event);

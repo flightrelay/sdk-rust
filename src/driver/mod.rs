@@ -157,7 +157,7 @@ use std::time::{Duration, Instant};
 
 pub use crate::config::{ConfigError, DriverConfig};
 pub use events::{DeviceEvent, DeviceStatus, Events, HostFlags, Level, StatusChange};
-pub use util::{Backoff, Live, STABLE_SESSION, ShotIds, Stop, connect_tcp};
+pub use util::{Backoff, Live, STABLE_SESSION, ShotIds, Stop};
 
 use crate::types::roles;
 use crate::{Club, FrpMessage, GolferTurn, Handedness, Mode, RawFrame, Source};
@@ -458,8 +458,10 @@ impl<'a> ConnectCtx<'a> {
         }
     }
 
-    /// [`connect_tcp`] that keeps ticking while it waits. The outer error is
-    /// a stop; the inner one is the connect failing.
+    /// Connect to `addr` within `timeout`, ticking while it waits. The
+    /// connect runs on a thread of its own; one that completes after a stop
+    /// is closed at once. The outer error is a stop; the inner one is the
+    /// connect failing.
     ///
     /// # Errors
     ///

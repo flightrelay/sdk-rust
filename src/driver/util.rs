@@ -1,7 +1,6 @@
 //! Small helpers every driver host and driver shares: [`Stop`], [`Backoff`],
-//! [`Live`], [`ShotIds`] and [`connect_tcp`].
+//! [`Live`] and [`ShotIds`].
 
-use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -46,7 +45,7 @@ impl Stop {
     /// full duration passed and `false` when a stop cut it short (or was
     /// already requested).
     #[must_use]
-    pub fn sleep(&self, duration: Duration) -> bool {
+    pub(crate) fn sleep(&self, duration: Duration) -> bool {
         let end = Instant::now() + duration;
         loop {
             if self.is_stopped() {
@@ -238,21 +237,6 @@ fn uuid_string(b: &[u8; 16]) -> String {
     s
 }
 
-/// Connect to `addr` within `timeout`, giving up as soon as `stop` is
-/// requested: `Ok(None)`. The connect runs on a thread of its own; one that
-/// completes after the caller gave up closes the connection at once.
-///
-/// # Errors
-///
-/// Returns the connect error, e.g. a refusal or the timeout.
-pub fn connect_tcp(
-    addr: SocketAddr,
-    timeout: Duration,
-    stop: &Stop,
-) -> std::io::Result<Option<TcpStream>> {
-    crate::net::connect_cancelable(addr, timeout, || !stop.is_stopped())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,22 +327,14 @@ mod tests {
     }
 
     #[test]
-    fn stop_is_shared_by_clones_and_cuts_a_sleep_short() {
+    fn stop_is_shared_by_clones_and_a_stopped_token_never_sleeps() {
         let stop = Stop::new();
-        assert!(!stop.is_stopped());
-        assert!(stop.sleep(Duration::from_millis(10)));
         let other = stop.clone();
-        let at = Instant::now();
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
-            other.stop();
-        });
-        assert!(!stop.sleep(secs(10)));
-        assert!(at.elapsed() < secs(2));
+        assert!(!stop.is_stopped());
+        other.stop();
         assert!(stop.is_stopped());
         assert!(stop.flag().load(Ordering::SeqCst));
-        assert!(!stop.sleep(secs(10)), "a stopped token never sleeps");
-        handle.join().expect("thread");
+        assert!(!stop.sleep(secs(10)));
     }
 
     #[test]
@@ -370,36 +346,5 @@ mod tests {
         assert_eq!(a.update(|v| std::mem::replace(v, 7)), 5);
         assert_eq!(b.get(), 7);
         assert_eq!(Live::<u8>::default().get(), 0);
-    }
-
-    #[test]
-    fn a_connect_returns_the_stream() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let stream = connect_tcp(addr, secs(2), &Stop::new())
-            .expect("connect")
-            .expect("not stopped");
-        assert_eq!(stream.peer_addr().expect("peer"), addr);
-    }
-
-    #[test]
-    fn a_stopped_token_gives_up_a_connect_at_once() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let stop = Stop::new();
-        stop.stop();
-        let at = Instant::now();
-        let stream = connect_tcp(addr, secs(5), &stop).expect("no error");
-        assert!(stream.is_none());
-        assert!(at.elapsed() < secs(1));
-    }
-
-    #[test]
-    fn a_refused_connect_is_an_error() {
-        let addr = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().expect("addr")
-        };
-        assert!(connect_tcp(addr, secs(2), &Stop::new()).is_err());
     }
 }
