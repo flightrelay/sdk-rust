@@ -2,9 +2,12 @@
 name = "flightrelay"
 version = "0.6.1"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Flight Relay Protocol (FRP) — a message bus for golf simulators, launch monitors and games, over WebSocket"
 repository = "https://github.com/flightrelay/sdk-rust"
+keywords = ["golf", "launch-monitor", "simulator", "websocket", "frp"]
+categories = ["network-programming", "web-programming::websocket"]
 
 [package.metadata.docs.rs]
 all-features = true

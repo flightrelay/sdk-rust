@@ -205,6 +205,11 @@ pub mod mock;
 #[cfg(all(feature = "driver", any(test, feature = "testing")))]
 pub mod testing;
 
+/// The `serde_json` this crate's public types use (`DriverConfig::from_map`,
+/// `UnknownBody::fields`, `FrpError::Json`), for callers that need the same
+/// version.
+pub use serde_json;
+
 pub use error::FrpError;
 #[cfg(feature = "transport")]
 pub use error::WebSocketError;
