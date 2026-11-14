@@ -637,7 +637,7 @@ fn accept_loop(
     let mut backoff = Backoff::default();
     let mut last_failure = None;
     while !stop.is_stopped() {
-        match endpoint.establish_until(stop.flag()) {
+        match endpoint.establish_until(stop.shared()) {
             Ok(Some(conn)) => {
                 last_failure = None;
                 // A link-down report from before this connection is stale.

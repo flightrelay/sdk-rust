@@ -18,7 +18,7 @@ use flightrelay::driver::{
 };
 use flightrelay::{
     Club, EndpointConfig, FrpEndpoint, FrpMessage, FrpServer, Handedness, Launch, Mode, RawDir,
-    ServerConfig, ServerError, ServerEvent, Severity, ShotKey, Source, Target, Velocity,
+    ServerConfig, ServerError, ServerEvent, Severity, ShotKey, Source, Target, Velocity, utc_ms,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -817,7 +817,7 @@ fn raw_frames_go_out_only_when_configured_and_count_on_across_sessions() {
     let mut peer = off.peer();
     off.wait_for("device+ ");
     off.control.run(|out| {
-        out.raw(RawDir::Rx, "result", &[1, 2, 3]);
+        out.wire(RawDir::Rx, "result", vec![1, 2, 3], utc_ms(), false);
         out.shot_trigger(key(1));
     });
     let seen = peer.until(|v| kind(v) == "shot.trigger");
@@ -828,13 +828,14 @@ fn raw_frames_go_out_only_when_configured_and_count_on_across_sessions() {
     let mut peer = on.peer();
     on.wait_for("device+ ");
     on.control.run(|out| {
-        out.raw(RawDir::Rx, "a", &[0xaa]);
-        out.raw(RawDir::Tx, "b", &[0xbb]);
+        out.wire(RawDir::Rx, "a", vec![0xaa], utc_ms(), false);
+        out.wire(RawDir::Tx, "b", vec![0xbb], utc_ms(), false);
     });
     peer.until(|v| v["label"] == "b");
     on.control.fail("reconnect");
     on.wait_for_nth("device+ ", 2);
-    on.control.run(|out| out.raw(RawDir::Rx, "c", &[0xcc]));
+    on.control
+        .run(|out| out.wire(RawDir::Rx, "c", vec![0xcc], utc_ms(), false));
     let seen = peer.until(|v| v["label"] == "c");
     let raws: Vec<&Value> = seen.iter().filter(|v| kind(v) == "shot.raw").collect();
     let last = raws.last().unwrap();

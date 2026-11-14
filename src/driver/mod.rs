@@ -146,8 +146,6 @@
 //! ```
 
 mod events;
-#[cfg(any(test, feature = "testing"))]
-pub mod testing;
 mod util;
 
 use std::error::Error;
@@ -416,9 +414,9 @@ pub trait ConnectHost {
 
 /// What [`FrpDriver::connect`] gets from its host.
 pub struct ConnectCtx<'a> {
-    /// The stop token. A driver passes `stop.flag()` to a transport layer
-    /// that takes a cancel flag.
-    pub stop: &'a Stop,
+    /// The host's stop token, watched by [`tick`](Self::tick) and
+    /// [`run_blocking`](Self::run_blocking).
+    pub(crate) stop: &'a Stop,
     /// The sink for events while connecting.
     pub out: Events<'a>,
     host: &'a mut dyn ConnectHost,
@@ -1056,7 +1054,7 @@ mod tests {
 
     #[test]
     fn blocking_work_reports_its_result_and_logs() {
-        let mut host = testing::TestHost::new();
+        let mut host = crate::testing::TestHost::new();
         let got = host.connect_with(|ctx| {
             ctx.run_blocking(
                 Duration::from_secs(1),
@@ -1077,7 +1075,7 @@ mod tests {
     #[test]
     fn blocking_work_found_after_a_stop_is_released() {
         static RELEASED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let mut host = testing::TestHost::new();
+        let mut host = crate::testing::TestHost::new();
         let stop = host.stop().clone();
         let got = host.connect_with(|ctx| {
             ctx.run_blocking(

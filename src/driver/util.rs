@@ -35,13 +35,6 @@ impl Stop {
         self.0.load(Ordering::SeqCst)
     }
 
-    /// The flag behind the token, for a transport layer that takes a
-    /// `cancel: Option<&AtomicBool>` and needs no flightrelay types.
-    #[must_use]
-    pub fn flag(&self) -> &AtomicBool {
-        &self.0
-    }
-
     /// The shared flag itself, for work that hands it on.
     pub(crate) fn shared(&self) -> &Arc<AtomicBool> {
         &self.0
@@ -340,7 +333,6 @@ mod tests {
         assert!(!stop.is_stopped());
         other.stop();
         assert!(stop.is_stopped());
-        assert!(stop.flag().load(Ordering::SeqCst));
         #[cfg(feature = "server")]
         assert!(!stop.sleep(secs(10)), "a stopped token never sleeps");
     }

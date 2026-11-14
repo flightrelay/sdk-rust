@@ -27,7 +27,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{
+use crate::driver::{
     Activity, ConnectCtx, ConnectHost, DeviceEvent, DeviceStatus, Events, FrpDriver, FrpSession,
     HostFlags, IDLE, Level, Stop, TurnHints,
 };
@@ -179,7 +179,7 @@ impl TestHost {
     ///
     /// # Errors
     ///
-    /// Returns what the session's [`bus`](super::FrpSession::bus) returns.
+    /// Returns what the session's [`bus`](crate::driver::FrpSession::bus) returns.
     pub fn bus<S: FrpSession>(
         &mut self,
         session: &mut S,

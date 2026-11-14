@@ -451,23 +451,6 @@ impl<'a> Events<'a> {
         self.emit(DeviceEvent::ShotDiscarded);
     }
 
-    /// A `shot.raw` of one protocol message, stamped with the current time,
-    /// with `seq` left at 0 for the host to number. Does nothing while raw
-    /// frames are off ([`wants_raw`](Self::wants_raw)). The caller makes sure
-    /// the message carries no device or user identity; those go to
-    /// [`audit`](Self::audit).
-    pub fn raw(&mut self, dir: RawDir, label: impl Into<String>, data: &[u8]) {
-        if !self.wants_raw() {
-            return;
-        }
-        let frame = RawFrame {
-            timestamp: crate::utc_ms(),
-            label: Some(label.into()),
-            ..RawFrame::new(dir, 0, data.to_vec())
-        };
-        self.frp(FrpBody::ShotRaw(frame));
-    }
-
     /// One protocol message as it crossed the transport at `at_ms` (UTC
     /// milliseconds, [`utc_ms`](crate::utc_ms) at capture): an
     /// [`audit`](Self::audit) line when `private`, else a `shot.raw` with
@@ -678,24 +661,6 @@ mod tests {
         assert!(status.blockers.is_empty());
         status.apply(StatusChange::Battery(Some(200)));
         assert_eq!(status.battery_pct, Some(100));
-    }
-
-    #[test]
-    fn raw_frames_are_built_only_while_wanted() {
-        let flags = HostFlags::new();
-        assert!(collect(&flags, |out| out.raw(RawDir::Rx, "x", &[1])).is_empty());
-        flags.set_wants_raw(true);
-        let seen = collect(&flags, |out| {
-            out.raw(RawDir::Tx, "tx result", &[0xde, 0xad]);
-        });
-        let [DeviceEvent::Frp(FrpBody::ShotRaw(frame))] = &seen[..] else {
-            panic!("{seen:?}");
-        };
-        assert_eq!(frame.dir, RawDir::Tx);
-        assert_eq!(frame.seq, 0);
-        assert_eq!(frame.label.as_deref(), Some("tx result"));
-        assert_eq!(frame.data, [0xde, 0xad]);
-        assert!(frame.timestamp.is_some_and(|t| t > 1_600_000_000_000));
     }
 
     #[test]

@@ -418,8 +418,8 @@ fn generate_shot(n: u32, mode: Mode) -> Shot {
 mod tests {
     use super::*;
     use crate::FrpBody;
-    use crate::driver::testing::TestHost;
     use crate::driver::{DeviceEvent, IDLE, StatusChange};
+    use crate::testing::TestHost;
 
     fn fast() -> MockConfig {
         MockConfig {

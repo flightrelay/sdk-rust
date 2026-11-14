@@ -42,9 +42,8 @@
 //! - **`server`** — `FrpServer`, which runs a driver as a launch monitor
 //!   actor on the bus (implies `driver` and `transport`)
 //! - **`main`** — `run`, a complete `main` for a driver: config file,
-//!   `--set` overrides, `--help`, Ctrl-C; and `config_actor_id`, the actor id
-//!   kept in a config file, for a binary that builds its own `FrpServer`
-//!   (implies `server`; adds `toml` and `ctrlc`)
+//!   `--set` overrides, `--help`, Ctrl-C (implies `server`; adds `toml` and
+//!   `ctrlc`)
 //! - **`mock`** — `mock::MockDriver`, a simulated launch monitor (implies
 //!   `driver`)
 //!
@@ -167,8 +166,8 @@ pub mod server;
 #[cfg(feature = "mock")]
 pub mod mock;
 
-#[cfg(feature = "testing")]
-pub use driver::testing;
+#[cfg(all(feature = "driver", any(test, feature = "testing")))]
+pub mod testing;
 
 pub use error::FrpError;
 #[cfg(feature = "transport")]
@@ -204,7 +203,7 @@ pub use hub::{Hub, HubEvent, PeerId};
 pub use server::{FrpServer, MIN_HEARTBEAT, ServerConfig, ServerError, ServerEvent};
 
 #[cfg(feature = "main")]
-pub use cli::{ActorIdOrigin, ConfigActorId, RunOptions, config_actor_id, run, run_args, run_with};
+pub use cli::{RunOptions, run, run_args, run_with};
 
 /// Recommended default port for standalone FRP connections.
 pub const DEFAULT_PORT: u16 = 5880;
