@@ -121,7 +121,7 @@ pub enum ServerEvent<'a> {
     },
     /// A session is up.
     DeviceConnected(&'a DeviceIdentity),
-    /// A connect failed or a session ended.
+    /// A connect failed or a session ended with an error.
     DeviceLost {
         /// What went wrong.
         error: &'a dyn Error,
@@ -419,18 +419,14 @@ impl<D: FrpDriver> FrpServer<D> {
             if net_thread.is_finished() {
                 break Err(ServerError::Network);
             }
-            // The session starts with the hints of the connect's start; a
-            // turn that arrives during the connect reaches it at the first
-            // pass.
-            let mut handed = hints;
-            let connected = {
-                let mut host = Host {
-                    inputs: &mut inputs,
-                    hints: &mut hints,
-                };
-                let mut ctx = ConnectCtx::new(stop, Events::new(&mut sink, &flags), &mut host);
-                driver.connect(&mut ctx)
-            };
+            let (connected, mut handed) = connect(
+                &mut driver,
+                stop,
+                &mut sink,
+                &flags,
+                &mut inputs,
+                &mut hints,
+            );
             let (error, connected_for) = match connected {
                 Ok(mut session) => {
                     attempts = 0;
@@ -575,6 +571,24 @@ impl ConnectHost for Host<'_, '_> {
     fn hints(&self) -> &TurnHints {
         self.hints
     }
+}
+
+/// One connect of `driver`, with the turns that arrive meanwhile taken into
+/// `hints`. Returns its outcome and the hints of the connect's start: the
+/// session starts with those, so a turn that arrives during the connect
+/// reaches it at the first [`hand_over`].
+fn connect<D: FrpDriver>(
+    driver: &mut D,
+    stop: &Stop,
+    sink: &mut dyn FnMut(DeviceEvent),
+    flags: &HostFlags,
+    inputs: &mut Inputs<'_>,
+    hints: &mut TurnHints,
+) -> (Result<D::Session, D::Error>, TurnHints) {
+    let handed = *hints;
+    let mut host = Host { inputs, hints };
+    let mut ctx = ConnectCtx::new(stop, Events::new(sink, flags), &mut host);
+    (driver.connect(&mut ctx), handed)
 }
 
 /// Takes the turns waiting and hands `session` the hints when they differ
@@ -1384,17 +1398,17 @@ mod tests {
         let flags = HostFlags::new();
         let mut sink = |_| {};
         let mut hints = TurnHints::default();
-        let mut handed = hints;
         let putter = TurnHints::default().with_club(crate::Club::Putter);
         turns.send(putter).unwrap();
-        let mut session = {
-            let mut host = Host {
-                inputs: &mut inputs,
-                hints: &mut hints,
-            };
-            let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &flags), &mut host);
-            EarlyReader.connect(&mut ctx).unwrap()
-        };
+        let (session, mut handed) = connect(
+            &mut EarlyReader,
+            &stop,
+            &mut sink,
+            &flags,
+            &mut inputs,
+            &mut hints,
+        );
+        let mut session = session.unwrap();
         assert_eq!(session.1, [TurnHints::default()], "read before the turn");
         let mut out = Events::new(&mut sink, &flags);
         hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
