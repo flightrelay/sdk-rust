@@ -39,6 +39,9 @@ enum Plan {
     Session(DeviceIdentity),
     /// Fail the attempt.
     Fail(&'static str),
+    /// Report ready, a battery and a flagged telemetry key, then fail the
+    /// attempt.
+    ReportThenFail,
     /// Tick until released, then connect. Emits one alert first, if given.
     Block {
         release: Arc<AtomicBool>,
@@ -171,6 +174,13 @@ impl FrpDriver for Fake {
         let id = match plan.unwrap_or_else(|| Plan::Session(identity())) {
             Plan::Session(id) => id,
             Plan::Fail(why) => return Err(FakeError::Failed(why)),
+            Plan::ReportThenFail => {
+                ctx.out.ready(true);
+                ctx.out.battery(50);
+                ctx.out.telemetry([("radar_mode", "armed")]);
+                ctx.out.flag("radar_mode", true);
+                return Err(FakeError::Failed("lost during the handshake"));
+            }
             Plan::Block { release, alert } => {
                 let mut alert = alert;
                 while !release.load(Ordering::SeqCst) {
@@ -577,7 +587,7 @@ fn shots_and_alerts_go_out_under_the_actor_id_to_every_peer() {
 }
 
 #[test]
-fn kinds_that_are_not_a_launch_monitors_are_not_published() {
+fn only_kinds_the_drivers_roles_send_are_published() {
     let h = Harness::listen();
     let mut peer = h.peer();
     h.wait_for("device+ ");
@@ -589,14 +599,16 @@ fn kinds_that_are_not_a_launch_monitors_are_not_published() {
             Mode::Full,
         ));
         out.frp(flightrelay::BusSync {});
+        out.frp(flightrelay::GolferSelect::new("r1"));
         out.shot_trigger(key(1), None);
     });
     let seen = peer.until(|v| kind(v) == "shot.trigger");
-    assert!(
-        seen.iter()
-            .all(|v| matches!(kind(v), "bus.actor" | "shot.trigger")),
-        "{seen:#?}"
-    );
+    let published: Vec<&str> = kinds(&seen)
+        .into_iter()
+        .filter(|k| *k != "bus.actor")
+        .collect();
+    assert_eq!(published, ["golfer.select", "shot.trigger"], "{seen:#?}");
+    assert!(seen.iter().all(|v| v["from"] == ACTOR));
 }
 
 #[test]
@@ -931,6 +943,33 @@ fn a_driver_that_gives_up_ends_the_server_with_its_error() {
         Err(ServerError::Driver(FakeError::Failed("no such device"))) => {}
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn a_failed_connect_leaves_no_ready_or_battery_on_the_actor() {
+    let (driver, control) = fake();
+    control.plan(Plan::ReportThenFail);
+    let release = Arc::new(AtomicBool::new(false));
+    control.plan(Plan::Block {
+        release: Arc::clone(&release),
+        alert: None,
+    });
+    let h = Harness::start_with(driver, control, Target::listen("127.0.0.1:0"), |c| {
+        c.heartbeat = Duration::from_secs(60);
+    });
+    h.wait_for("lost ");
+    wait_until("the second connect", || h.control.connects() == 2);
+    let (_peer, greeting) = h.peer_and_greeting();
+    let actor = &greeting[0];
+    assert_eq!(actor["blockers"], json!(["not_armed"]), "{actor}");
+    assert!(actor["device"].get("battery_pct").is_none(), "{actor}");
+    assert_eq!(
+        actor["telemetry"]["radar_mode"], "idle",
+        "the next connect started from not_armed: {actor}"
+    );
+    assert!(actor.get("flagged").is_none(), "{actor}");
+    release.store(true, Ordering::SeqCst);
+    h.wait_for("device+ ");
 }
 
 #[test]

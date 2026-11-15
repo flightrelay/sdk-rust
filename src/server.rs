@@ -192,11 +192,15 @@ type Observer = Box<dyn FnMut(&ServerEvent<'_>)>;
 ///   [`DeviceStatus`] (a battery the driver takes off is off the next
 ///   `bus.actor`), and its `telemetry` is every key of
 ///   [`DriverInfo::telemetry`], with the driver's value or the declared one.
-///   Before the first session and whenever a session ends the status is
-///   [`DeviceStatus::not_armed`]. The device's own id and card label never
-///   go on the bus.
-/// - What the driver emits goes out under the actor id: `shot.*` messages
-///   and `bus.alert`. A `shot.raw` is numbered per actor, across sessions,
+///   Each connect starts from [`DeviceStatus::not_armed`], and a session
+///   that ends goes back to it. While no session is up the actor carries
+///   [`DeviceStatus::off_session`] of the driver's status: `not_armed`, no
+///   battery, the telemetry and flagged values the driver reported. The
+///   device's own id and card label never go on the bus.
+/// - What the driver emits goes out under the actor id when its roles send
+///   that kind ([`DriverInfo::sends`]): `shot.*` for a launch monitor,
+///   `golfer.select`, `bus.reply` and `bus.alert` for any driver, and so on.
+///   A `shot.raw` is numbered per actor, across sessions,
 ///   and goes out only while [`ServerConfig::raw_frames`] is on; drivers
 ///   are asked not to build one otherwise, and one that arrives anyway is
 ///   dropped.
@@ -267,6 +271,7 @@ enum ToNet {
     Message(Box<FrpBody>),
     Status(DeviceStatus),
     StatusChange(StatusChange),
+    ConnectStarted,
     Identified(DeviceIdentity),
     SessionEnded,
     Shutdown,
@@ -419,6 +424,7 @@ impl<D: FrpDriver> FrpServer<D> {
             if net_thread.is_finished() {
                 break Err(ServerError::Network);
             }
+            push(&to_net, ToNet::ConnectStarted);
             let (connected, mut handed) = connect(
                 &mut driver,
                 stop,
@@ -744,7 +750,10 @@ struct Net {
     info: DriverInfo,
     /// The last session's identity; it stays after the session ends.
     identity: Option<DeviceIdentity>,
-    /// The driver's current status, which the actor carries exactly.
+    /// A session is up: from its identity until it ends.
+    session_up: bool,
+    /// The driver's current status. The actor carries it exactly while a
+    /// session is up, else its [`DeviceStatus::off_session`].
     status: DeviceStatus,
     /// The name from the config, which wins over any other.
     name: Option<String>,
@@ -770,6 +779,7 @@ impl Net {
             actor: BusActor::new(info.name, heartbeat.as_secs_f64()),
             info: info.clone(),
             identity: None,
+            session_up: false,
             status: DeviceStatus::not_armed(),
             name: config.name.clone(),
             heartbeat,
@@ -895,6 +905,11 @@ impl Net {
                     self.publish_actor();
                 }
             }
+            ToNet::ConnectStarted => {
+                if self.clear_session_status() {
+                    self.publish_actor();
+                }
+            }
             ToNet::Identified(identity) => {
                 if self.apply_identity(&identity) {
                     self.publish_actor();
@@ -946,6 +961,9 @@ impl Net {
     }
 
     fn on_driver_message(&mut self, mut body: FrpBody) {
+        if !self.info.sends(&body) {
+            return;
+        }
         match &mut body {
             FrpBody::ShotTrigger(m) => {
                 self.open.insert(
@@ -964,13 +982,7 @@ impl Net {
                 frame.seq = self.seq;
                 self.seq += 1;
             }
-            FrpBody::ShotLaunch(_)
-            | FrpBody::ShotClub(_)
-            | FrpBody::ShotImpact(_)
-            | FrpBody::ShotFlight(_)
-            | FrpBody::BusAlert(_) => {}
-            // Not a launch monitor's to send.
-            _ => return,
+            _ => {}
         }
         let msg = FrpMessage::new(self.actor_id.clone(), body);
         self.publish(&msg);
@@ -990,23 +1002,33 @@ impl Net {
     }
 
     /// Builds the actor from the driver's facts, the identity and the
-    /// status ([`DriverInfo::bus_actor`]). Returns whether it changed.
+    /// status ([`DriverInfo::bus_actor`]; [`DeviceStatus::off_session`]
+    /// while no session is up). Returns whether it changed.
     fn rebuild_actor(&mut self) -> bool {
         let name = self
             .name
             .clone()
             .unwrap_or_else(|| self.info.actor_name(self.identity.as_ref()));
+        let held;
+        let status = if self.session_up {
+            &self.status
+        } else {
+            held = self.status.off_session();
+            &held
+        };
         let actor = self
             .info
-            .bus_actor(name, self.heartbeat, self.identity.as_ref(), &self.status);
+            .bus_actor(name, self.heartbeat, self.identity.as_ref(), status);
         let changed = actor != self.actor;
         self.actor = actor;
         changed
     }
 
-    /// Takes a session's identity into the actor. Returns whether it changed.
+    /// A session is up as `identity`: the actor takes the identity and the
+    /// driver's whole status. Returns whether it changed.
     fn apply_identity(&mut self, identity: &DeviceIdentity) -> bool {
         self.identity = Some(identity.clone());
+        self.session_up = true;
         self.rebuild_actor()
     }
 
@@ -1014,6 +1036,7 @@ impl Net {
     /// reported off the actor: it is `not_armed`, with no battery, nothing
     /// flagged and each telemetry key at its declared value.
     fn on_session_ended(&mut self) {
+        self.session_up = false;
         self.finish_open_shots("the session ended");
         if self.clear_session_status() {
             self.publish_actor();
@@ -1120,6 +1143,17 @@ mod tests {
 
     const MS: Duration = Duration::from_millis(1);
 
+    /// A net with a session up, so the actor carries the driver's whole
+    /// status.
+    fn in_session() -> Net {
+        let mut net = net(None);
+        net.handle(
+            ToNet::Identified(DeviceIdentity::new("SERIAL-123")),
+            net.now,
+        );
+        net
+    }
+
     #[test]
     fn a_drivers_namespaces_reach_its_actor() {
         let config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
@@ -1132,7 +1166,7 @@ mod tests {
 
     #[test]
     fn the_actor_is_republished_once_per_heartbeat() {
-        let mut net = net(None);
+        let mut net = in_session();
         let (t0, hb) = (net.last_beat, net.heartbeat);
         net.tick((t0 + hb).checked_sub(MS).unwrap());
         assert_eq!(net.last_beat, t0, "not due yet");
@@ -1201,7 +1235,7 @@ mod tests {
 
     #[test]
     fn changes_apply_to_the_status_and_report_whether_the_actor_changed() {
-        let mut net = net(None);
+        let mut net = in_session();
         assert!(net.apply_change(StatusChange::Blockers(vec![])));
         assert!(net.apply_change(StatusChange::Battery(Some(80))));
         assert!(!net.apply_change(StatusChange::Battery(Some(80))));
@@ -1215,7 +1249,7 @@ mod tests {
 
     #[test]
     fn every_declared_key_is_on_the_actor_and_the_battery_can_come_off() {
-        let mut net = net(None);
+        let mut net = in_session();
         assert_eq!(
             net.actor.telemetry,
             Some(
@@ -1249,7 +1283,7 @@ mod tests {
 
     #[test]
     fn a_whole_status_replaces_the_one_held() {
-        let mut net = net(None);
+        let mut net = in_session();
         net.apply_status(
             DeviceStatus::new()
                 .with_battery(80)
@@ -1421,6 +1455,34 @@ mod tests {
         turns.send(putter).unwrap();
         hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
         assert_eq!(session.1.len(), 2, "the same hints again are no change");
+    }
+
+    #[test]
+    fn a_connects_blockers_and_battery_wait_for_its_session_and_each_connect_starts_fresh() {
+        let mut net = net(None);
+        let t0 = net.now;
+        let reported = || {
+            DeviceStatus::new()
+                .with_battery(50)
+                .with_telemetry("radar_mode", "armed")
+                .with_flag("radar_mode", true)
+                .with_flag("battery_pct", true)
+        };
+        net.handle(ToNet::ConnectStarted, t0);
+        net.handle(ToNet::Status(reported()), t0);
+        assert_eq!(net.actor.blockers, ["not_armed"], "no session: not ready");
+        assert_eq!(net.actor.device.as_ref().unwrap().battery_pct, None);
+        assert_eq!(net.actor.telemetry.as_ref().unwrap()["radar_mode"], "armed");
+        assert_eq!(net.actor.flagged, ["radar_mode"]);
+        // That connect failed; the next one starts from `not_armed`.
+        net.handle(ToNet::ConnectStarted, t0);
+        assert_eq!(net.actor.telemetry.as_ref().unwrap()["radar_mode"], "idle");
+        assert!(net.actor.flagged.is_empty());
+        net.handle(ToNet::Status(reported()), t0);
+        net.handle(ToNet::Identified(DeviceIdentity::new("SERIAL-123")), t0);
+        assert!(net.actor.is_clear(), "the session is up: ready");
+        assert_eq!(net.actor.device.as_ref().unwrap().battery_pct, Some(50));
+        assert_eq!(net.actor.flagged, ["battery_pct", "radar_mode"]);
     }
 
     #[test]

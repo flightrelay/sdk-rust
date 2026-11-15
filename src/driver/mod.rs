@@ -46,8 +46,13 @@
 //! [`Events::flag`]). Its telemetry keys are fixed: the driver declares
 //! each one with the value it has while not reported
 //! ([`DriverInfo::telemetry`]), and every `bus.actor` carries every one of
-//! them, in every state. When a session ends the host goes back to
-//! [`DeviceStatus::not_armed`].
+//! them, in every state. Every connect starts from
+//! [`DeviceStatus::not_armed`], and when a session ends the host goes back
+//! to it. While no session is up (a connect runs, or one failed) the actor
+//! carries the telemetry and flagged values the driver reports, a
+//! connect's at once, but stays blocked by `not_armed` with no battery
+//! ([`DeviceStatus::off_session`]); blockers and battery count once the
+//! session is up.
 //!
 //! The driver reads `golfer.turn` as [`TurnHints`]: each turn replaces all
 //! the hints (handedness, club, mode), and a field that is `null` or not
@@ -162,7 +167,7 @@ pub use util::{Backoff, Live, ShotIds, Stop};
 
 use crate::types::{blockers, roles};
 use crate::{
-    BusActor, Club, DeviceInfo, FrpMessage, GolferTurn, Handedness, Mode, RawFrame, Source,
+    BusActor, Club, DeviceInfo, FrpBody, FrpMessage, GolferTurn, Handedness, Mode, RawFrame, Source,
 };
 
 /// How long a host waits before the next [`FrpSession::step`] after one
@@ -231,7 +236,10 @@ pub trait FrpDriver: Send + Sized + 'static {
     /// identified; configuring and arming may go on inside
     /// [`step`](FrpSession::step). Events emitted
     /// while connecting (a phase, a hint alert, logs) reach the host at once
-    /// through `ctx.out`. When the hints change while it connects, the host
+    /// through `ctx.out`. The connect starts from
+    /// [`DeviceStatus::not_armed`]; telemetry and flags it reports go on the
+    /// actor at once, its blockers and battery once the session is up
+    /// ([`DeviceStatus::off_session`]). When the hints change while it connects, the host
     /// hands the session the new ones ([`hints`](FrpSession::hints)) before
     /// its first step, so a connect may read `ctx.hints()` at any point.
     ///
@@ -796,6 +804,23 @@ impl DriverInfo {
         }
     }
 
+    /// Whether a message `body` the driver emits goes on the bus: a kind
+    /// its roles send. Any driver sends `bus.alert`, `golfer.select` and
+    /// `bus.reply`; a [game](roles::GAME), or a driver that issues golfer
+    /// ids ([`namespaces`](Self::namespaces)), sends `game.*` and
+    /// `golfer.profile` (and their removals); a
+    /// [launch monitor](roles::LAUNCH_MONITOR) sends `shot.*`. Everything
+    /// else is the host's (`bus.actor`, `bus.sync`) or another role's
+    /// (`golfer.turn`, `practice.*`), and a host drops it.
+    #[must_use]
+    pub fn sends(&self, body: &FrpBody) -> bool {
+        let kind = body.kind();
+        matches!(kind, "bus.alert" | "golfer.select" | "bus.reply")
+            || ((self.roles.contains(&roles::GAME) || !self.namespaces.is_empty())
+                && (kind.starts_with("game.") || kind == "golfer.profile"))
+            || (self.roles.contains(&roles::LAUNCH_MONITOR) && kind.starts_with("shot."))
+    }
+
     /// The driver's `bus.actor`, as a host publishes it: named `name`,
     /// republished every `heartbeat`, with this driver's
     /// [`roles`](Self::roles) and [`namespaces`](Self::namespaces); a
@@ -1102,6 +1127,67 @@ mod tests {
         assert!(!json.contains("SERIAL-1"), "{json}");
         let theirs = identity.clone().with_manufacturer("Eagle Works");
         assert_eq!(info.actor_name(Some(&theirs)), "Eagle Works Eagle One");
+    }
+
+    /// Any driver sends alerts, selects and replies; a game, or a driver
+    /// that issues golfer ids, `game.*` and `golfer.profile` with their
+    /// removals; a launch monitor `shot.*`. The host's own kinds and other
+    /// roles' never pass.
+    #[test]
+    fn a_drivers_roles_decide_the_kinds_it_sends() {
+        use crate::{
+            BusAlert, BusReply, BusSync, GameRound, GolferId, GolferProfile, GolferSelect,
+            PracticeBlock, Removal, RoundStatus, Severity, ShotFinished, ShotKey, ShotTrigger,
+            StateKind,
+        };
+        let output = DriverInfo::new("o", "O", Source::Virtual).with_roles(&[]);
+        let game = DriverInfo::new("g", "G", Source::Virtual).with_roles(&[roles::GAME]);
+        let issuer = DriverInfo::new("i", "I", Source::Virtual)
+            .with_roles(&[])
+            .with_namespaces(&["soft"]);
+        let monitor = DriverInfo::new("m", "M", Source::Measured);
+        let key = ShotKey::new("shot-1", 1);
+        let golfer = GolferId::new("soft", "1").expect("an id");
+        let bodies: Vec<(FrpBody, [bool; 4])> = vec![
+            (BusAlert::new(Severity::Warn, "w").into(), [true; 4]),
+            (GolferSelect::new("r").into(), [true; 4]),
+            (
+                BusReply::ok("fake.0", "golfer.select", "r").into(),
+                [true; 4],
+            ),
+            (
+                GameRound::new("round-1", RoundStatus::Playing, Vec::new(), None, None).into(),
+                [false, true, true, false],
+            ),
+            (
+                Removal::of(StateKind::GameRound).into(),
+                [false, true, true, false],
+            ),
+            (
+                GolferProfile::new(golfer, "Ann").into(),
+                [false, true, true, false],
+            ),
+            (
+                ShotTrigger::new(key.clone()).into(),
+                [false, false, false, true],
+            ),
+            (ShotFinished { key }.into(), [false, false, false, true]),
+            (BusActor::new("x", 2.0).into(), [false; 4]),
+            (Removal::of(StateKind::BusActor).into(), [false; 4]),
+            (
+                GolferTurn::new(None, None, Handedness::Right, Mode::Full).into(),
+                [false; 4],
+            ),
+            (
+                PracticeBlock::new("b", None, None, 1, 1, 0).into(),
+                [false; 4],
+            ),
+            (BusSync::new().into(), [false; 4]),
+        ];
+        for (body, want) in bodies {
+            let got = [&output, &game, &issuer, &monitor].map(|info| info.sends(&body));
+            assert_eq!(got, want, "{}", body.kind());
+        }
     }
 
     #[test]

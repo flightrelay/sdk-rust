@@ -150,6 +150,20 @@ impl DeviceStatus {
         Self::new().with_blockers([blockers::NOT_ARMED])
     }
 
+    /// What a host publishes of this status while no session is up (during
+    /// a connect, and after one that failed): blocked by
+    /// [`blockers::NOT_ARMED`], no battery, and this status's telemetry and
+    /// flagged values (a flagged `battery_pct` goes with the battery). A
+    /// connect's blockers and battery count once its session is up.
+    #[must_use]
+    pub fn off_session(&self) -> Self {
+        let mut held = Self::not_armed();
+        held.telemetry.clone_from(&self.telemetry);
+        held.flagged.clone_from(&self.flagged);
+        held.flagged.remove("battery_pct");
+        held
+    }
+
     /// With these blockers (empty: nothing in the way). Standard names are
     /// in [`blockers`].
     #[must_use]
