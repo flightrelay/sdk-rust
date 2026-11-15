@@ -66,13 +66,13 @@ const STEP: Duration = Duration::from_secs(1);
 /// Shortest session that restarts a [`Backoff`] at its minimum. Longer than
 /// any connect-time setup, so a link that is accepted and then drops during
 /// setup counts as a failed attempt and keeps growing toward the cap.
-pub const STABLE_SESSION: Duration = Duration::from_secs(10);
+pub(crate) const STABLE_SESSION: Duration = Duration::from_secs(10);
 
 /// Linear reconnect backoff: starts at `min`, grows by 1 s per failed
-/// attempt, capped at `max`. A session that lasted at least
-/// [`STABLE_SESSION`] restarts the sequence at `min`, so one long outage does
-/// not slow every later reconnect, while a link that keeps connecting and
-/// dropping at once still backs off to `max`.
+/// attempt, capped at `max`. A session that lasted at least 10 s restarts
+/// the sequence at `min`, so one long outage does not slow every later
+/// reconnect, while a link that keeps connecting and dropping at once still
+/// backs off to `max`.
 #[derive(Debug, Clone)]
 pub struct Backoff {
     min: Duration,

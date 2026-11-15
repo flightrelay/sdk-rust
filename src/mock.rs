@@ -260,10 +260,7 @@ impl MockSession {
         );
         out.blockers([blockers::NOT_ARMED]);
         self.mode_telemetry(out, "idle");
-        match crate::utc_ms() {
-            Some(ms) => out.shot_trigger_at(key.clone(), ms),
-            None => out.shot_trigger(key.clone()),
-        }
+        out.shot_trigger(key.clone(), crate::utc_ms());
         out.launch(key.clone(), shot.launch);
         out.flight(key.clone(), shot.flight);
         out.club(key.clone(), shot.club);
@@ -319,9 +316,8 @@ impl FrpSession for MockSession {
         &self.identity
     }
 
-    fn close(self, out: &mut Events<'_>) -> Result<(), MockError> {
+    fn close(self, out: &mut Events<'_>) {
         out.blockers([blockers::NOT_ARMED]);
-        Ok(())
     }
 }
 
@@ -666,7 +662,7 @@ mod tests {
         let mut driver = MockDriver::new(MockConfig::default()).unwrap();
         let mut h = host(None);
         let session = h.connect(&mut driver).unwrap();
-        h.with(|_, out| session.close(out)).unwrap();
+        h.with(|_, out| session.close(out));
         assert_eq!(blocker_values(&h.take()), ["not_armed"]);
     }
 

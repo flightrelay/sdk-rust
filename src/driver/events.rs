@@ -313,7 +313,7 @@ impl<'a> Events<'a> {
     }
 
     /// Push a change to one part of the status.
-    pub fn status_change(&mut self, change: StatusChange) {
+    fn status_change(&mut self, change: StatusChange) {
         self.emit(DeviceEvent::StatusChange(change));
     }
 
@@ -339,15 +339,14 @@ impl<'a> Events<'a> {
         level >= self.flags.min_level()
     }
 
-    /// `shot.trigger` without a timestamp.
-    pub fn shot_trigger(&mut self, key: ShotKey) {
-        self.frp(ShotTrigger::new(key));
-    }
-
-    /// `shot.trigger` with the strike time in milliseconds since the Unix
-    /// epoch (UTC).
-    pub fn shot_trigger_at(&mut self, key: ShotKey, timestamp_ms: u64) {
-        self.frp(ShotTrigger::at(key, timestamp_ms));
+    /// `shot.trigger`, with the strike time in milliseconds since the Unix
+    /// epoch (UTC) when `at` gives one: `shot_trigger(key, None)` or
+    /// `shot_trigger(key, ms)`.
+    pub fn shot_trigger(&mut self, key: ShotKey, at: impl Into<Option<u64>>) {
+        self.frp(match at.into() {
+            Some(ms) => ShotTrigger::at(key, ms),
+            None => ShotTrigger::new(key),
+        });
     }
 
     /// `shot.launch`.
@@ -517,7 +516,7 @@ mod tests {
         let flags = HostFlags::new();
         let key = ShotKey::new("id", 1);
         let seen = collect(&flags, |out| {
-            out.shot_trigger(key.clone());
+            out.shot_trigger(key.clone(), None);
             out.shot_finished(key.clone());
             out.ready(false);
             out.alert(Severity::Warn, "careful");

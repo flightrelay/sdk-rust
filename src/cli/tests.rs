@@ -135,9 +135,7 @@ impl FrpSession for FakeSession {
     fn identity(&self) -> &DeviceIdentity {
         &self.0
     }
-    fn close(self, _: &mut Events<'_>) -> Result<(), FakeError> {
-        Ok(())
-    }
+    fn close(self, _: &mut Events<'_>) {}
 }
 
 use crate::driver::SessionEnd;

@@ -418,6 +418,10 @@ impl<D: FrpDriver> FrpServer<D> {
             if net_thread.is_finished() {
                 break Err(ServerError::Network);
             }
+            // The session starts with the hints of the connect's start; a
+            // turn that arrives during the connect reaches it at the first
+            // pass.
+            let mut handed = hints;
             let connected = {
                 let mut host = Host {
                     inputs: &mut inputs,
@@ -426,7 +430,6 @@ impl<D: FrpDriver> FrpServer<D> {
                 let mut ctx = ConnectCtx::new(stop, Events::new(&mut sink, &flags), &mut host);
                 driver.connect(&mut ctx)
             };
-            let mut net_down = false;
             let (error, connected_for) = match connected {
                 Ok(mut session) => {
                     attempts = 0;
@@ -434,6 +437,7 @@ impl<D: FrpDriver> FrpServer<D> {
                     let identity = session.identity().clone();
                     push(&to_net, ToNet::Identified(identity.clone()));
                     observe(&ServerEvent::DeviceConnected(&identity));
+                    let mut net_down = false;
                     let error = loop {
                         if stop.is_stopped() {
                             break None;
@@ -442,55 +446,44 @@ impl<D: FrpDriver> FrpServer<D> {
                             net_down = true;
                             break None;
                         }
-                        let mut failed = None;
-                        if inputs.drain(&mut hints)
-                            && let Err(e) =
-                                session.hints(&hints, &mut Events::new(&mut sink, &flags))
-                        {
-                            failed = Some(e);
-                        }
-                        if failed.is_none() {
-                            failed =
-                                poll(&mut session, POLL, &mut Events::new(&mut sink, &flags)).err();
-                        }
-                        if failed.is_some() {
-                            break failed;
+                        let mut out = Events::new(&mut sink, &flags);
+                        let failed =
+                            hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out)
+                                .and_then(|()| poll(&mut session, POLL, &mut out));
+                        if let Err(e) = failed {
+                            break Some(e);
                         }
                     };
-                    if let Err(e) = session.close(&mut Events::new(&mut sink, &flags)) {
-                        sink(DeviceEvent::Log(
-                            Level::Warn,
-                            format!("closing the device: {e}"),
-                        ));
-                    }
+                    session.close(&mut Events::new(&mut sink, &flags));
                     push(&to_net, ToNet::SessionEnded);
-                    (error, Some(started.elapsed()))
+                    match error {
+                        Some(e) => (e, Some(started.elapsed())),
+                        None if net_down => break Err(ServerError::Network),
+                        None => break Ok(()),
+                    }
                 }
                 Err(e) => {
                     attempts = attempts.saturating_add(1);
-                    (Some(e), None)
+                    (e, None)
                 }
             };
             if stop.is_stopped() {
                 break Ok(());
             }
-            if net_down || net_thread.is_finished() {
+            if net_thread.is_finished() {
                 break Err(ServerError::Network);
             }
             let delay = driver.retry_delay(
-                &SessionEnd::new(error.as_ref(), connected_for, attempts),
+                &SessionEnd::new(&error, Instant::now(), connected_for, attempts),
                 &mut backoff,
                 &mut Events::new(&mut sink, &flags),
             );
             observe(&ServerEvent::DeviceLost {
-                error: error.as_ref().map(|e| e as &dyn Error),
+                error: Some(&error),
                 retry_in: delay,
             });
             let Some(delay) = delay else {
-                break match error {
-                    Some(e) => Err(ServerError::Driver(e)),
-                    None => Ok(()),
-                };
+                break Err(ServerError::Driver(error));
             };
             let until = Instant::now() + delay;
             while Instant::now() < until && !stop.is_stopped() && !net_thread.is_finished() {
@@ -581,6 +574,23 @@ impl ConnectHost for Host<'_, '_> {
     fn hints(&self) -> &TurnHints {
         self.hints
     }
+}
+
+/// Takes the turns waiting and hands `session` the hints when they differ
+/// from the ones it has (`handed`).
+fn hand_over<S: FrpSession>(
+    session: &mut S,
+    inputs: &mut Inputs<'_>,
+    hints: &mut TurnHints,
+    handed: &mut TurnHints,
+    out: &mut Events<'_>,
+) -> Result<(), S::Error> {
+    let _ = inputs.drain(hints);
+    if hints == handed {
+        return Ok(());
+    }
+    *handed = *hints;
+    session.hints(hints, out)
 }
 
 /// Step `session` for about `timeout` of real time, waiting [`IDLE`] after a
@@ -1293,6 +1303,101 @@ mod tests {
         on.on_driver_message(raw());
         on.on_driver_message(raw());
         assert_eq!(on.seq, 2);
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("stopped")]
+    struct Halt;
+    impl From<crate::driver::Stopped> for Halt {
+        fn from(_: crate::driver::Stopped) -> Self {
+            Self
+        }
+    }
+
+    /// Reads its hints at the top of a connect, then ticks once.
+    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct EarlyReader;
+    /// Records every `hints` call.
+    struct Heard(DeviceIdentity, Vec<TurnHints>);
+
+    impl crate::driver::DriverConfig for EarlyReader {}
+
+    impl FrpDriver for EarlyReader {
+        type Config = Self;
+        type Error = Halt;
+        type Action = crate::driver::NoAction;
+        type Session = Heard;
+        fn info(_: &Self) -> DriverInfo {
+            DriverInfo::new("early", "Early", Source::Virtual)
+        }
+        fn new(config: Self) -> Result<Self, crate::driver::ConfigError> {
+            Ok(config)
+        }
+        fn config(&self) -> &Self {
+            self
+        }
+        fn apply_config(&mut self, _: &Self) {}
+        fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<Heard, Halt> {
+            let read = *ctx.hints();
+            ctx.tick()?;
+            Ok(Heard(DeviceIdentity::new("Early-1"), vec![read]))
+        }
+    }
+
+    impl FrpSession for Heard {
+        type Error = Halt;
+        type Action = crate::driver::NoAction;
+        fn step(&mut self, _: Instant, _: &mut Events<'_>) -> Result<Activity, Halt> {
+            Ok(Activity::Idle)
+        }
+        fn hints(&mut self, hints: &TurnHints, _: &mut Events<'_>) -> Result<(), Halt> {
+            self.1.push(*hints);
+            Ok(())
+        }
+        fn identity(&self) -> &DeviceIdentity {
+            &self.0
+        }
+        fn close(self, _: &mut Events<'_>) {}
+    }
+
+    #[test]
+    fn a_turn_during_the_connect_reaches_the_session_before_its_first_step() {
+        let (turns, hints_rx) = channel();
+        let (_notes, note_rx) = channel();
+        let observe = |_: &ServerEvent<'_>| {};
+        let mut inputs = Inputs {
+            hints_rx: &hints_rx,
+            note_rx: &note_rx,
+            observe: &observe,
+            log_level: Level::Info,
+        };
+        let stop = Stop::new();
+        let flags = HostFlags::new();
+        let mut sink = |_| {};
+        let mut hints = TurnHints::default();
+        let mut handed = hints;
+        let putter = TurnHints::default().with_club(crate::Club::Putter);
+        turns.send(putter).unwrap();
+        let mut session = {
+            let mut host = Host {
+                inputs: &mut inputs,
+                hints: &mut hints,
+            };
+            let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &flags), &mut host);
+            EarlyReader.connect(&mut ctx).unwrap()
+        };
+        assert_eq!(session.1, [TurnHints::default()], "read before the turn");
+        let mut out = Events::new(&mut sink, &flags);
+        hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
+        hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
+        assert_eq!(
+            session.1,
+            [TurnHints::default(), putter],
+            "handed over once"
+        );
+        turns.send(putter).unwrap();
+        hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
+        assert_eq!(session.1.len(), 2, "the same hints again are no change");
     }
 
     #[test]

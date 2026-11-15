@@ -484,9 +484,7 @@ mod tests {
         fn identity(&self) -> &DeviceIdentity {
             &self.identity
         }
-        fn close(self, _: &mut Events<'_>) -> Result<(), Stopped> {
-            Ok(())
-        }
+        fn close(self, _: &mut Events<'_>) {}
     }
 
     #[test]
@@ -510,7 +508,7 @@ mod tests {
         let mut sink = |e| events.push(e);
         let mut out = Events::new(&mut sink, &flags);
         let key = ShotKey::new("id", 1);
-        out.shot_trigger(key.clone());
+        out.shot_trigger(key.clone(), None);
         out.launch(key.clone(), Launch::default());
         out.club(key.clone(), ClubData::default());
         out.alert(Severity::Warn, "careful");

@@ -206,9 +206,7 @@ impl FrpDriver for Fake {
         _: &mut Backoff,
         out: &mut Events<'_>,
     ) -> Option<Duration> {
-        if let Some(error) = ended.error {
-            out.alert(Severity::Warn, error.to_string());
-        }
+        out.alert(Severity::Warn, ended.error.to_string());
         if self.inner.give_up.load(Ordering::SeqCst) {
             None
         } else {
@@ -237,9 +235,8 @@ impl FrpSession for FakeSession {
     fn identity(&self) -> &DeviceIdentity {
         &self.identity
     }
-    fn close(self, _: &mut Events<'_>) -> Result<(), FakeError> {
+    fn close(self, _: &mut Events<'_>) {
         self.inner.closes.fetch_add(1, Ordering::SeqCst);
-        Ok(())
     }
 }
 
@@ -559,7 +556,7 @@ fn shots_and_alerts_go_out_under_the_actor_id_to_every_peer() {
     let mut b = h.peer();
     h.wait_for("device+ ");
     h.control.run(|out| {
-        out.shot_trigger_at(key(1), 1_794_063_845_123);
+        out.shot_trigger(key(1), 1_794_063_845_123);
         out.launch(key(1), launch());
         out.alert(Severity::Error, "lens fogged");
         out.shot_finished(key(1));
@@ -591,7 +588,7 @@ fn kinds_that_are_not_a_launch_monitors_are_not_published() {
             Mode::Full,
         ));
         out.frp(flightrelay::BusSync {});
-        out.shot_trigger(key(1));
+        out.shot_trigger(key(1), None);
     });
     let seen = peer.until(|v| kind(v) == "shot.trigger");
     assert!(
@@ -778,7 +775,7 @@ fn a_lost_session_finishes_its_open_shot_and_raises_not_armed() {
     h.wait_for("device+ ");
     h.control.run(|out| {
         out.ready(true);
-        out.shot_trigger(key(3));
+        out.shot_trigger(key(3), None);
     });
     peer.until(|v| kind(v) == "shot.trigger");
     h.control.fail("cable pulled");
@@ -801,7 +798,7 @@ fn a_stop_closes_the_session_and_removes_the_actor() {
     let h = Harness::listen();
     let mut peer = h.peer();
     h.wait_for("device+ ");
-    h.control.run(|out| out.shot_trigger(key(5)));
+    h.control.run(|out| out.shot_trigger(key(5), None));
     peer.until(|v| kind(v) == "shot.trigger");
     let control = h.control.clone();
     assert!(h.stop_and_join().is_ok());
@@ -818,7 +815,7 @@ fn raw_frames_go_out_only_when_configured_and_count_on_across_sessions() {
     off.wait_for("device+ ");
     off.control.run(|out| {
         out.wire(RawDir::Rx, "result", vec![1, 2, 3], utc_ms(), false);
-        out.shot_trigger(key(1));
+        out.shot_trigger(key(1), None);
     });
     let seen = peer.until(|v| kind(v) == "shot.trigger");
     assert!(!kinds(&seen).contains(&"shot.raw"), "{seen:#?}");

@@ -139,9 +139,7 @@
 //!     fn identity(&self) -> &DeviceIdentity {
 //!         &self.identity
 //!     }
-//!     fn close(self, _: &mut Events<'_>) -> Result<(), Error> {
-//!         Ok(())
-//!     }
+//!     fn close(self, _: &mut Events<'_>) {}
 //! }
 //! ```
 
@@ -158,7 +156,7 @@ use std::time::{Duration, Instant};
 
 pub use crate::config::{ConfigError, DriverConfig};
 pub use events::{DeviceEvent, DeviceStatus, Events, HostFlags, Level, StatusChange};
-pub use util::{Backoff, Live, STABLE_SESSION, ShotIds, Stop};
+pub use util::{Backoff, Live, ShotIds, Stop};
 
 use crate::types::{blockers, roles};
 use crate::{
@@ -187,7 +185,7 @@ pub enum Activity {
 const HELPER_TICK: Duration = Duration::from_millis(50);
 
 /// The default [`FrpDriver::STOP_WAIT`].
-pub const DEFAULT_STOP_WAIT: Duration = Duration::from_secs(3);
+const DEFAULT_STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// How a launch monitor plugs into a host. See the [module docs](self).
 pub trait FrpDriver: Send + Sized + 'static {
@@ -203,7 +201,7 @@ pub trait FrpDriver: Send + Sized + 'static {
     type Session: FrpSession<Error = Self::Error, Action = Self::Action>;
 
     /// Longest time from [`Stop::stop`] until [`connect`](Self::connect)
-    /// returns or [`close`](FrpSession::close) ends.
+    /// returns or [`close`](FrpSession::close) ends. Default: 3 s.
     const STOP_WAIT: Duration = DEFAULT_STOP_WAIT;
 
     /// Static facts, known before any I/O, so a host can classify the device
@@ -231,7 +229,9 @@ pub trait FrpDriver: Send + Sized + 'static {
     /// identified; configuring and arming may go on inside
     /// [`step`](FrpSession::step). Events emitted
     /// while connecting (a phase, a hint alert, logs) reach the host at once
-    /// through `ctx.out`.
+    /// through `ctx.out`. When the hints change while it connects, the host
+    /// hands the session the new ones ([`hints`](FrpSession::hints)) before
+    /// its first step, so a connect may read `ctx.hints()` at any point.
     ///
     /// # Errors
     ///
@@ -239,18 +239,18 @@ pub trait FrpDriver: Send + Sized + 'static {
     fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<Self::Session, Self::Error>;
 
     /// How long to wait before the next [`connect`](Self::connect), or `None`
-    /// to give up. The host owns `backoff` (one per driver instance). The
-    /// default emits a warn alert with the error for every failed attempt,
-    /// then asks `backoff`; a driver with its own alert policy overrides it.
+    /// to give up. The host asks after a failed connect or a session that
+    /// ended with an error, never after a stop. The host owns `backoff` (one
+    /// per driver instance). The default emits a warn alert with the error
+    /// for every failed attempt, then asks `backoff`; a driver with its own
+    /// alert policy overrides it.
     fn retry_delay(
         &mut self,
         ended: &SessionEnd<'_, Self::Error>,
         backoff: &mut Backoff,
         out: &mut Events<'_>,
     ) -> Option<Duration> {
-        if let Some(error) = ended.error {
-            out.alert(crate::Severity::Warn, error.to_string());
-        }
+        out.alert(crate::Severity::Warn, ended.error.to_string());
         Some(backoff.delay(ended.connected_for))
     }
 
@@ -271,8 +271,7 @@ pub trait FrpDriver: Send + Sized + 'static {
 /// transport (`impl<S> FrpSession for MySession<S>`) implements this trait
 /// directly.
 pub trait FrpSession: Sized {
-    /// What a step or a close can fail with: the driver's
-    /// [`FrpDriver::Error`].
+    /// What a step can fail with: the driver's [`FrpDriver::Error`].
     type Error;
     /// Device-specific operations: the driver's [`FrpDriver::Action`].
     type Action;
@@ -346,12 +345,9 @@ pub trait FrpSession: Sized {
     /// [`action`](Self::action) returned `Err`. So a session releases the
     /// device here and nowhere else. Dropping a session without `close`
     /// (a panic, a host that broke the rule) must still free the transport,
-    /// only less politely.
-    ///
-    /// # Errors
-    ///
-    /// Returns why the device could not be released cleanly.
-    fn close(self, out: &mut Events<'_>) -> Result<(), Self::Error>;
+    /// only less politely. What goes wrong while releasing goes into `out`
+    /// (a log line); the session is over either way.
+    fn close(self, out: &mut Events<'_>);
 }
 
 /// Returned by [`ConnectCtx::tick`] after a stop; every driver error converts
@@ -369,9 +365,11 @@ pub enum NoAction {}
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct SessionEnd<'a, E> {
-    /// What ended the session or failed the connect; `None` after a clean
-    /// stop.
-    pub error: Option<&'a E>,
+    /// What ended the session or failed the connect.
+    pub error: &'a E,
+    /// When the host asks: the `now` to compare the driver's own timers
+    /// against.
+    pub now: Instant,
     /// How long the session lasted; `None` when [`connect`](FrpDriver::connect)
     /// failed.
     pub connected_for: Option<Duration>,
@@ -381,12 +379,18 @@ pub struct SessionEnd<'a, E> {
 }
 
 impl<'a, E> SessionEnd<'a, E> {
-    /// How a session ended: its `error`, how long it was `connected_for`,
-    /// and the failed connect `attempts` (see the fields).
+    /// How a session ended: its `error`, the host's `now`, how long it was
+    /// `connected_for`, and the failed connect `attempts` (see the fields).
     #[must_use]
-    pub const fn new(error: Option<&'a E>, connected_for: Option<Duration>, attempts: u32) -> Self {
+    pub const fn new(
+        error: &'a E,
+        now: Instant,
+        connected_for: Option<Duration>,
+        attempts: u32,
+    ) -> Self {
         Self {
             error,
+            now,
             connected_for,
             attempts,
         }
@@ -662,7 +666,7 @@ impl TurnHints {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DriverInfo {
-    /// Stable kind for logs, config tables and export labels, e.g.
+    /// Stable short name for logs and a fallback program name, e.g.
     /// `"beacon"`.
     pub kind: &'static str,
     /// Display name, e.g. `"Eagle One launch monitor"`. The name of the
@@ -1143,9 +1147,7 @@ mod tests {
         fn identity(&self) -> &DeviceIdentity {
             &self.0
         }
-        fn close(self, _: &mut Events<'_>) -> Result<(), Oops> {
-            Ok(())
-        }
+        fn close(self, _: &mut Events<'_>) {}
     }
 
     #[test]
@@ -1161,7 +1163,8 @@ mod tests {
         let mut backoff = Backoff::default();
         let mut out = Events::new(&mut sink, &flags);
         let boom = Oops("boom");
-        let failed = |attempts| SessionEnd::new(Some(&boom), None, attempts);
+        let now = Instant::now();
+        let failed = |attempts| SessionEnd::new(&boom, now, None, attempts);
         assert_eq!(
             driver.retry_delay(&failed(1), &mut backoff, &mut out),
             Some(Duration::from_secs(1))
@@ -1170,23 +1173,13 @@ mod tests {
             driver.retry_delay(&failed(2), &mut backoff, &mut out),
             Some(Duration::from_secs(2))
         );
-        // A session that lasted restarts the sequence; a clean end raises no alert.
-        let clean = SessionEnd::<Oops> {
-            error: None,
-            connected_for: Some(STABLE_SESSION),
-            attempts: 0,
-        };
+        // A session that lasted restarts the sequence.
+        let lasted = SessionEnd::new(&boom, now, Some(util::STABLE_SESSION), 0);
         assert_eq!(
-            driver.retry_delay(&clean, &mut backoff, &mut out),
+            driver.retry_delay(&lasted, &mut backoff, &mut out),
             Some(Duration::from_secs(1))
         );
-        assert_eq!(
-            alerts,
-            [
-                (crate::Severity::Warn, "boom".to_owned()),
-                (crate::Severity::Warn, "boom".to_owned())
-            ]
-        );
+        assert_eq!(alerts, vec![(crate::Severity::Warn, "boom".to_owned()); 3]);
         // `hints` and `action` default to ignoring what they are given.
         let mut session = PlainSession(DeviceIdentity::new("Plain-1"), ());
         let mut sink = |_| {};
