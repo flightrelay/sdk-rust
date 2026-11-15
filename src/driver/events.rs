@@ -57,11 +57,10 @@ impl fmt::Display for Level {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum DeviceEvent {
-    /// A message body of this actor, of a kind its roles send: `shot.*` for
-    /// a launch monitor, `game.*` and `golfer.profile` for a game, and
-    /// `golfer.select`, `bus.reply` and `bus.alert` for any. The host
-    /// publishes it with the actor's id as `from`; other kinds are not the
-    /// driver's to send, and the host drops them.
+    /// A message body of this actor, of a kind its roles send
+    /// ([`DriverInfo::sends`](super::DriverInfo::sends) is the rule). The
+    /// host publishes it with the actor's id as `from`; other kinds are not
+    /// the driver's to send, and the host drops them.
     Frp(FrpBody),
     /// The device's whole status: blockers, battery, telemetry, flagged
     /// values. It replaces the status the host holds: a battery it leaves
@@ -155,6 +154,9 @@ impl DeviceStatus {
     /// [`blockers::NOT_ARMED`], no battery, and this status's telemetry and
     /// flagged values (a flagged `battery_pct` goes with the battery). A
     /// connect's blockers and battery count once its session is up.
+    ///
+    /// The host keeps the status it holds and publishes this in its place;
+    /// once the session is up the actor carries the held status whole.
     #[must_use]
     pub fn off_session(&self) -> Self {
         let mut held = Self::not_armed();

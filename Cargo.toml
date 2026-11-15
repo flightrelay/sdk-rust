@@ -29,7 +29,8 @@ transport = ["dep:tungstenite"]
 config = []
 # The FrpDriver / FrpSession contract between a launch monitor and its host.
 driver = ["config"]
-# FrpServer, which runs a driver as a launch monitor actor on the bus.
+# FrpServer, which hosts one driver as an actor on the bus; its roles decide
+# what it sends.
 server = ["driver", "transport"]
 # run, a complete main for a driver: config file, --set, --help, Ctrl-C.
 main = ["server", "dep:toml", "dep:ctrlc"]

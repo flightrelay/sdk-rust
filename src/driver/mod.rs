@@ -33,7 +33,8 @@
 //! otherwise. It emits [`DeviceEvent`]s into an [`Events`] sink: message
 //! bodies of the kinds its roles send (`shot.*` for a launch monitor,
 //! `game.*` and `golfer.profile` for a game, and `golfer.select`,
-//! `bus.reply` and `bus.alert` for any), which the host drops otherwise;
+//! `bus.reply` and `bus.alert` for any; [`DriverInfo::sends`] is the rule),
+//! which the host drops otherwise;
 //! its status (the `blockers`, battery, telemetry and flagged values of its
 //! `bus.actor`); and three host-only kinds (phase, log, shot discarded). It
 //! sends each shot message once, when it has it, and leaves out any value
@@ -812,6 +813,9 @@ impl DriverInfo {
     /// [launch monitor](roles::LAUNCH_MONITOR) sends `shot.*`. Everything
     /// else is the host's (`bus.actor`, `bus.sync`) or another role's
     /// (`golfer.turn`, `practice.*`), and a host drops it.
+    ///
+    /// `shot.raw` is a `shot.*` kind: only a launch monitor's goes on the
+    /// bus. A host that keeps raw frames itself takes them before asking.
     #[must_use]
     pub fn sends(&self, body: &FrpBody) -> bool {
         let kind = body.kind();
@@ -1183,6 +1187,10 @@ mod tests {
                 [false; 4],
             ),
             (BusSync::new().into(), [false; 4]),
+            (
+                crate::RawFrame::new(crate::RawDir::Rx, 99, vec![1]).into(),
+                [false, false, false, true],
+            ),
         ];
         for (body, want) in bodies {
             let got = [&output, &game, &issuer, &monitor].map(|info| info.sends(&body));

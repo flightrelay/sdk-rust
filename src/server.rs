@@ -1,4 +1,4 @@
-//! [`FrpServer`]: run a [`FrpDriver`] as a launch monitor actor on the bus.
+//! [`FrpServer`]: run a [`FrpDriver`] as an actor on the bus.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -156,11 +156,12 @@ pub enum ServerError<E: Error + 'static> {
 
 type Observer = Box<dyn FnMut(&ServerEvent<'_>)>;
 
-/// Runs a driver as a launch monitor actor on the bus.
+/// Runs a driver as an actor on the bus.
 ///
-/// Requires the `server` feature. The server connects the driver, steps its
-/// session and publishes what the driver emits as one launch monitor actor,
-/// with the actor id the host gives it ([`ServerConfig::actor_id`]). It
+/// Requires the `server` feature. The server hosts one driver: it connects
+/// the driver, steps its session and publishes what the driver emits as one
+/// actor with the driver's roles, which decide what it sends, with the actor
+/// id the host gives it ([`ServerConfig::actor_id`]). It
 /// listens for peers (listen mode, a hub of its own) or dials one (bridge
 /// mode), and reconnects the driver with the driver's advised delay, so a
 /// host's `main` is a driver, a config and one call; `run` (feature `main`)
@@ -1483,6 +1484,12 @@ mod tests {
         assert!(net.actor.is_clear(), "the session is up: ready");
         assert_eq!(net.actor.device.as_ref().unwrap().battery_pct, Some(50));
         assert_eq!(net.actor.flagged, ["battery_pct", "radar_mode"]);
+        // A connect after a session starts from `not_armed` as well.
+        net.handle(ToNet::SessionEnded, t0);
+        net.handle(ToNet::ConnectStarted, t0);
+        net.handle(ToNet::Status(reported()), t0);
+        assert_eq!(net.actor.blockers, ["not_armed"], "the old session is over");
+        assert_eq!(net.actor.device.as_ref().unwrap().battery_pct, None);
     }
 
     #[test]
