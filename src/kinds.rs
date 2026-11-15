@@ -27,7 +27,7 @@ pub struct BusActor {
     pub frp: String,
     /// The interval, in seconds, at which the actor republishes `bus.actor`.
     pub heartbeat: f64,
-    /// The actor's roles; see [`roles`](crate::types::roles). Other strings
+    /// The actor's roles; see [`roles`](crate::roles). Other strings
     /// are allowed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
@@ -35,7 +35,7 @@ pub struct BusActor {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub namespaces: Vec<String>,
     /// The actor's own reasons a shot shouldn't be taken now; empty when it
-    /// sees none. See [`blockers`](crate::types::blockers). Display only: no
+    /// sees none. See [`blockers`](crate::blockers). Display only: no
     /// actor is required to act on another actor's blockers.
     pub blockers: Vec<String>,
     /// For launch monitors: the device behind the actor. A value that is
@@ -110,7 +110,7 @@ impl BusActor {
     }
 
     /// Whether the actor lists the blocker `blocker`, e.g.
-    /// [`blockers::NOT_ARMED`](crate::types::blockers::NOT_ARMED).
+    /// [`blockers::NOT_ARMED`](crate::blockers::NOT_ARMED).
     #[must_use]
     pub fn has_blocker(&self, blocker: &str) -> bool {
         self.blockers.iter().any(|b| b == blocker)
@@ -986,7 +986,7 @@ pub struct GameBall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distance_to_hole: Option<Distance>,
     /// While the game's `bus.actor` lists
-    /// [`blockers::AWAITING_DECISION`](crate::types::blockers::AWAITING_DECISION): text for people,
+    /// [`blockers::AWAITING_DECISION`](crate::blockers::AWAITING_DECISION): text for people,
     /// e.g. "Take a drop?".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,

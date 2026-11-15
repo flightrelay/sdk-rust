@@ -214,7 +214,7 @@ fn spec_examples_parse_to_the_expected_values() {
     };
     assert_eq!(actor.heartbeat, 2.0);
     assert!(actor.is_clear());
-    assert!(actor.has_role(crate::types::roles::LAUNCH_MONITOR));
+    assert!(actor.has_role(crate::roles::LAUNCH_MONITOR));
     let device = actor.device.unwrap();
     assert_eq!(device.source, Some(Source::Measured));
     assert_eq!(device.battery_pct, Some(82));
@@ -529,7 +529,7 @@ fn lenient_device_fields_and_reply_errors() {
     assert_eq!(device.source, None);
     assert_eq!(device.battery_pct, None);
     assert_eq!(device.model.as_deref(), Some("M"));
-    assert!(actor.has_blocker(crate::types::blockers::NOT_ARMED));
+    assert!(actor.has_blocker(crate::blockers::NOT_ARMED));
     assert!(
         actor.has_blocker("warming_up"),
         "unknown blockers are kept as is"
@@ -667,8 +667,8 @@ fn every_club_code_round_trips() {
 #[test]
 fn builders_make_the_matching_messages() {
     let actor = BusActor::new("Clubhouse", 2.0)
-        .with_role(crate::types::roles::SESSION)
-        .with_role(crate::types::roles::PRACTICE)
+        .with_role(crate::roles::SESSION)
+        .with_role(crate::roles::PRACTICE)
         .with_namespace("clubhouse");
     let v: Value =
         serde_json::from_str(&FrpMessage::new(CLUBHOUSE, actor).to_json().unwrap()).unwrap();

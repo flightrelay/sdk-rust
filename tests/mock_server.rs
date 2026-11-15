@@ -7,11 +7,10 @@ use std::time::{Duration, Instant};
 
 use flightrelay::driver::{FrpDriver, Stop};
 use flightrelay::mock::{MockConfig, MockDriver};
-use flightrelay::types::roles;
 use flightrelay::{
     Basis, BusActor, BusState, EndpointConfig, FrpBody, FrpEndpoint, FrpMessage, FrpServer,
     GolferTurn, Handedness, Mode, ServerConfig, ServerEvent, ShotAccumulator, ShotEvent, Source,
-    Target,
+    Target, roles,
 };
 
 const MOCK: &str = "7d2f9a41c03be856";

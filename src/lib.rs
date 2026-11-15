@@ -101,10 +101,9 @@
 //! # #[cfg(feature = "transport")]
 //! # fn main() -> Result<(), flightrelay::FrpError> {
 //! use std::time::Instant;
-//! use flightrelay::types::roles;
 //! use flightrelay::{
 //!     BusActor, DEFAULT_HEARTBEAT, EndpointConfig, FrpBody, FrpEndpoint, FrpMessage,
-//!     Target,
+//!     Target, roles,
 //! };
 //!
 //! // Generate the id once and keep it across restarts.
@@ -183,7 +182,7 @@ mod rand;
 mod error;
 mod kinds;
 mod message;
-pub mod types;
+mod types;
 mod units;
 
 #[cfg(feature = "collector")]
@@ -232,7 +231,7 @@ pub use message::{Class, FrpBody, FrpMessage, KINDS, Removal, StateKey, StateKin
 pub use types::{
     AssumedLaunch, Basis, Club, ClubData, FaceImpact, FlightResult, GolferId, Handedness,
     InvalidGolferId, InvalidUnitValue, Launch, Mode, Position, RawDir, RawFrame, Severity, Sex,
-    ShotKey, Source, UnknownClub,
+    ShotKey, Source, UnknownClub, blockers, roles,
 };
 pub use units::{Distance, Velocity};
 
