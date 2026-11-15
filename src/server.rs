@@ -123,8 +123,8 @@ pub enum ServerEvent<'a> {
     DeviceConnected(&'a DeviceIdentity),
     /// A connect failed or a session ended.
     DeviceLost {
-        /// What went wrong; `None` after a stop.
-        error: Option<&'a dyn Error>,
+        /// What went wrong.
+        error: &'a dyn Error,
         /// When the next attempt starts; `None` when the driver gave up.
         retry_in: Option<Duration>,
     },
@@ -187,13 +187,14 @@ type Observer = Box<dyn FnMut(&ServerEvent<'_>)>;
 ///   identified device's manufacturer and model, else
 ///   [`DriverInfo::name`]), and a `device` block: manufacturer, model and
 ///   firmware from the last session's identity, `source` from
-///   [`DriverInfo::source`], and the battery and attitude the driver
-///   reports. Its `blockers`, battery, attitude and telemetry are exactly
-///   the driver's current [`DeviceStatus`]: a value the driver takes off
-///   (`battery(None)`, a whole status without it) is off the next
-///   `bus.actor`. Before the first session and whenever a session ends the
-///   status is [`DeviceStatus::not_armed`]. The device's own id and card
-///   label never go on the bus.
+///   [`DriverInfo::source`], and the battery the driver reports. Its
+///   `blockers`, battery and flagged values are the driver's current
+///   [`DeviceStatus`] (a battery the driver takes off is off the next
+///   `bus.actor`), and its `telemetry` is every key of
+///   [`DriverInfo::telemetry`], with the driver's value or the declared one.
+///   Before the first session and whenever a session ends the status is
+///   [`DeviceStatus::not_armed`]. The device's own id and card label never
+///   go on the bus.
 /// - What the driver emits goes out under the actor id: `shot.*` messages
 ///   and `bus.alert`. A `shot.raw` is numbered per actor, across sessions,
 ///   and goes out only while [`ServerConfig::raw_frames`] is on; drivers
@@ -479,7 +480,7 @@ impl<D: FrpDriver> FrpServer<D> {
                 &mut Events::new(&mut sink, &flags),
             );
             observe(&ServerEvent::DeviceLost {
-                error: Some(&error),
+                error: &error,
                 retry_in: delay,
             });
             let Some(delay) = delay else {
@@ -996,8 +997,8 @@ impl Net {
     }
 
     /// Finishes the session's open shots and takes what the session
-    /// reported off the actor: it is `not_armed`, with no battery, attitude
-    /// or telemetry.
+    /// reported off the actor: it is `not_armed`, with no battery, nothing
+    /// flagged and each telemetry key at its declared value.
     fn on_session_ended(&mut self) {
         self.finish_open_shots("the session ended");
         if self.clear_session_status() {
@@ -1006,7 +1007,8 @@ impl Net {
     }
 
     /// Goes back to [`DeviceStatus::not_armed`]: blockers `not_armed`, no
-    /// battery, attitude or telemetry. Returns whether the actor changed.
+    /// battery, nothing flagged, each telemetry key at its declared value.
+    /// Returns whether the actor changed.
     fn clear_session_status(&mut self) -> bool {
         self.apply_status(DeviceStatus::not_armed())
     }
@@ -1076,8 +1078,9 @@ mod tests {
     }
 
     fn net_with_notes(config: &ServerConfig) -> (Net, Receiver<Note>) {
-        let info =
-            DriverInfo::new("beacon", "Beacon", Source::Virtual).with_manufacturer("Birdie Labs");
+        let info = DriverInfo::new("beacon", "Beacon", Source::Virtual)
+            .with_manufacturer("Birdie Labs")
+            .with_telemetry(&[("radar_mode", "idle"), ("signal", "none")]);
         net_with_info(config, &info)
     }
 
@@ -1188,8 +1191,7 @@ mod tests {
         assert!(net.apply_change(StatusChange::Blockers(vec![])));
         assert!(net.apply_change(StatusChange::Battery(Some(80))));
         assert!(!net.apply_change(StatusChange::Battery(Some(80))));
-        let set =
-            StatusChange::Telemetry([("radar_mode".to_owned(), Some("armed".to_owned()))].into());
+        let set = StatusChange::Telemetry([("radar_mode".to_owned(), "armed".to_owned())].into());
         assert!(net.apply_change(set.clone()));
         assert!(!net.apply_change(set));
         assert!(net.actor.is_clear());
@@ -1198,35 +1200,37 @@ mod tests {
     }
 
     #[test]
-    fn a_driver_can_take_each_value_off_the_actor() {
+    fn every_declared_key_is_on_the_actor_and_the_battery_can_come_off() {
         let mut net = net(None);
+        assert_eq!(
+            net.actor.telemetry,
+            Some(
+                [
+                    ("radar_mode".to_owned(), "idle".to_owned()),
+                    ("signal".to_owned(), "none".to_owned()),
+                ]
+                .into()
+            ),
+            "the declared values before anything is reported"
+        );
         net.apply_status(
             DeviceStatus::new()
                 .with_blockers(["no_ball"])
                 .with_battery(80)
-                .with_attitude(0.4, -0.2)
-                .with_telemetry("radar_mode", "armed"),
+                .with_telemetry("radar_mode", "armed")
+                .with_flag("battery_pct", true),
         );
+        assert_eq!(net.actor.flagged, ["battery_pct"]);
         assert!(net.apply_change(StatusChange::Battery(None)));
-        assert!(net.apply_change(StatusChange::Attitude {
-            tilt: None,
-            roll: None
-        }));
-        assert!(net.apply_change(StatusChange::Telemetry(
-            [("radar_mode".to_owned(), None)].into()
-        )));
+        assert!(net.apply_change(StatusChange::Flag("battery_pct".into(), false)));
         assert!(net.apply_change(StatusChange::Blockers(vec![])));
-        let device = net.actor.device.as_ref().unwrap();
-        assert_eq!(
-            (device.battery_pct, device.tilt, device.roll),
-            (None, None, None)
-        );
-        assert_eq!(net.actor.telemetry, None, "no keys: no telemetry object");
+        assert_eq!(net.actor.device.as_ref().unwrap().battery_pct, None);
         assert!(net.actor.is_clear());
         let json = net.actor_message().to_json().unwrap();
-        for gone in ["battery_pct", "tilt", "roll", "telemetry", "radar_mode"] {
+        for gone in ["battery_pct", "flagged"] {
             assert!(!json.contains(gone), "{gone} is off the bus: {json}");
         }
+        assert!(json.contains(r#""radar_mode":"armed""#), "{json}");
     }
 
     #[test]
@@ -1235,20 +1239,25 @@ mod tests {
         net.apply_status(
             DeviceStatus::new()
                 .with_battery(80)
-                .with_attitude(0.4, -0.2)
                 .with_telemetry("radar_mode", "armed")
                 .with_telemetry("signal", "good"),
         );
         assert!(net.apply_status(DeviceStatus::new().with_telemetry("signal", "weak")));
-        let device = net.actor.device.as_ref().unwrap();
         assert_eq!(
-            (device.battery_pct, device.tilt, device.roll),
-            (None, None, None),
-            "what the new status leaves out is gone"
+            net.actor.device.as_ref().unwrap().battery_pct,
+            None,
+            "a battery the new status leaves out is gone"
         );
         assert_eq!(
             net.actor.telemetry,
-            Some([("signal".to_owned(), "weak".to_owned())].into())
+            Some(
+                [
+                    ("radar_mode".to_owned(), "idle".to_owned()),
+                    ("signal".to_owned(), "weak".to_owned()),
+                ]
+                .into()
+            ),
+            "a key it leaves out is back at its declared value"
         );
         assert!(net.actor.is_clear());
         assert!(!net.apply_status(DeviceStatus::new().with_telemetry("signal", "weak")));
@@ -1409,17 +1418,17 @@ mod tests {
         net.apply_identity(&identity);
         let status = DeviceStatus::new()
             .with_battery(80)
-            .with_attitude(0.4, -0.2)
             .with_telemetry("radar_mode", "armed");
         assert!(net.apply_status(status));
         net.on_session_ended();
         assert_eq!(net.actor.blockers, ["not_armed"]);
-        assert_eq!(net.actor.telemetry, None);
-        let device = net.actor.device.as_ref().unwrap();
         assert_eq!(
-            (device.battery_pct, device.tilt, device.roll),
-            (None, None, None)
+            net.actor.telemetry.as_ref().unwrap()["radar_mode"],
+            "idle",
+            "back at its declared value"
         );
+        let device = net.actor.device.as_ref().unwrap();
+        assert_eq!(device.battery_pct, None);
         assert_eq!(device.model.as_deref(), Some("Eagle One"), "identity stays");
         assert!(!net.clear_session_status(), "a second end changes nothing");
         assert_eq!(net.status, DeviceStatus::not_armed());

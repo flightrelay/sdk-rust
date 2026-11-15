@@ -56,12 +56,23 @@ pub struct BusActor {
         deserialize_with = "crate::lenient::map"
     )]
     pub telemetry: Option<BTreeMap<String, String>>,
+    /// The values that need the user's attention now: telemetry keys, and
+    /// `battery_pct`. The actor decides what is out of range. Replaced whole
+    /// like [`blockers`](Self::blockers); empty (absent on the wire) when
+    /// nothing is flagged. Display only. An entry that is not a string is
+    /// left out.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::lenient::list"
+    )]
+    pub flagged: Vec<String>,
 }
 
 impl BusActor {
     /// An actor named `name` that speaks [`SPEC_VERSION`](crate::SPEC_VERSION)
     /// and republishes every `heartbeat` seconds, with no roles, namespaces,
-    /// blockers, device or telemetry.
+    /// blockers, device, telemetry or flagged values.
     #[must_use]
     pub fn new(name: impl Into<String>, heartbeat: f64) -> Self {
         Self {
@@ -73,6 +84,7 @@ impl BusActor {
             blockers: Vec::new(),
             device: None,
             telemetry: None,
+            flagged: Vec::new(),
         }
     }
 
@@ -161,20 +173,6 @@ pub struct DeviceInfo {
         deserialize_with = "battery"
     )]
     pub battery_pct: Option<u8>,
-    /// Device attitude, degrees.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::lenient::option"
-    )]
-    pub tilt: Option<f64>,
-    /// Device attitude, degrees.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::lenient::option"
-    )]
-    pub roll: Option<f64>,
 }
 
 fn battery<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u8>, D::Error> {

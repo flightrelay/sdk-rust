@@ -594,18 +594,18 @@ fn describe_prints_the_log_lines_it_is_given() {
     assert_eq!(info.as_deref(), Some("debug: detail"));
     assert_eq!(
         describe(
-            &ServerEvent::Device(&DeviceEvent::Phase("arming")),
+            &ServerEvent::Device(&DeviceEvent::Phase("measuring")),
             Level::Info
         ),
         None
     );
     assert_eq!(
         describe(
-            &ServerEvent::Device(&DeviceEvent::Phase("arming")),
+            &ServerEvent::Device(&DeviceEvent::Phase("measuring")),
             Level::Debug
         )
         .as_deref(),
-        Some("phase: arming")
+        Some("phase: measuring")
     );
 }
 
@@ -614,13 +614,14 @@ fn delays_print_in_the_unit_that_keeps_them_visible() {
     assert_eq!(delay_text(Duration::from_millis(50)), "50 ms");
     assert_eq!(delay_text(Duration::from_secs(2)), "2 s");
     assert_eq!(delay_text(Duration::from_millis(1500)), "1.5 s");
+    let error = std::io::Error::other("link down");
     let lost = ServerEvent::DeviceLost {
-        error: None,
+        error: &error,
         retry_in: Some(Duration::from_millis(50)),
     };
     assert_eq!(
         describe(&lost, Level::Info).as_deref(),
-        Some("device lost: stopped; retrying in 50 ms")
+        Some("device lost: link down; retrying in 50 ms")
     );
 }
 

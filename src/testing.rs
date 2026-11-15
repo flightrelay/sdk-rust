@@ -539,7 +539,7 @@ mod tests {
         assert_eq!(status(&[]), DeviceStatus::not_armed());
         let events = [
             DeviceEvent::StatusChange(StatusChange::Battery(Some(80))),
-            DeviceEvent::Phase("arming"),
+            DeviceEvent::Phase("measuring"),
             DeviceEvent::StatusChange(StatusChange::Blockers(vec![])),
             DeviceEvent::Status(DeviceStatus::new().with_telemetry("mode", "full")),
             DeviceEvent::StatusChange(StatusChange::Battery(Some(70))),

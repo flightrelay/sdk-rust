@@ -146,7 +146,11 @@ impl FrpDriver for Fake {
     const STOP_WAIT: Duration = Duration::from_secs(1);
 
     fn info(_: &FakeConfig) -> DriverInfo {
-        DriverInfo::new("fake", "Fake launch monitor", Source::Virtual)
+        DriverInfo::new("fake", "Fake launch monitor", Source::Virtual).with_telemetry(&[
+            ("radar_mode", "idle"),
+            ("temp_c", "unknown"),
+            ("tilt", "unknown"),
+        ])
     }
     fn new(config: FakeConfig) -> Result<Self, ConfigError> {
         let (mut driver, _) = fake();
@@ -361,10 +365,7 @@ fn render(event: &ServerEvent<'_>) -> String {
         ServerEvent::PeerLeft { addr, reason } => format!("peer- {addr:?}: {reason}"),
         ServerEvent::DeviceConnected(id) => format!("device+ {}", id.device),
         ServerEvent::DeviceLost { error, retry_in } => {
-            format!(
-                "lost {:?} retry={retry_in:?}",
-                error.map(ToString::to_string)
-            )
+            format!("lost {error} retry={retry_in:?}")
         }
         ServerEvent::Device(event) => format!("device {event:?}"),
         ServerEvent::Hints(hints) => format!("hints {hints:?}"),
@@ -745,20 +746,24 @@ fn driver_status_is_merged_into_the_actor() {
     h.control.run(|out| {
         out.blockers(["no_ball"]);
         out.battery(82);
-        out.attitude(0.4, -0.2);
-        out.telemetry([("radar_mode", "armed")]);
+        out.telemetry([("radar_mode", "armed"), ("tilt", "6.5°")]);
+        out.flag("tilt", true);
     });
-    let seen = peer.until(|v| v["telemetry"]["radar_mode"] == "armed");
+    let seen = peer.until(|v| v["flagged"] == json!(["tilt"]));
     let actor = seen.last().unwrap();
     assert_eq!(actor["blockers"], json!(["no_ball"]));
     assert_eq!(actor["device"]["battery_pct"], 82);
-    assert_eq!(actor["device"]["tilt"], 0.4);
-    assert_eq!(actor["device"]["roll"], -0.2);
+    assert_eq!(actor["telemetry"]["radar_mode"], "armed");
+    assert_eq!(
+        actor["telemetry"]["temp_c"], "unknown",
+        "declared, not reported"
+    );
     // Telemetry keys merge; the rest stays.
     h.control.run(|out| out.telemetry([("temp_c", "21")]));
     let seen = peer.until(|v| v["telemetry"]["temp_c"] == "21");
     let actor = seen.last().unwrap();
     assert_eq!(actor["telemetry"]["radar_mode"], "armed");
+    assert_eq!(actor["flagged"], json!(["tilt"]));
     assert_eq!(actor["device"]["battery_pct"], 82);
     // A status that changes nothing publishes nothing: the next actor is
     // the one for the change after it.

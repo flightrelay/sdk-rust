@@ -34,18 +34,20 @@
 //! bodies of the kinds its roles send (`shot.*` for a launch monitor,
 //! `game.*` and `golfer.profile` for a game, and `golfer.select`,
 //! `bus.reply` and `bus.alert` for any), which the host drops otherwise;
-//! its status (the `blockers`, battery, attitude and telemetry of its
+//! its status (the `blockers`, battery, telemetry and flagged values of its
 //! `bus.actor`); and three host-only kinds (phase, log, shot discarded). It
 //! sends each shot message once, when it has it, and leaves out any value
 //! the device does not have. The host stamps every message with the actor's
 //! id and publishes the actor's `bus.actor`.
 //!
-//! The host holds the driver's current [`DeviceStatus`] and publishes exactly
-//! that: the driver sends it whole ([`Events::status`]) or one part at a time
-//! ([`Events::blockers`], [`Events::battery`], [`Events::attitude`],
-//! [`Events::telemetry`]), and takes a value off the actor the same way
-//! (`battery(None)`, [`Events::clear_telemetry`]). When a session ends the
-//! host goes back to [`DeviceStatus::not_armed`].
+//! The host holds the driver's current [`DeviceStatus`] and publishes it:
+//! the driver sends it whole ([`Events::status`]) or one part at a time
+//! ([`Events::blockers`], [`Events::battery`], [`Events::telemetry`],
+//! [`Events::flag`]). Its telemetry keys are fixed: the driver declares
+//! each one with the value it has while not reported
+//! ([`DriverInfo::telemetry`]), and every `bus.actor` carries every one of
+//! them, in every state. When a session ends the host goes back to
+//! [`DeviceStatus::not_armed`].
 //!
 //! The driver reads `golfer.turn` as [`TurnHints`]: each turn replaces all
 //! the hints (handedness, club, mode), and a field that is `null` or not
@@ -692,6 +694,14 @@ pub struct DriverInfo {
     /// [`BusActor::namespaces`](crate::BusActor::namespaces). Empty for a
     /// device that issues no golfer ids.
     pub namespaces: &'static [&'static str],
+    /// Every telemetry key the driver reports, each with the value its
+    /// actor carries while the driver has not reported one (`"none"`,
+    /// `"unknown"`, `"idle"`). FRP has an actor send every telemetry key it
+    /// uses in every `bus.actor`, from its first one on, with a value even
+    /// when it has nothing to report (spec, `bus.actor`, "`telemetry`");
+    /// [`bus_actor`](Self::bus_actor) publishes exactly these keys. Empty
+    /// for a driver with no telemetry.
+    pub telemetry: &'static [(&'static str, &'static str)],
 }
 
 impl DriverInfo {
@@ -709,6 +719,7 @@ impl DriverInfo {
             raw: None,
             roles: &[roles::LAUNCH_MONITOR],
             namespaces: &[],
+            telemetry: &[],
         }
     }
 
@@ -747,6 +758,15 @@ impl DriverInfo {
         self
     }
 
+    /// Declare the telemetry keys, each with the value its actor carries
+    /// while the driver has not reported one. Every `bus.actor` carries
+    /// every key, as FRP asks (spec, `bus.actor`, "`telemetry`").
+    #[must_use]
+    pub fn with_telemetry(mut self, keys: &'static [(&'static str, &'static str)]) -> Self {
+        self.telemetry = keys;
+        self
+    }
+
     /// Set the raw-frame profile.
     #[must_use]
     pub fn with_raw(mut self, raw: RawProfile) -> Self {
@@ -781,10 +801,16 @@ impl DriverInfo {
     /// [`roles`](Self::roles) and [`namespaces`](Self::namespaces); a
     /// `device` block with the manufacturer (the identity's, else this
     /// driver's), the identity's model and firmware, this driver's
-    /// [`source`](Self::source), and the status's battery and attitude;
-    /// and the status's blockers and telemetry, exactly. `not_armed` is a
-    /// launch monitor's blocker, so an actor without that role leaves it
-    /// out. The device's own id and label never go on it.
+    /// [`source`](Self::source), and the status's battery; the status's
+    /// blockers and flagged values; and every declared
+    /// [`telemetry`](Self::telemetry) key, with the status's value or, when
+    /// it has none, the declared one. `not_armed` is a launch monitor's
+    /// blocker, so an actor without that role leaves it out. The device's
+    /// own id and label never go on it.
+    ///
+    /// A telemetry key the status has that is not declared is not
+    /// published (a debug build panics on it), nor is a flagged value that
+    /// is neither a declared key nor `battery_pct`.
     #[must_use]
     pub fn bus_actor(
         &self,
@@ -808,14 +834,36 @@ impl DriverInfo {
             firmware: identity.and_then(|i| i.firmware.clone()),
             source: Some(self.source),
             battery_pct: status.battery_pct.map(|p| p.min(100)),
-            tilt: status.tilt,
-            roll: status.roll,
         });
         actor.blockers.clone_from(&status.blockers);
         if !self.roles.contains(&roles::LAUNCH_MONITOR) {
             actor.blockers.retain(|b| b != blockers::NOT_ARMED);
         }
-        actor.telemetry = (!status.telemetry.is_empty()).then(|| status.telemetry.clone());
+        let declared = |key: &str| self.telemetry.iter().any(|(d, _)| *d == key);
+        debug_assert!(
+            status.telemetry.keys().all(|k| declared(k)),
+            "a telemetry key is not in DriverInfo::telemetry: {:?}",
+            status.telemetry.keys().collect::<Vec<_>>()
+        );
+        debug_assert!(
+            status
+                .flagged
+                .iter()
+                .all(|k| k == "battery_pct" || declared(k)),
+            "a flagged value is not battery_pct or in DriverInfo::telemetry: {:?}",
+            status.flagged
+        );
+        let rows = self.telemetry.iter().map(|&(key, unset)| {
+            let value = status.telemetry.get(key).map_or(unset, String::as_str);
+            (key.to_owned(), value.to_owned())
+        });
+        actor.telemetry = (!self.telemetry.is_empty()).then(|| rows.collect());
+        actor.flagged = status
+            .flagged
+            .iter()
+            .filter(|k| *k == "battery_pct" || declared(k))
+            .cloned()
+            .collect();
         actor
     }
 }
@@ -1017,16 +1065,24 @@ mod tests {
     fn the_bus_actor_carries_the_facts_identity_and_status() {
         let info = DriverInfo::new("beacon", "Beacon", Source::Measured)
             .with_manufacturer("Birdie Labs")
-            .with_namespaces(&["range"]);
+            .with_namespaces(&["range"])
+            .with_telemetry(&[("mode", "unknown"), ("signal", "none")]);
         let status = DeviceStatus::not_armed()
             .with_battery(80)
-            .with_telemetry("mode", "full");
+            .with_telemetry("mode", "full")
+            .with_flag("mode", true);
         let actor = info.bus_actor("Bay 3", Duration::from_secs(2), None, &status);
         assert_eq!(actor.name, "Bay 3");
         assert!(actor.has_role(roles::LAUNCH_MONITOR));
         assert_eq!(actor.namespaces, ["range"]);
         assert_eq!(actor.blockers, ["not_armed"]);
-        assert_eq!(actor.telemetry.as_ref().unwrap()["mode"], "full");
+        let telemetry = actor.telemetry.as_ref().unwrap();
+        assert_eq!(telemetry["mode"], "full");
+        assert_eq!(
+            telemetry["signal"], "none",
+            "a key not reported: its declared value"
+        );
+        assert_eq!(actor.flagged, ["mode"]);
         let device = actor.device.unwrap();
         assert_eq!(device.manufacturer.as_deref(), Some("Birdie Labs"));
         assert_eq!(device.source, Some(Source::Measured));

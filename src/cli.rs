@@ -755,13 +755,10 @@ fn describe(event: &ServerEvent<'_>, log: Level) -> Option<String> {
         ServerEvent::DeviceConnected(identity) => {
             format!("device connected: {}", identity.label())
         }
-        ServerEvent::DeviceLost { error, retry_in } => {
-            let why = error.map_or_else(|| "stopped".to_owned(), ToString::to_string);
-            match retry_in {
-                Some(d) => format!("device lost: {why}; retrying in {}", delay_text(*d)),
-                None => format!("device lost: {why}; giving up"),
-            }
-        }
+        ServerEvent::DeviceLost { error, retry_in } => match retry_in {
+            Some(d) => format!("device lost: {error}; retrying in {}", delay_text(*d)),
+            None => format!("device lost: {error}; giving up"),
+        },
         ServerEvent::Hints(hints) => format!(
             "turn: hand={} club={} mode={}",
             opt(hints.handedness.map(|h| h.to_string())),

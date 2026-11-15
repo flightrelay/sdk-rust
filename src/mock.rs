@@ -177,6 +177,7 @@ impl FrpDriver for MockDriver {
 
     fn info(_: &MockConfig) -> DriverInfo {
         DriverInfo::new("mock", "Mock launch monitor", Source::Virtual)
+            .with_telemetry(&[("radar_mode", "idle"), ("tracking_mode", "unknown")])
     }
 
     fn new(config: MockConfig) -> Result<Self, ConfigError> {
@@ -192,6 +193,7 @@ impl FrpDriver for MockDriver {
     }
 
     fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<MockSession, MockError> {
+        ctx.out.phase("connecting");
         ctx.tick()?;
         let mode = ctx.hints().mode.unwrap_or(Mode::Full);
         Ok(MockSession {
@@ -279,6 +281,7 @@ impl FrpSession for MockSession {
         };
         match self.phase {
             Phase::Start => {
+                out.phase("measuring");
                 out.blockers([blockers::NOT_ARMED]);
                 self.mode_telemetry(out, "idle");
                 out.log(Level::Info, "mock: connected");
@@ -521,7 +524,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 DeviceEvent::StatusChange(StatusChange::Telemetry(t)) => {
-                    t.get("tracking_mode").and_then(Option::as_deref)
+                    t.get("tracking_mode").map(String::as_str)
                 }
                 _ => None,
             })
@@ -530,6 +533,13 @@ mod tests {
             !tracking.is_empty() && tracking.iter().all(|m| *m == "chipping"),
             "{tracking:?}"
         );
+        // Every state's actor carries the same, declared keys.
+        let info = MockDriver::info(&fast());
+        for status in crate::testing::statuses(&seen) {
+            let actor = info.bus_actor("Mock", Duration::from_secs(2), None, &status);
+            let keys: Vec<String> = actor.telemetry.unwrap().into_keys().collect();
+            assert_eq!(keys, ["radar_mode", "tracking_mode"]);
+        }
 
         // One key throughout; the flight is modeled and carries the distances.
         let keys: Vec<_> = bodies(&seen).filter_map(FrpBody::shot_key).collect();
