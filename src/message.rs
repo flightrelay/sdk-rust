@@ -1,23 +1,4 @@
 //! FRP messages: the flat envelope and its parsing.
-//!
-//! Every message is one JSON object with its fields at the top level:
-//! `kind` (the message kind, e.g. `shot.launch`), `from` (the sending
-//! actor's id) and the kind's own fields. [`FrpMessage`] holds `from` and an
-//! [`FrpBody`], which has one variant per kind, each holding that kind's
-//! type from [`kinds`](crate::kinds).
-//!
-//! # Parsing rules
-//!
-//! - A message must be a JSON object with a string `kind` and a string
-//!   `from`; anything else is an [`FrpError::Json`] for that message.
-//! - Unknown fields are ignored.
-//! - A kind this crate doesn't know, including every extension kind
-//!   (`x.<vendor>.<name>`), parses as [`FrpBody::Unknown`], which keeps the
-//!   message's fields so it serializes back unchanged. So does a known kind
-//!   whose fields don't match it (e.g. a `shot.flight` without a recognized
-//!   `basis`). A receiver ignores it; a hub forwards it like any other.
-//! - A state kind with `"removed": true` parses as [`FrpBody::Removed`],
-//!   whatever its other fields.
 
 use std::fmt;
 
@@ -34,6 +15,25 @@ use crate::kinds::{
 use crate::types::{RawFrame, ShotKey};
 
 /// One FRP message: the sending actor and the kind's body.
+///
+/// Every message is one JSON object with its fields at the top level:
+/// `kind` (the message kind, e.g. `shot.launch`), `from` (the sending
+/// actor's id) and the kind's own fields. [`FrpMessage`] holds `from` and an
+/// [`FrpBody`], which has one variant per kind, each holding that kind's
+/// type (e.g. [`ShotLaunch`](crate::ShotLaunch)).
+///
+/// # Parsing rules
+///
+/// - A message must be a JSON object with a string `kind` and a string
+///   `from`; anything else is an [`FrpError::Json`] for that message.
+/// - Unknown fields are ignored.
+/// - A kind this crate doesn't know, including every extension kind
+///   (`x.<vendor>.<name>`), parses as [`FrpBody::Unknown`], which keeps the
+///   message's fields so it serializes back unchanged. So does a known kind
+///   whose fields don't match it (e.g. a `shot.flight` without a recognized
+///   `basis`). A receiver ignores it; a hub forwards it like any other.
+/// - A state kind with `"removed": true` parses as [`FrpBody::Removed`],
+///   whatever its other fields.
 ///
 /// ```
 /// use flightrelay::{FrpBody, FrpMessage, ShotKey, ShotTrigger};
@@ -66,8 +66,8 @@ impl FrpMessage {
         }
     }
 
-    /// Parse one message from JSON text. See the [module docs](self) for the
-    /// rules.
+    /// Parse one message from JSON text, by the
+    /// [parsing rules](FrpMessage#parsing-rules).
     ///
     /// # Errors
     ///
@@ -197,6 +197,7 @@ macro_rules! bodies {
         // gap between variants costs nothing.
         #[allow(clippy::large_enum_variant)]
         #[derive(Debug, Clone, PartialEq)]
+        #[non_exhaustive]
         pub enum FrpBody {
             $( $(#[$doc])* $variant($ty), )*
             /// The removal of a state: the owner's last message for it, with
@@ -378,6 +379,7 @@ impl FrpBody {
 
 /// The message classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Class {
     /// A complete object its owner republishes on change, at start and in
     /// answer to `bus.sync`. The newest replaces the older one.
@@ -391,6 +393,7 @@ pub enum Class {
 
 /// The state kinds: the kinds a [`Removal`] can remove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum StateKind {
     /// `bus.actor`.
     BusActor,

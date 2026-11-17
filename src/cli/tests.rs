@@ -2,14 +2,14 @@
 
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use super::*;
 use crate::config::is_default;
 use crate::driver::{
-    ConnectCtx, DeviceIdentity, DeviceSession, DriverInfo, Events, NoAction, Stopped,
+    Activity, ConnectCtx, DeviceIdentity, DriverInfo, Events, FrpSession, NoAction, Stopped,
 };
 use crate::{EndpointConfig, FrpEndpoint, FrpMessage, Source};
 
@@ -82,7 +82,7 @@ impl From<Stopped> for FakeError {
 struct Fake(Cfg);
 struct FakeSession(DeviceIdentity);
 
-impl DeviceDriver for Fake {
+impl FrpDriver for Fake {
     type Config = Cfg;
     type Error = FakeError;
     type Action = NoAction;
@@ -126,18 +126,16 @@ impl DeviceDriver for Fake {
     }
 }
 
-impl DeviceSession for FakeSession {
-    type Driver = Fake;
-    fn poll(&mut self, timeout: Duration, _: &mut Events<'_>) -> Result<(), FakeError> {
-        std::thread::sleep(timeout.min(Duration::from_millis(10)));
-        Ok(())
+impl FrpSession for FakeSession {
+    type Error = FakeError;
+    type Action = NoAction;
+    fn step(&mut self, _: Instant, _: &mut Events<'_>) -> Result<Activity, FakeError> {
+        Ok(Activity::Idle)
     }
     fn identity(&self) -> &DeviceIdentity {
         &self.0
     }
-    fn close(self, _: &mut Events<'_>) -> Result<(), FakeError> {
-        Ok(())
-    }
+    fn close(self, _: &mut Events<'_>) {}
 }
 
 use crate::driver::SessionEnd;
@@ -543,7 +541,7 @@ fn a_driver_that_gives_up_exits_1() {
 fn a_ws_target_dials_and_anything_else_listens() {
     // A hub that listens: the server dials it.
     let mut hub =
-        FrpEndpoint::open(EndpointConfig::new(crate::Transport::listen("127.0.0.1:0"))).unwrap();
+        FrpEndpoint::open(EndpointConfig::new(crate::Target::listen("127.0.0.1:0"))).unwrap();
     let addr = hub.local_addr().unwrap().unwrap();
     let stop = Stop::new();
     let runner_stop = stop.clone();
@@ -596,18 +594,18 @@ fn describe_prints_the_log_lines_it_is_given() {
     assert_eq!(info.as_deref(), Some("debug: detail"));
     assert_eq!(
         describe(
-            &ServerEvent::Device(&DeviceEvent::Phase("arming")),
+            &ServerEvent::Device(&DeviceEvent::Phase("measuring")),
             Level::Info
         ),
         None
     );
     assert_eq!(
         describe(
-            &ServerEvent::Device(&DeviceEvent::Phase("arming")),
+            &ServerEvent::Device(&DeviceEvent::Phase("measuring")),
             Level::Debug
         )
         .as_deref(),
-        Some("phase: arming")
+        Some("phase: measuring")
     );
 }
 
@@ -616,13 +614,14 @@ fn delays_print_in_the_unit_that_keeps_them_visible() {
     assert_eq!(delay_text(Duration::from_millis(50)), "50 ms");
     assert_eq!(delay_text(Duration::from_secs(2)), "2 s");
     assert_eq!(delay_text(Duration::from_millis(1500)), "1.5 s");
+    let error = std::io::Error::other("link down");
     let lost = ServerEvent::DeviceLost {
-        error: None,
+        error: &error,
         retry_in: Some(Duration::from_millis(50)),
     };
     assert_eq!(
         describe(&lost, Level::Info).as_deref(),
-        Some("device lost: stopped; retrying in 50 ms")
+        Some("device lost: link down; retrying in 50 ms")
     );
 }
 
@@ -805,80 +804,6 @@ fn a_crlf_config_file_stays_crlf() {
 }
 
 #[test]
-fn config_actor_id_generates_saves_and_then_reads_the_id() {
-    let text = "count = 3\n[frp]\nraw_frames = true\nmine = \"kept\"\n";
-    let file = temp_file("helper.toml", text);
-    let first = config_actor_id(&file).unwrap();
-    assert_eq!(first.origin, ActorIdOrigin::Saved);
-    assert_eq!(first.id.len(), 16);
-    let saved = std::fs::read_to_string(&file).unwrap();
-    assert_eq!(actor_id_in(&saved).as_deref(), Some(first.id.as_str()));
-    assert!(
-        saved.starts_with("count = 3\n[frp]\nactor_id = \""),
-        "{saved}"
-    );
-    assert!(
-        saved.ends_with("raw_frames = true\nmine = \"kept\"\n"),
-        "{saved}"
-    );
-
-    let again = config_actor_id(&file).unwrap();
-    assert_eq!(again.origin, ActorIdOrigin::Read);
-    assert_eq!(again.id, first.id);
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), saved, "untouched");
-}
-
-#[test]
-fn config_actor_id_reads_an_id_the_runner_saved() {
-    let file = temp_file("shared.toml", "count = 3\n");
-    let run = go_stopped(&["--config", file.to_str().unwrap()]);
-    assert_eq!(run.code, 0, "{}", run.err);
-    let saved = actor_id_in(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    let kept = config_actor_id(&file).unwrap();
-    assert_eq!((kept.id, kept.origin), (saved, ActorIdOrigin::Read));
-}
-
-#[test]
-fn config_actor_id_leaves_a_table_of_another_shape_untouched() {
-    let text = "count = 3\nfrp = { raw_frames = true }\n";
-    let file = temp_file("helper-inline.toml", text);
-    let kept = config_actor_id(&file).unwrap();
-    assert_eq!(kept.origin, ActorIdOrigin::NotSaved);
-    assert_eq!(kept.id.len(), 16);
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
-}
-
-#[test]
-fn config_actor_id_refuses_a_bad_file() {
-    let missing = std::env::temp_dir().join("flightrelay-cli-no-such-dir/none.toml");
-    assert!(
-        config_actor_id(&missing)
-            .unwrap_err()
-            .to_string()
-            .contains("cannot read")
-    );
-    for (name, text, needle) in [
-        ("helper-bad.toml", "count = = 3\n", "helper-bad.toml"),
-        ("helper-frp-int.toml", "frp = 3\n", "frp"),
-        (
-            "helper-empty-id.toml",
-            "[frp]\nactor_id = \"\"\n",
-            "frp.actor_id",
-        ),
-        (
-            "helper-int-id.toml",
-            "[frp]\nactor_id = 7\n",
-            "frp.actor_id",
-        ),
-    ] {
-        let file = temp_file(name, text);
-        let err = config_actor_id(&file).unwrap_err().to_string();
-        assert!(err.contains(needle), "{name}: {err}");
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), text, "{name}");
-    }
-}
-
-#[test]
 fn without_a_config_file_the_actor_id_lasts_for_the_run() {
     let run = go_stopped(&["--set", "frp.raw_frames=true"]);
     assert_eq!(run.code, 0, "{}", run.err);
@@ -907,7 +832,7 @@ fn runner_keys_are_checked() {
 #[test]
 fn the_runner_publishes_with_the_configured_actor_id() {
     let mut hub =
-        FrpEndpoint::open(EndpointConfig::new(crate::Transport::listen("127.0.0.1:0"))).unwrap();
+        FrpEndpoint::open(EndpointConfig::new(crate::Target::listen("127.0.0.1:0"))).unwrap();
     let addr = hub.local_addr().unwrap().unwrap();
     let stop = Stop::new();
     let runner_stop = stop.clone();

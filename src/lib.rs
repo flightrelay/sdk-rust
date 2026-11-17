@@ -4,6 +4,18 @@
 //! [Flight Relay Protocol](https://github.com/flightrelay/spec) and optional
 //! WebSocket transport, a hub, and a framework for launch monitor drivers.
 //!
+//! The message types need no feature:
+//!
+//! ```
+//! use flightrelay::{FrpBody, FrpMessage, ShotKey, ShotTrigger};
+//!
+//! let msg = FrpMessage::new("7d2f9a41c03be856", ShotTrigger::new(ShotKey::new("id", 1)));
+//! let json = msg.to_json()?;
+//! assert_eq!(FrpMessage::parse(&json)?, msg);
+//! assert!(matches!(msg.body, FrpBody::ShotTrigger(_)));
+//! # Ok::<(), flightrelay::FrpError>(())
+//! ```
+//!
 //! # The bus
 //!
 //! FRP is a multi-producer, multi-consumer bus of **actors**. Every message
@@ -27,9 +39,34 @@
 //! forget all its state. An actor id is a random string generated once by
 //! the host that runs the actor and kept across restarts ([`new_actor_id`]).
 //!
+//! # Message types
+//!
+//! Each kind has one Rust type ([`ShotLaunch`], [`GolferTurn`], …) that
+//! holds the kind's own fields; the envelope fields `kind` and `from` live on
+//! [`FrpMessage`]. Optional fields are left out on the wire while `None`. A
+//! field that is required but may be `null` (e.g. `golfer.turn` `club`) is
+//! an `Option` that writes `null` for `None`. A field that may be absent,
+//! `null` or a value (e.g. `golfer.select` `club`) is an `Option<Option<_>>`:
+//! `None` absent, `Some(None)` null.
+//!
+//! Where a field holds a value from a closed set (a club code, handedness,
+//! mode, sex, a reply error, a match result) or a golfer id, a value that is
+//! not recognized reads as absent and the rest of the message still applies.
+//! Unknown fields are ignored. Distances and velocities are unit-tagged
+//! strings on the wire (`"67.2mps"`, `"180.5m"`), read as [`Distance`] and
+//! [`Velocity`].
+//!
+//! The spec adds optional fields to a kind without changing its version, so
+//! this crate adds them in minor releases. Build a message type with its
+//! `new` (the required fields) or `Default`, set the optional fields you
+//! need with struct update syntax (`Kind { field, ..Kind::new(..) }`), and
+//! match it with `..`; code written that way keeps compiling when a field is
+//! added. [`FrpBody`] and the enums of wire values are
+//! `#[non_exhaustive]` for the same reason.
+//!
 //! # Features
 //!
-//! - **`controller`** — `ShotAggregator`, which composes a shot from its
+//! - **`collector`** — `ShotAccumulator`, which composes a shot from its
 //!   `shot.*` messages, and `BusState`, the current state of the bus with
 //!   removals and heartbeat expiry applied
 //! - **`transport`** — `FrpEndpoint` / `FrpConnection`, the WebSocket
@@ -37,16 +74,20 @@
 //!   connection
 //! - **`config`** — `config::DriverConfig`, the serde settings of a device
 //!   driver
-//! - **`driver`** — the `driver::DeviceDriver` contract between a launch
+//! - **`driver`** — the `driver::FrpDriver` contract between a launch
 //!   monitor and its host (implies `config`)
 //! - **`server`** — `FrpServer`, which runs a driver as a launch monitor
 //!   actor on the bus (implies `driver` and `transport`)
 //! - **`main`** — `run`, a complete `main` for a driver: config file,
-//!   `--set` overrides, `--help`, Ctrl-C; and `config_actor_id`, the actor id
-//!   kept in a config file, for a binary that builds its own `FrpServer`
-//!   (implies `server`; adds `toml` and `ctrlc`)
+//!   `--set` overrides, `--help`, Ctrl-C (implies `server`; adds `toml` and
+//!   `ctrlc`)
 //! - **`mock`** — `mock::MockDriver`, a simulated launch monitor (implies
 //!   `driver`)
+//! - **`testing`** — `testing::TestHost`, a host for driver tests (one
+//!   thread, no sockets, time in steps), and readers of the events a driver
+//!   emitted (implies `driver`)
+//!
+//! No feature is on by default; the message types need none.
 //!
 //! # A collector
 //!
@@ -60,10 +101,9 @@
 //! # #[cfg(feature = "transport")]
 //! # fn main() -> Result<(), flightrelay::FrpError> {
 //! use std::time::Instant;
-//! use flightrelay::types::roles;
 //! use flightrelay::{
 //!     BusActor, DEFAULT_HEARTBEAT, EndpointConfig, FrpBody, FrpEndpoint, FrpMessage,
-//!     Transport,
+//!     Target, roles,
 //! };
 //!
 //! // Generate the id once and keep it across restarts.
@@ -71,7 +111,7 @@
 //!     "e4a7136b9f02cd58",
 //!     BusActor::new("Shot Log", DEFAULT_HEARTBEAT.as_secs_f64()).with_role(roles::COLLECTOR),
 //! );
-//! let mut ep = FrpEndpoint::open(EndpointConfig::new(Transport::connect(
+//! let mut ep = FrpEndpoint::open(EndpointConfig::new(Target::connect(
 //!     "ws://localhost:5880/frp",
 //! )))?;
 //! let mut conn = ep.establish()?;
@@ -128,6 +168,8 @@
 //! turns them on. Raw frames never carry device or user identity, and never
 //! affect a shot.
 
+#![warn(missing_docs)]
+
 use std::time::Duration;
 
 #[cfg(feature = "main")]
@@ -137,23 +179,23 @@ mod lenient;
 mod net;
 mod rand;
 
-pub mod error;
-pub mod kinds;
-pub mod message;
-pub mod types;
-pub mod units;
+mod error;
+mod kinds;
+mod message;
+mod types;
+mod units;
 
-#[cfg(feature = "controller")]
-pub mod accumulator;
+#[cfg(feature = "collector")]
+mod accumulator;
 
-#[cfg(feature = "controller")]
-pub mod bus;
-
-#[cfg(feature = "transport")]
-pub mod endpoint;
+#[cfg(feature = "collector")]
+mod bus;
 
 #[cfg(feature = "transport")]
-pub mod hub;
+mod endpoint;
+
+#[cfg(feature = "transport")]
+mod hub;
 
 #[cfg(feature = "config")]
 pub mod config;
@@ -162,12 +204,22 @@ pub mod config;
 pub mod driver;
 
 #[cfg(feature = "server")]
-pub mod server;
+mod server;
 
 #[cfg(feature = "mock")]
 pub mod mock;
 
+#[cfg(all(feature = "driver", any(test, feature = "testing")))]
+pub mod testing;
+
+/// The `serde_json` this crate's public types use (`DriverConfig::from_map`,
+/// `UnknownBody::fields`, `FrpError::Json`), for callers that need the same
+/// version.
+pub use serde_json;
+
 pub use error::FrpError;
+#[cfg(feature = "transport")]
+pub use error::WebSocketError;
 pub use kinds::{
     AimAction, BusActor, BusAlert, BusReply, BusSync, Course, DeviceInfo, EndReason, GameAim,
     GameBall, GameRound, GameScores, GameStroke, GolferProfile, GolferSelect, GolferTurn, Hole,
@@ -175,21 +227,24 @@ pub use kinds::{
     RoundPlayer, RoundStatus, ShotClub, ShotFinished, ShotFlight, ShotImpact, ShotLaunch,
     ShotTrigger, StrokeOutcome,
 };
-pub use message::{Class, FrpBody, FrpMessage, Removal, StateKey, StateKind, UnknownBody};
+pub use message::{Class, FrpBody, FrpMessage, KINDS, Removal, StateKey, StateKind, UnknownBody};
 pub use types::{
     AssumedLaunch, Basis, Club, ClubData, FaceImpact, FlightResult, GolferId, Handedness,
-    InvalidGolferId, Launch, Mode, Position, RawDir, RawFrame, Severity, Sex, ShotKey, Source,
+    InvalidGolferId, InvalidUnitValue, Launch, Mode, Position, RawDir, RawFrame, Severity, Sex,
+    ShotKey, Source, UnknownClub, blockers, roles,
 };
 pub use units::{Distance, Velocity};
 
-#[cfg(feature = "controller")]
-pub use accumulator::{CompletedShot, Flight, LateMessage, ShotAggregator, ShotEvent};
+#[cfg(feature = "collector")]
+pub use accumulator::{CompletedShot, Flight, LateMessage, ShotAccumulator, ShotEvent};
 
-#[cfg(feature = "controller")]
+#[cfg(feature = "collector")]
 pub use bus::BusState;
 
 #[cfg(feature = "transport")]
-pub use endpoint::{EndpointConfig, FrpConnection, FrpEndpoint, Transport};
+pub use endpoint::{
+    DEFAULT_WRITE_BUFFER_LIMIT, EndpointConfig, FrpConnection, FrpEndpoint, Target,
+};
 
 #[cfg(feature = "transport")]
 pub use hub::{Hub, HubEvent, PeerId};
@@ -198,7 +253,7 @@ pub use hub::{Hub, HubEvent, PeerId};
 pub use server::{FrpServer, MIN_HEARTBEAT, ServerConfig, ServerError, ServerEvent};
 
 #[cfg(feature = "main")]
-pub use cli::{ActorIdOrigin, ConfigActorId, RunOptions, config_actor_id, run, run_args, run_with};
+pub use cli::{RunOptions, run, run_args, run_with};
 
 /// Recommended default port for standalone FRP connections.
 pub const DEFAULT_PORT: u16 = 5880;
@@ -226,6 +281,17 @@ pub const MISSED_HEARTBEATS: u32 = 3;
 
 /// The FRP spec version this crate implements, sent as `frp` in `bus.actor`.
 pub const SPEC_VERSION: &str = "0.3.0";
+
+/// The current UTC time in milliseconds since the Unix epoch, as
+/// [`RawFrame::timestamp`] and [`ShotTrigger::timestamp`] carry it; `None`
+/// for a system clock set before 1970.
+#[must_use]
+pub fn utc_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+}
 
 /// A new actor id: 16 random lowercase hexadecimal digits.
 ///

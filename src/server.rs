@@ -1,92 +1,4 @@
-//! [`FrpServer`]: run a [`DeviceDriver`] as a launch monitor actor on the bus.
-//!
-//! Requires the `server` feature. The server connects the driver, polls its
-//! session and publishes what the driver emits as one launch monitor actor,
-//! with the actor id the host gives it ([`ServerConfig::actor_id`]). It
-//! listens for peers (listen mode, a hub of its own) or dials one (bridge
-//! mode), and reconnects the driver with the driver's advised delay, so a
-//! host's `main` is a driver, a config and one call; `run` (feature `main`)
-//! is that `main`.
-//!
-//! # Threads
-//!
-//! The caller's thread is the device thread: [`connect`](DeviceDriver::connect),
-//! [`poll`](DeviceSession::poll), [`hints`](DeviceSession::hints),
-//! [`close`](DeviceSession::close) and the retry sleeps all run on it, so a
-//! session can be `!Send`. A network thread owns every connection, as a
-//! [`Hub`], so peers are served while a connect blocks. An acceptor thread
-//! obtains connections: it accepts in listen mode and dials, and redials, in
-//! bridge mode.
-//!
-//! # What the server does on the bus
-//!
-//! - On each new connection it sends the actor's `bus.actor`, then
-//!   `bus.sync`. It republishes `bus.actor` when it changes, every
-//!   [`ServerConfig::heartbeat`], and in answer to any `bus.sync`.
-//! - The `bus.actor` has the role `launch_monitor`, the name
-//!   [`ServerConfig::name`] (else the identified device's manufacturer and
-//!   model, else [`DriverInfo::name`](crate::driver::DriverInfo::name)), and
-//!   a `device` block: manufacturer, model and firmware from the session's
-//!   identity, `source` from
-//!   [`DriverInfo::source`](crate::driver::DriverInfo::source), and the
-//!   battery and attitude the driver reports. Its `blockers`, battery,
-//!   attitude and telemetry are exactly the driver's current
-//!   [`DeviceStatus`]: a value the driver takes off (`battery(None)`, a
-//!   whole status without it) is off the next `bus.actor`. Before the first
-//!   session and whenever a session ends the status is
-//!   [`DeviceStatus::not_armed`]. The device's own id and card label never
-//!   go on the bus.
-//! - What the driver emits goes out under the actor id: `shot.*` messages
-//!   and `bus.alert`. A `shot.raw` is numbered per actor, across sessions,
-//!   and goes out only while [`ServerConfig::raw_frames`] is on; drivers
-//!   are asked not to build one otherwise, and one that arrives anyway is
-//!   dropped.
-//! - A `shot.finished` for every shot a lost session left open, and for any
-//!   shot still open after [`ServerConfig::shot_timeout`] (default
-//!   [`DEFAULT_SHOT_TIMEOUT`]).
-//! - Every message a peer sends is forwarded to every other peer, never back
-//!   to its source.
-//! - Each `golfer.turn` replaces all the hints ([`TurnHints::from_turn`]):
-//!   a `null` or unrecognized field is no hint for it, and nothing is
-//!   carried over from an earlier turn. Whenever the resulting hints change,
-//!   the session gets them through [`hints`](DeviceSession::hints), and the
-//!   next connect through
-//!   [`ConnectCtx::hints`](crate::driver::ConnectCtx::hints). The hints of
-//!   the last complete turn stay when the session actor goes away.
-//! - On a stop, the session is closed and the actor's removal
-//!   (`bus.actor` with `"removed": true`) goes out.
-//!
-//! The launch monitor role owns no command, so the server answers none.
-//!
-//! A peer that stops reading is not disconnected while the kernel buffers
-//! it: the server queues its messages, and drops it only once the queue
-//! passes [`ServerConfig::write_buffer_limit`].
-//!
-//! The device thread and the network thread are joined by a bounded queue.
-//! When it is full, a `shot.raw` is dropped (debug data; `seq` is numbered
-//! on the network thread, after the queue, so the loss leaves no gap) and
-//! anything else waits briefly.
-//!
-//! In bridge mode the server dials its peer again whenever the link drops.
-//! A dial that fails is logged at [`Level::Info`] the first time and
-//! whenever the error changes, and at [`Level::Debug`] while the same error
-//! repeats. The target must be a `ws://` URL; `wss://` is refused when the
-//! server starts.
-//!
-//! ```no_run
-//! # use flightrelay::driver::{DeviceDriver, Stop};
-//! # fn serve<D: DeviceDriver>(driver: D) -> Result<(), Box<dyn std::error::Error>> {
-//! use flightrelay::{FrpServer, ServerConfig, Transport};
-//!
-//! // Generated once with `flightrelay::new_actor_id()` and kept by the host.
-//! let actor_id = "7d2f9a41c03be856";
-//! let config = ServerConfig::new(Transport::listen("0.0.0.0:5880"), actor_id);
-//! let stop = Stop::new();
-//! FrpServer::new(driver, config)
-//!     .on_event(|event| eprintln!("{event:?}"))
-//!     .run(&stop)?;
-//! # Ok(()) }
-//! ```
+//! [`FrpServer`]: run a [`FrpDriver`] as an actor on the bus.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -101,15 +13,15 @@ use std::sync::mpsc::{
 use std::time::{Duration, Instant};
 
 use crate::driver::{
-    Backoff, ConnectCtx, ConnectHost, DeviceDriver, DeviceEvent, DeviceIdentity, DeviceSession,
-    DeviceStatus, DriverInfo, Events, HostFlags, Level, SessionEnd, StatusChange, Stop, TurnHints,
+    Activity, Backoff, ConnectCtx, ConnectHost, DeviceEvent, DeviceIdentity, DeviceStatus,
+    DriverInfo, Events, FrpDriver, FrpSession, HostFlags, IDLE, Level, SessionEnd, StatusChange,
+    Stop, TurnHints,
 };
 use crate::endpoint::DEFAULT_WRITE_BUFFER_LIMIT;
-use crate::types::roles;
 use crate::{
-    BusActor, DEFAULT_HEARTBEAT, DEFAULT_SHOT_TIMEOUT, DeviceInfo, EndpointConfig, FrpBody,
-    FrpConnection, FrpEndpoint, FrpError, FrpMessage, Hub, HubEvent, Removal, ShotFinished,
-    ShotKey, StateKind, Transport,
+    BusActor, DEFAULT_HEARTBEAT, DEFAULT_SHOT_TIMEOUT, EndpointConfig, FrpBody, FrpConnection,
+    FrpEndpoint, FrpError, FrpMessage, Hub, HubEvent, Removal, ShotFinished, ShotKey, StateKind,
+    Target,
 };
 
 /// Capacity of the queue from the device thread to the network thread.
@@ -123,7 +35,8 @@ const FULL_QUEUE_PATIENCE: Duration = Duration::from_secs(1);
 /// over the connections.
 const NET_TICK: Duration = Duration::from_millis(10);
 
-/// The device thread's poll timeout.
+/// How long the device thread steps the session between looks at its
+/// inputs.
 const POLL: Duration = Duration::from_millis(20);
 
 /// How often the device thread looks at its inputs while it sleeps.
@@ -138,9 +51,9 @@ pub const MIN_HEARTBEAT: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ServerConfig {
-    /// [`Transport::Listen`] to serve peers that connect, or
-    /// [`Transport::Connect`] to dial one (a bridge).
-    pub target: Transport,
+    /// [`Target::Listen`] to serve peers that connect, or
+    /// [`Target::Connect`] to dial one (a bridge).
+    pub target: Target,
     /// The actor's id: generated once ([`new_actor_id`](crate::new_actor_id))
     /// and kept across restarts by the host.
     pub actor_id: String,
@@ -172,7 +85,7 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// A config for `target` and the actor `actor_id`, with the defaults.
     #[must_use]
-    pub fn new(target: Transport, actor_id: impl Into<String>) -> Self {
+    pub fn new(target: Target, actor_id: impl Into<String>) -> Self {
         Self {
             target,
             actor_id: actor_id.into(),
@@ -208,10 +121,10 @@ pub enum ServerEvent<'a> {
     },
     /// A session is up.
     DeviceConnected(&'a DeviceIdentity),
-    /// A connect failed or a session ended.
+    /// A connect failed or a session ended with an error.
     DeviceLost {
-        /// What went wrong; `None` after a stop.
-        error: Option<&'a dyn Error>,
+        /// What went wrong.
+        error: &'a dyn Error,
         /// When the next attempt starts; `None` when the driver gave up.
         retry_in: Option<Duration>,
     },
@@ -243,15 +156,117 @@ pub enum ServerError<E: Error + 'static> {
 
 type Observer = Box<dyn FnMut(&ServerEvent<'_>)>;
 
-/// Runs a driver as a launch monitor actor on the bus. See the
-/// [module docs](self).
-pub struct FrpServer<D: DeviceDriver> {
+/// Runs a driver as an actor on the bus.
+///
+/// Requires the `server` feature. The server hosts one driver: it connects
+/// the driver, steps its session and publishes what the driver emits as one
+/// actor with the driver's roles, which decide what it sends, with the actor
+/// id the host gives it ([`ServerConfig::actor_id`]). It
+/// listens for peers (listen mode, a hub of its own) or dials one (bridge
+/// mode), and reconnects the driver with the driver's advised delay, so a
+/// host's `main` is a driver, a config and one call; `run` (feature `main`)
+/// is that `main`.
+///
+/// # Threads
+///
+/// The caller's thread is the device thread: [`connect`](FrpDriver::connect),
+/// [`step`](FrpSession::step), [`hints`](FrpSession::hints),
+/// [`bus`](FrpSession::bus), [`close`](FrpSession::close) and the retry
+/// sleeps all run on it, so a
+/// session can be `!Send`. A network thread owns every connection, as a
+/// [`Hub`], so peers are served while a connect blocks. An acceptor thread
+/// obtains connections: it accepts in listen mode and dials, and redials, in
+/// bridge mode.
+///
+/// # What the server does on the bus
+///
+/// - On each new connection it sends the actor's `bus.actor`, then
+///   `bus.sync`. It republishes `bus.actor` when it changes, every
+///   [`ServerConfig::heartbeat`], and in answer to any `bus.sync`.
+/// - The `bus.actor` is [`DriverInfo::bus_actor`]: the driver's roles
+///   (`launch_monitor` unless it says otherwise), the name
+///   [`ServerConfig::name`] (else [`DriverInfo::actor_name`]: the
+///   identified device's manufacturer and model, else
+///   [`DriverInfo::name`]), and a `device` block: manufacturer, model and
+///   firmware from the last session's identity, `source` from
+///   [`DriverInfo::source`], and the battery the driver reports. Its
+///   `blockers`, battery and flagged values are the driver's current
+///   [`DeviceStatus`] (a battery the driver takes off is off the next
+///   `bus.actor`), and its `telemetry` is every key of
+///   [`DriverInfo::telemetry`], with the driver's value or the declared one.
+///   Each connect starts from [`DeviceStatus::not_armed`], and a session
+///   that ends goes back to it. While no session is up the actor carries
+///   [`DeviceStatus::off_session`] of the driver's status: `not_armed`, no
+///   battery, the telemetry and flagged values the driver reported. The
+///   device's own id and card label never go on the bus.
+/// - What the driver emits goes out under the actor id when its roles send
+///   that kind ([`DriverInfo::sends`]): `shot.*` for a launch monitor,
+///   `golfer.select`, `bus.reply` and `bus.alert` for any driver, and so on.
+///   A `shot.raw` is numbered per actor, across sessions,
+///   and goes out only while [`ServerConfig::raw_frames`] is on; drivers
+///   are asked not to build one otherwise, and one that arrives anyway is
+///   dropped.
+/// - A `shot.finished` for every shot a lost session left open, and for any
+///   shot still open after [`ServerConfig::shot_timeout`] (default
+///   [`DEFAULT_SHOT_TIMEOUT`]).
+/// - Every message a peer sends is forwarded to every other peer, never back
+///   to its source.
+/// - Each `golfer.turn` replaces all the hints ([`TurnHints::from_turn`]):
+///   a `null` or unrecognized field is no hint for it, and nothing is
+///   carried over from an earlier turn. Whenever the resulting hints change,
+///   the session gets them through [`hints`](FrpSession::hints), and the
+///   next connect through
+///   [`ConnectCtx::hints`](crate::driver::ConnectCtx::hints). The hints of
+///   the last complete turn stay when the session actor goes away.
+/// - Every message a peer sends, a `golfer.turn` and a `bus.sync`
+///   included, reaches the running session through
+///   [`bus`](FrpSession::bus), in arrival order, before its next
+///   [`step`](FrpSession::step). A message that arrives while no session
+///   is up (during a connect or a retry wait) is dropped, not kept for the
+///   next session. An error from `bus` ends the session as one from `step`
+///   does.
+/// - A session is always closed when it ends: after an error, and on a
+///   stop. On a stop the actor's removal (`bus.actor` with
+///   `"removed": true`) then goes out.
+///
+/// The launch monitor role owns no command, so the server answers none.
+///
+/// A peer that stops reading is not disconnected while the kernel buffers
+/// it: the server queues its messages, and drops it only once the queue
+/// passes [`ServerConfig::write_buffer_limit`].
+///
+/// The device thread and the network thread are joined by a bounded queue.
+/// When it is full, a `shot.raw` is dropped (debug data; `seq` is numbered
+/// on the network thread, after the queue, so the loss leaves no gap) and
+/// anything else waits briefly.
+///
+/// In bridge mode the server dials its peer again whenever the link drops.
+/// A dial that fails is logged at [`Level::Info`] the first time and
+/// whenever the error changes, and at [`Level::Debug`] while the same error
+/// repeats. The target must be a `ws://` URL; `wss://` is refused when the
+/// server starts.
+///
+/// ```no_run
+/// # use flightrelay::driver::{FrpDriver, Stop};
+/// # fn serve<D: FrpDriver>(driver: D) -> Result<(), Box<dyn std::error::Error>> {
+/// use flightrelay::{FrpServer, ServerConfig, Target};
+///
+/// // Generated once with `flightrelay::new_actor_id()` and kept by the host.
+/// let actor_id = "7d2f9a41c03be856";
+/// let config = ServerConfig::new(Target::listen("0.0.0.0:5880"), actor_id);
+/// let stop = Stop::new();
+/// FrpServer::new(driver, config)
+///     .on_event(|event| eprintln!("{event:?}"))
+///     .run(&stop)?;
+/// # Ok(()) }
+/// ```
+pub struct FrpServer<D: FrpDriver> {
     driver: D,
     config: ServerConfig,
     observer: Option<Observer>,
 }
 
-impl<D: DeviceDriver> fmt::Debug for FrpServer<D> {
+impl<D: FrpDriver> fmt::Debug for FrpServer<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrpServer")
             .field("config", &self.config)
@@ -265,6 +280,7 @@ enum ToNet {
     Message(Box<FrpBody>),
     Status(DeviceStatus),
     StatusChange(StatusChange),
+    ConnectStarted,
     Identified(DeviceIdentity),
     SessionEnded,
     Shutdown,
@@ -277,7 +293,7 @@ enum Note {
     Log(Level, String),
 }
 
-impl<D: DeviceDriver> FrpServer<D> {
+impl<D: FrpDriver> FrpServer<D> {
     /// A server for `driver`.
     #[must_use]
     pub fn new(driver: D, config: ServerConfig) -> Self {
@@ -303,7 +319,7 @@ impl<D: DeviceDriver> FrpServer<D> {
     /// # Errors
     ///
     /// Returns [`ServerError::Endpoint`] when the endpoint cannot open,
-    /// [`ServerError::Driver`] when [`retry_delay`](DeviceDriver::retry_delay)
+    /// [`ServerError::Driver`] when [`retry_delay`](FrpDriver::retry_delay)
     /// returned `None`, and [`ServerError::Network`] when the network thread
     /// ended on its own; the session, if any, is closed first.
     #[allow(clippy::too_many_lines)]
@@ -326,8 +342,8 @@ impl<D: DeviceDriver> FrpServer<D> {
         flags.set_wants_raw(config.raw_frames);
         let inner = Stop::new();
 
-        let bridge = matches!(config.target, Transport::Connect(_));
-        if let Transport::Connect(url) = &config.target
+        let bridge = matches!(config.target, Target::Connect(_));
+        if let Target::Connect(url) = &config.target
             && !url
                 .get(..5)
                 .is_some_and(|s| s.eq_ignore_ascii_case("ws://"))
@@ -347,6 +363,7 @@ impl<D: DeviceDriver> FrpServer<D> {
 
         let (to_net, net_rx) = sync_channel::<ToNet>(QUEUE);
         let (hints_tx, hints_rx) = channel::<TurnHints>();
+        let (bus_tx, bus_rx) = channel::<FrpMessage>();
         let (note_tx, note_rx) = channel::<Note>();
         let (conn_tx, conn_rx) = channel::<FrpConnection>();
         let (down_tx, down_rx) = channel::<()>();
@@ -358,9 +375,11 @@ impl<D: DeviceDriver> FrpServer<D> {
                 rx: net_rx,
                 conn_rx,
                 hints_tx,
+                bus_tx,
                 note_tx: note_tx.clone(),
                 down_tx: bridge.then_some(down_tx),
             },
+            Instant::now(),
         );
         let net_thread = std::thread::Builder::new()
             .name("frp-net".into())
@@ -404,6 +423,7 @@ impl<D: DeviceDriver> FrpServer<D> {
         let mut attempts: u32 = 0;
         let mut inputs = Inputs {
             hints_rx: &hints_rx,
+            bus_rx: &bus_rx,
             note_rx: &note_rx,
             observe: &observe,
             log_level: config.log_level,
@@ -416,15 +436,15 @@ impl<D: DeviceDriver> FrpServer<D> {
             if net_thread.is_finished() {
                 break Err(ServerError::Network);
             }
-            let connected = {
-                let mut host = Host {
-                    inputs: &mut inputs,
-                    hints: &mut hints,
-                };
-                let mut ctx = ConnectCtx::new(stop, Events::new(&mut sink, &flags), &mut host);
-                driver.connect(&mut ctx)
-            };
-            let mut net_down = false;
+            push(&to_net, ToNet::ConnectStarted);
+            let (connected, mut handed) = connect(
+                &mut driver,
+                stop,
+                &mut sink,
+                &flags,
+                &mut inputs,
+                &mut hints,
+            );
             let (error, connected_for) = match connected {
                 Ok(mut session) => {
                     attempts = 0;
@@ -432,6 +452,7 @@ impl<D: DeviceDriver> FrpServer<D> {
                     let identity = session.identity().clone();
                     push(&to_net, ToNet::Identified(identity.clone()));
                     observe(&ServerEvent::DeviceConnected(&identity));
+                    let mut net_down = false;
                     let error = loop {
                         if stop.is_stopped() {
                             break None;
@@ -440,63 +461,49 @@ impl<D: DeviceDriver> FrpServer<D> {
                             net_down = true;
                             break None;
                         }
-                        let mut failed = None;
-                        if inputs.drain(&mut hints)
-                            && let Err(e) = session.hints(&hints)
-                        {
-                            failed = Some(e);
-                        }
-                        if failed.is_none() {
-                            failed = session
-                                .poll(POLL, &mut Events::new(&mut sink, &flags))
-                                .err();
-                        }
-                        if failed.is_some() {
-                            break failed;
+                        let mut out = Events::new(&mut sink, &flags);
+                        let failed =
+                            hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out)
+                                .and_then(|()| poll(&mut session, POLL, &mut out));
+                        if let Err(e) = failed {
+                            break Some(e);
                         }
                     };
-                    if let Err(e) = session.close(&mut Events::new(&mut sink, &flags)) {
-                        sink(DeviceEvent::Log(
-                            Level::Warn,
-                            format!("closing the device: {e}"),
-                        ));
-                    }
+                    session.close(&mut Events::new(&mut sink, &flags));
                     push(&to_net, ToNet::SessionEnded);
-                    (error, Some(started.elapsed()))
+                    match error {
+                        Some(e) => (e, Some(started.elapsed())),
+                        None if net_down => break Err(ServerError::Network),
+                        None => break Ok(()),
+                    }
                 }
                 Err(e) => {
                     attempts = attempts.saturating_add(1);
-                    (Some(e), None)
+                    (e, None)
                 }
             };
             if stop.is_stopped() {
                 break Ok(());
             }
-            if net_down || net_thread.is_finished() {
+            if net_thread.is_finished() {
                 break Err(ServerError::Network);
             }
             let delay = driver.retry_delay(
-                &SessionEnd {
-                    error: error.as_ref(),
-                    connected_for,
-                    attempts,
-                },
+                &SessionEnd::new(&error, Instant::now(), connected_for, attempts),
                 &mut backoff,
                 &mut Events::new(&mut sink, &flags),
             );
             observe(&ServerEvent::DeviceLost {
-                error: error.as_ref().map(|e| e as &dyn Error),
+                error: &error,
                 retry_in: delay,
             });
             let Some(delay) = delay else {
-                break match error {
-                    Some(e) => Err(ServerError::Driver(e)),
-                    None => Ok(()),
-                };
+                break Err(ServerError::Driver(error));
             };
             let until = Instant::now() + delay;
             while Instant::now() < until && !stop.is_stopped() && !net_thread.is_finished() {
                 let _ = inputs.drain(&mut hints);
+                inputs.drop_bus();
                 std::thread::sleep(
                     until
                         .saturating_duration_since(Instant::now())
@@ -525,6 +532,7 @@ impl<D: DeviceDriver> FrpServer<D> {
 /// The device thread's view of what the other threads send it.
 struct Inputs<'a> {
     hints_rx: &'a Receiver<TurnHints>,
+    bus_rx: &'a Receiver<FrpMessage>,
     note_rx: &'a Receiver<Note>,
     observe: &'a dyn Fn(&ServerEvent<'_>),
     log_level: Level,
@@ -567,6 +575,11 @@ impl Inputs<'_> {
         }
         changed
     }
+
+    /// Drops the peer messages waiting: no session is up to take them.
+    fn drop_bus(&self) {
+        while self.bus_rx.try_recv().is_ok() {}
+    }
 }
 
 /// The [`ConnectHost`] of a server: the hints of the last complete turn.
@@ -578,10 +591,72 @@ struct Host<'a, 'b> {
 impl ConnectHost for Host<'_, '_> {
     fn tick(&mut self) {
         let _ = self.inputs.drain(self.hints);
+        self.inputs.drop_bus();
     }
 
     fn hints(&self) -> &TurnHints {
         self.hints
+    }
+}
+
+/// One connect of `driver`, with the turns that arrive meanwhile taken into
+/// `hints` and the peer messages dropped. Returns its outcome and the hints
+/// of the connect's start: the session starts with those, so a turn that
+/// arrives during the connect reaches it at the first [`hand_over`].
+fn connect<D: FrpDriver>(
+    driver: &mut D,
+    stop: &Stop,
+    sink: &mut dyn FnMut(DeviceEvent),
+    flags: &HostFlags,
+    inputs: &mut Inputs<'_>,
+    hints: &mut TurnHints,
+) -> (Result<D::Session, D::Error>, TurnHints) {
+    let handed = *hints;
+    let mut host = Host { inputs, hints };
+    let mut ctx = ConnectCtx::new(stop, Events::new(sink, flags), &mut host);
+    let connected = driver.connect(&mut ctx);
+    host.inputs.drop_bus();
+    (connected, handed)
+}
+
+/// Takes the turns waiting and hands `session` the hints when they differ
+/// from the ones it has (`handed`), then each peer message waiting.
+fn hand_over<S: FrpSession>(
+    session: &mut S,
+    inputs: &mut Inputs<'_>,
+    hints: &mut TurnHints,
+    handed: &mut TurnHints,
+    out: &mut Events<'_>,
+) -> Result<(), S::Error> {
+    let _ = inputs.drain(hints);
+    if hints != handed {
+        *handed = *hints;
+        session.hints(hints, out)?;
+    }
+    while let Ok(msg) = inputs.bus_rx.try_recv() {
+        session.bus(&msg, out)?;
+    }
+    Ok(())
+}
+
+/// Step `session` for about `timeout` of real time, waiting [`IDLE`] after a
+/// step that returned [`Activity::Idle`]. Always steps at least once, so a
+/// zero timeout still sees a dead device.
+fn poll<S: FrpSession>(
+    session: &mut S,
+    timeout: Duration,
+    out: &mut Events<'_>,
+) -> Result<(), S::Error> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let activity = session.step(Instant::now(), out)?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(());
+        }
+        if activity == Activity::Idle {
+            std::thread::sleep(left.min(IDLE));
+        }
     }
 }
 
@@ -617,7 +692,7 @@ fn accept_loop(
     let mut backoff = Backoff::default();
     let mut last_failure = None;
     while !stop.is_stopped() {
-        match endpoint.establish_until(stop.flag()) {
+        match endpoint.establish_until(stop.shared()) {
             Ok(Some(conn)) => {
                 last_failure = None;
                 // A link-down report from before this connection is stale.
@@ -680,6 +755,7 @@ struct Links {
     rx: Receiver<ToNet>,
     conn_rx: Receiver<FrpConnection>,
     hints_tx: Sender<TurnHints>,
+    bus_tx: Sender<FrpMessage>,
     note_tx: Sender<Note>,
     down_tx: Option<Sender<()>>,
 }
@@ -695,14 +771,22 @@ struct Net {
     hub: Hub,
     max_peers: usize,
     actor_id: String,
+    /// The actor as last built from `info`, `identity` and `status`.
     actor: BusActor,
-    /// The driver's current status, which the actor carries exactly.
+    info: DriverInfo,
+    /// The last session's identity; it stays after the session ends.
+    identity: Option<DeviceIdentity>,
+    /// A session is up: from its identity until it ends.
+    session_up: bool,
+    /// The driver's current status. The actor carries it exactly while a
+    /// session is up, else its [`DeviceStatus::off_session`].
     status: DeviceStatus,
     /// The name from the config, which wins over any other.
     name: Option<String>,
-    /// The driver's name, until a device is identified.
-    fallback_name: String,
     heartbeat: Duration,
+    /// The time of the current [`handle`](Self::handle) or
+    /// [`tick`](Self::tick): what every timer compares against.
+    now: Instant,
     last_beat: Instant,
     raw_frames: bool,
     shot_timeout: Duration,
@@ -711,36 +795,29 @@ struct Net {
 }
 
 impl Net {
-    fn new(config: &ServerConfig, info: &DriverInfo, links: Links) -> Self {
+    fn new(config: &ServerConfig, info: &DriverInfo, links: Links, now: Instant) -> Self {
         let heartbeat = config.heartbeat.max(MIN_HEARTBEAT);
-        let mut actor = BusActor::new(
-            config.name.clone().unwrap_or_else(|| info.name.to_owned()),
-            heartbeat.as_secs_f64(),
-        )
-        .with_role(roles::LAUNCH_MONITOR)
-        .with_device(DeviceInfo {
-            manufacturer: info.manufacturer.map(str::to_owned),
-            source: Some(info.source),
-            ..DeviceInfo::default()
-        });
-        let status = DeviceStatus::not_armed();
-        actor.blockers.clone_from(&status.blockers);
-        Self {
+        let mut net = Self {
             links,
             hub: Hub::new(),
             max_peers: config.max_peers,
             actor_id: config.actor_id.clone(),
-            actor,
-            status,
+            actor: BusActor::new(info.name, heartbeat.as_secs_f64()),
+            info: info.clone(),
+            identity: None,
+            session_up: false,
+            status: DeviceStatus::not_armed(),
             name: config.name.clone(),
-            fallback_name: info.name.to_owned(),
             heartbeat,
-            last_beat: Instant::now(),
+            now,
+            last_beat: now,
             raw_frames: config.raw_frames,
             shot_timeout: config.shot_timeout,
             seq: 0,
             open: HashMap::new(),
-        }
+        };
+        net.rebuild_actor();
+        net
     }
 
     fn run(mut self) {
@@ -749,10 +826,10 @@ impl Net {
             let mut shutdown = false;
             match self.links.rx.recv_timeout(NET_TICK) {
                 Ok(msg) => {
-                    shutdown |= self.handle(msg);
+                    shutdown |= self.handle(msg, Instant::now());
                     while !shutdown {
                         match self.links.rx.try_recv() {
-                            Ok(msg) => shutdown |= self.handle(msg),
+                            Ok(msg) => shutdown |= self.handle(msg, Instant::now()),
                             Err(TryRecvError::Empty) => break,
                             Err(TryRecvError::Disconnected) => shutdown = true,
                         }
@@ -765,13 +842,20 @@ impl Net {
                 self.shut_down();
                 return;
             }
-            self.expire_shots();
-            if self.last_beat.elapsed() >= self.heartbeat {
-                self.publish_actor();
-            }
-            let events = self.hub.poll();
-            self.on_hub(events);
+            self.tick(Instant::now());
         }
+    }
+
+    /// What time decides at `now` (expired shots, the heartbeat), then one
+    /// pass over the connections.
+    fn tick(&mut self, now: Instant) {
+        self.now = now;
+        self.expire_shots();
+        if now.saturating_duration_since(self.last_beat) >= self.heartbeat {
+            self.publish_actor();
+        }
+        let events = self.hub.poll();
+        self.on_hub(events);
     }
 
     fn note(&self, note: Note) {
@@ -831,8 +915,10 @@ impl Net {
         }
     }
 
-    /// Returns whether to shut down.
-    fn handle(&mut self, msg: ToNet) -> bool {
+    /// Takes one message from the driver side at `now`. Returns whether to
+    /// shut down.
+    fn handle(&mut self, msg: ToNet, now: Instant) -> bool {
+        self.now = now;
         match msg {
             ToNet::Message(body) => self.on_driver_message(*body),
             ToNet::Status(status) => {
@@ -842,6 +928,11 @@ impl Net {
             }
             ToNet::StatusChange(change) => {
                 if self.apply_change(change) {
+                    self.publish_actor();
+                }
+            }
+            ToNet::ConnectStarted => {
+                if self.clear_session_status() {
                     self.publish_actor();
                 }
             }
@@ -860,13 +951,7 @@ impl Net {
         let mut left = false;
         for event in events {
             match event {
-                HubEvent::Message { message, .. } => match &message.body {
-                    FrpBody::GolferTurn(turn) => {
-                        let _ = self.links.hints_tx.send(TurnHints::from_turn(turn));
-                    }
-                    FrpBody::BusSync(_) => self.publish_actor(),
-                    _ => {}
-                },
+                HubEvent::Message { message, .. } => self.on_peer_message(message),
                 HubEvent::Invalid { .. } => {}
                 HubEvent::Left { addr, reason, .. } => {
                     self.note(Note::PeerLeft(addr, reason));
@@ -877,6 +962,19 @@ impl Net {
         if left {
             self.link_down_if_none();
         }
+    }
+
+    /// A peer's message: a `golfer.turn` becomes the hints, a `bus.sync`
+    /// republishes the actor, and every message goes on to the session.
+    fn on_peer_message(&mut self, message: FrpMessage) {
+        match &message.body {
+            FrpBody::GolferTurn(turn) => {
+                let _ = self.links.hints_tx.send(TurnHints::from_turn(turn));
+            }
+            FrpBody::BusSync(_) => self.publish_actor(),
+            _ => {}
+        }
+        let _ = self.links.bus_tx.send(message);
     }
 
     fn publish(&mut self, msg: &FrpMessage) {
@@ -890,19 +988,22 @@ impl Net {
     }
 
     fn publish_actor(&mut self) {
-        self.last_beat = Instant::now();
+        self.last_beat = self.now;
         let msg = self.actor_message();
         self.publish(&msg);
     }
 
     fn on_driver_message(&mut self, mut body: FrpBody) {
+        if !self.info.sends(&body) {
+            return;
+        }
         match &mut body {
             FrpBody::ShotTrigger(m) => {
                 self.open.insert(
                     m.key.shot_id.clone(),
                     OpenShot {
                         key: m.key.clone(),
-                        since: Instant::now(),
+                        since: self.now,
                     },
                 );
             }
@@ -914,13 +1015,7 @@ impl Net {
                 frame.seq = self.seq;
                 self.seq += 1;
             }
-            FrpBody::ShotLaunch(_)
-            | FrpBody::ShotClub(_)
-            | FrpBody::ShotImpact(_)
-            | FrpBody::ShotFlight(_)
-            | FrpBody::BusAlert(_) => {}
-            // Not a launch monitor's to send.
-            _ => return,
+            _ => {}
         }
         let msg = FrpMessage::new(self.actor_id.clone(), body);
         self.publish(&msg);
@@ -929,57 +1024,52 @@ impl Net {
     /// Takes a driver's whole status. Returns whether the actor changed.
     fn apply_status(&mut self, status: DeviceStatus) -> bool {
         self.status = status;
-        self.sync_status()
+        self.rebuild_actor()
     }
 
     /// Applies a change to the driver's status. Returns whether the actor
     /// changed.
     fn apply_change(&mut self, change: StatusChange) -> bool {
         self.status.apply(change);
-        self.sync_status()
+        self.rebuild_actor()
     }
 
-    /// Puts the driver's status on the actor, exactly: blockers, battery,
-    /// attitude and telemetry. Returns whether the actor changed.
-    fn sync_status(&mut self) -> bool {
-        let before = self.actor.clone();
-        let status = &self.status;
-        self.actor.blockers.clone_from(&status.blockers);
-        let device = self.actor.device.get_or_insert_with(DeviceInfo::default);
-        device.battery_pct = status.battery_pct.map(|p| p.min(100));
-        device.tilt = status.tilt;
-        device.roll = status.roll;
-        self.actor.telemetry = (!status.telemetry.is_empty()).then(|| status.telemetry.clone());
-        self.actor != before
+    /// Builds the actor from the driver's facts, the identity and the
+    /// status ([`DriverInfo::bus_actor`]; [`DeviceStatus::off_session`]
+    /// while no session is up). Returns whether it changed.
+    fn rebuild_actor(&mut self) -> bool {
+        let name = self
+            .name
+            .clone()
+            .unwrap_or_else(|| self.info.actor_name(self.identity.as_ref()));
+        let held;
+        let status = if self.session_up {
+            &self.status
+        } else {
+            held = self.status.off_session();
+            &held
+        };
+        let actor = self
+            .info
+            .bus_actor(name, self.heartbeat, self.identity.as_ref(), status);
+        let changed = actor != self.actor;
+        self.actor = actor;
+        changed
     }
 
-    /// Takes a session's identity into the actor. Returns whether it changed.
+    /// A session is up as `identity`: the actor takes the identity and the
+    /// driver's whole status. Returns whether it changed.
     fn apply_identity(&mut self, identity: &DeviceIdentity) -> bool {
-        let before = self.actor.clone();
-        let device = self.actor.device.get_or_insert_with(DeviceInfo::default);
-        if identity.manufacturer.is_some() {
-            device.manufacturer.clone_from(&identity.manufacturer);
-        }
-        device.model.clone_from(&identity.model);
-        device.firmware.clone_from(&identity.firmware);
-        let made: Vec<&str> = [device.manufacturer.as_deref(), device.model.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect();
-        self.actor.name = self.name.clone().unwrap_or_else(|| {
-            if made.is_empty() {
-                self.fallback_name.clone()
-            } else {
-                made.join(" ")
-            }
-        });
-        self.actor != before
+        self.identity = Some(identity.clone());
+        self.session_up = true;
+        self.rebuild_actor()
     }
 
     /// Finishes the session's open shots and takes what the session
-    /// reported off the actor: it is `not_armed`, with no battery, attitude
-    /// or telemetry.
+    /// reported off the actor: it is `not_armed`, with no battery, nothing
+    /// flagged and each telemetry key at its declared value.
     fn on_session_ended(&mut self) {
+        self.session_up = false;
         self.finish_open_shots("the session ended");
         if self.clear_session_status() {
             self.publish_actor();
@@ -987,17 +1077,18 @@ impl Net {
     }
 
     /// Goes back to [`DeviceStatus::not_armed`]: blockers `not_armed`, no
-    /// battery, attitude or telemetry. Returns whether the actor changed.
+    /// battery, nothing flagged, each telemetry key at its declared value.
+    /// Returns whether the actor changed.
     fn clear_session_status(&mut self) -> bool {
         self.apply_status(DeviceStatus::not_armed())
     }
 
     fn expire_shots(&mut self) {
-        let timeout = self.shot_timeout;
+        let (now, timeout) = (self.now, self.shot_timeout);
         let stale: Vec<String> = self
             .open
             .iter()
-            .filter(|(_, s)| s.since.elapsed() >= timeout)
+            .filter(|(_, s)| now.saturating_duration_since(s.since) >= timeout)
             .map(|(id, _)| id.clone())
             .collect();
         for id in stale {
@@ -1047,29 +1138,112 @@ mod tests {
     use crate::Source;
 
     fn net(name: Option<&str>) -> Net {
-        let mut config = ServerConfig::new(Transport::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let mut config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
         config.name = name.map(str::to_owned);
         net_with(&config)
     }
 
     fn net_with(config: &ServerConfig) -> Net {
+        net_with_notes(config).0
+    }
+
+    fn net_with_notes(config: &ServerConfig) -> (Net, Receiver<Note>) {
+        let info = DriverInfo::new("beacon", "Beacon", Source::Virtual)
+            .with_manufacturer("Birdie Labs")
+            .with_telemetry(&[("radar_mode", "idle"), ("signal", "none")]);
+        net_with_info(config, &info)
+    }
+
+    fn net_with_info(config: &ServerConfig, info: &DriverInfo) -> (Net, Receiver<Note>) {
         let (_to_net, rx) = sync_channel(QUEUE);
         let (hints_tx, _) = channel();
-        let (note_tx, _) = channel();
+        let (bus_tx, _) = channel();
+        let (note_tx, notes) = channel();
         let (_conn_tx, conn_rx) = channel();
-        let info =
-            DriverInfo::new("beacon", "Beacon", Source::Virtual).with_manufacturer("Birdie Labs");
-        Net::new(
+        let net = Net::new(
             config,
-            &info,
+            info,
             Links {
                 rx,
                 conn_rx,
                 hints_tx,
+                bus_tx,
                 note_tx,
                 down_tx: None,
             },
-        )
+            Instant::now(),
+        );
+        (net, notes)
+    }
+
+    const MS: Duration = Duration::from_millis(1);
+
+    /// A net with a session up, so the actor carries the driver's whole
+    /// status.
+    fn in_session() -> Net {
+        let mut net = net(None);
+        net.handle(
+            ToNet::Identified(DeviceIdentity::new("SERIAL-123")),
+            net.now,
+        );
+        net
+    }
+
+    #[test]
+    fn a_drivers_namespaces_reach_its_actor() {
+        let config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let info = DriverInfo::new("beacon", "Beacon", Source::Virtual)
+            .with_namespaces(&["clubhouse", "range"]);
+        let (with, _notes) = net_with_info(&config, &info);
+        assert_eq!(with.actor.namespaces, ["clubhouse", "range"]);
+        assert!(net(None).actor.namespaces.is_empty());
+    }
+
+    #[test]
+    fn the_actor_is_republished_once_per_heartbeat() {
+        let mut net = in_session();
+        let (t0, hb) = (net.last_beat, net.heartbeat);
+        net.tick((t0 + hb).checked_sub(MS).unwrap());
+        assert_eq!(net.last_beat, t0, "not due yet");
+        net.tick(t0 + hb);
+        assert_eq!(net.last_beat, t0 + hb, "due: published");
+        net.tick(t0 + hb + MS);
+        assert_eq!(net.last_beat, t0 + hb, "no second beat");
+        // Publishing for any other reason restarts the wait.
+        net.handle(
+            ToNet::StatusChange(StatusChange::Battery(Some(50))),
+            t0 + hb + 2 * MS,
+        );
+        net.tick(t0 + hb * 2 + MS);
+        assert_eq!(net.last_beat, t0 + hb + 2 * MS);
+    }
+
+    #[test]
+    fn a_shot_left_open_is_finished_at_the_shot_timeout() {
+        let config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let (mut net, notes) = net_with_notes(&config);
+        let (t0, timeout) = (net.now, net.shot_timeout);
+        let key = crate::driver::ShotIds::new().next_key();
+        let number = key.shot_number;
+        net.handle(
+            ToNet::Message(Box::new(crate::ShotTrigger::new(key).into())),
+            t0,
+        );
+        net.tick((t0 + timeout).checked_sub(MS).unwrap());
+        assert_eq!(net.open.len(), 1, "still open");
+        net.tick(t0 + timeout);
+        assert!(net.open.is_empty(), "finished");
+        let logs: Vec<String> = notes
+            .try_iter()
+            .filter_map(|n| match n {
+                Note::Log(_, line) => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            logs,
+            [format!("finishing shot {number}: it stayed open too long")]
+        );
     }
 
     #[test]
@@ -1096,12 +1270,11 @@ mod tests {
 
     #[test]
     fn changes_apply_to_the_status_and_report_whether_the_actor_changed() {
-        let mut net = net(None);
+        let mut net = in_session();
         assert!(net.apply_change(StatusChange::Blockers(vec![])));
         assert!(net.apply_change(StatusChange::Battery(Some(80))));
         assert!(!net.apply_change(StatusChange::Battery(Some(80))));
-        let set =
-            StatusChange::Telemetry([("radar_mode".to_owned(), Some("armed".to_owned()))].into());
+        let set = StatusChange::Telemetry([("radar_mode".to_owned(), "armed".to_owned())].into());
         assert!(net.apply_change(set.clone()));
         assert!(!net.apply_change(set));
         assert!(net.actor.is_clear());
@@ -1110,57 +1283,64 @@ mod tests {
     }
 
     #[test]
-    fn a_driver_can_take_each_value_off_the_actor() {
-        let mut net = net(None);
+    fn every_declared_key_is_on_the_actor_and_the_battery_can_come_off() {
+        let mut net = in_session();
+        assert_eq!(
+            net.actor.telemetry,
+            Some(
+                [
+                    ("radar_mode".to_owned(), "idle".to_owned()),
+                    ("signal".to_owned(), "none".to_owned()),
+                ]
+                .into()
+            ),
+            "the declared values before anything is reported"
+        );
         net.apply_status(
             DeviceStatus::new()
                 .with_blockers(["no_ball"])
                 .with_battery(80)
-                .with_attitude(0.4, -0.2)
-                .with_telemetry("radar_mode", "armed"),
+                .with_telemetry("radar_mode", "armed")
+                .with_flag("battery_pct", true),
         );
+        assert_eq!(net.actor.flagged, ["battery_pct"]);
         assert!(net.apply_change(StatusChange::Battery(None)));
-        assert!(net.apply_change(StatusChange::Attitude {
-            tilt: None,
-            roll: None
-        }));
-        assert!(net.apply_change(StatusChange::Telemetry(
-            [("radar_mode".to_owned(), None)].into()
-        )));
+        assert!(net.apply_change(StatusChange::Flag("battery_pct".into(), false)));
         assert!(net.apply_change(StatusChange::Blockers(vec![])));
-        let device = net.actor.device.as_ref().unwrap();
-        assert_eq!(
-            (device.battery_pct, device.tilt, device.roll),
-            (None, None, None)
-        );
-        assert_eq!(net.actor.telemetry, None, "no keys: no telemetry object");
+        assert_eq!(net.actor.device.as_ref().unwrap().battery_pct, None);
         assert!(net.actor.is_clear());
         let json = net.actor_message().to_json().unwrap();
-        for gone in ["battery_pct", "tilt", "roll", "telemetry", "radar_mode"] {
+        for gone in ["battery_pct", "flagged"] {
             assert!(!json.contains(gone), "{gone} is off the bus: {json}");
         }
+        assert!(json.contains(r#""radar_mode":"armed""#), "{json}");
     }
 
     #[test]
     fn a_whole_status_replaces_the_one_held() {
-        let mut net = net(None);
+        let mut net = in_session();
         net.apply_status(
             DeviceStatus::new()
                 .with_battery(80)
-                .with_attitude(0.4, -0.2)
                 .with_telemetry("radar_mode", "armed")
                 .with_telemetry("signal", "good"),
         );
         assert!(net.apply_status(DeviceStatus::new().with_telemetry("signal", "weak")));
-        let device = net.actor.device.as_ref().unwrap();
         assert_eq!(
-            (device.battery_pct, device.tilt, device.roll),
-            (None, None, None),
-            "what the new status leaves out is gone"
+            net.actor.device.as_ref().unwrap().battery_pct,
+            None,
+            "a battery the new status leaves out is gone"
         );
         assert_eq!(
             net.actor.telemetry,
-            Some([("signal".to_owned(), "weak".to_owned())].into())
+            Some(
+                [
+                    ("radar_mode".to_owned(), "idle".to_owned()),
+                    ("signal".to_owned(), "weak".to_owned()),
+                ]
+                .into()
+            ),
+            "a key it leaves out is back at its declared value"
         );
         assert!(net.actor.is_clear());
         assert!(!net.apply_status(DeviceStatus::new().with_telemetry("signal", "weak")));
@@ -1191,7 +1371,7 @@ mod tests {
 
     #[test]
     fn a_short_heartbeat_is_raised_once_and_advertised() {
-        let mut config = ServerConfig::new(Transport::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let mut config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
         config.heartbeat = Duration::from_millis(1);
         let net = net_with(&config);
         assert_eq!(net.heartbeat, MIN_HEARTBEAT);
@@ -1209,12 +1389,203 @@ mod tests {
         off.on_driver_message(raw());
         assert_eq!(off.seq, 0, "not numbered, not sent");
 
-        let mut config = ServerConfig::new(Transport::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let mut config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
         config.raw_frames = true;
         let mut on = net_with(&config);
         on.on_driver_message(raw());
         on.on_driver_message(raw());
         assert_eq!(on.seq, 2);
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("stopped")]
+    struct Halt;
+    impl From<crate::driver::Stopped> for Halt {
+        fn from(_: crate::driver::Stopped) -> Self {
+            Self
+        }
+    }
+
+    /// Reads its hints at the top of a connect, then ticks once.
+    #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct EarlyReader;
+    /// Records every `hints` and `bus` call.
+    struct Heard(DeviceIdentity, Vec<TurnHints>, Vec<FrpMessage>);
+
+    impl crate::driver::DriverConfig for EarlyReader {}
+
+    impl FrpDriver for EarlyReader {
+        type Config = Self;
+        type Error = Halt;
+        type Action = crate::driver::NoAction;
+        type Session = Heard;
+        fn info(_: &Self) -> DriverInfo {
+            DriverInfo::new("early", "Early", Source::Virtual)
+        }
+        fn new(config: Self) -> Result<Self, crate::driver::ConfigError> {
+            Ok(config)
+        }
+        fn config(&self) -> &Self {
+            self
+        }
+        fn apply_config(&mut self, _: &Self) {}
+        fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<Heard, Halt> {
+            let read = *ctx.hints();
+            ctx.tick()?;
+            Ok(Heard(DeviceIdentity::new("Early-1"), vec![read], vec![]))
+        }
+    }
+
+    impl FrpSession for Heard {
+        type Error = Halt;
+        type Action = crate::driver::NoAction;
+        fn step(&mut self, _: Instant, _: &mut Events<'_>) -> Result<Activity, Halt> {
+            Ok(Activity::Idle)
+        }
+        fn hints(&mut self, hints: &TurnHints, _: &mut Events<'_>) -> Result<(), Halt> {
+            self.1.push(*hints);
+            Ok(())
+        }
+        fn bus(&mut self, msg: &FrpMessage, _: &mut Events<'_>) -> Result<(), Halt> {
+            self.2.push(msg.clone());
+            Ok(())
+        }
+        fn identity(&self) -> &DeviceIdentity {
+            &self.0
+        }
+        fn close(self, _: &mut Events<'_>) {}
+    }
+
+    #[test]
+    fn a_turn_during_the_connect_reaches_the_session_before_its_first_step() {
+        let (turns, hints_rx) = channel();
+        let (_peers, bus_rx) = channel();
+        let (_notes, note_rx) = channel();
+        let observe = |_: &ServerEvent<'_>| {};
+        let mut inputs = Inputs {
+            hints_rx: &hints_rx,
+            bus_rx: &bus_rx,
+            note_rx: &note_rx,
+            observe: &observe,
+            log_level: Level::Info,
+        };
+        let stop = Stop::new();
+        let flags = HostFlags::new();
+        let mut sink = |_| {};
+        let mut hints = TurnHints::default();
+        let putter = TurnHints::default().with_club(crate::Club::Putter);
+        turns.send(putter).unwrap();
+        let (session, mut handed) = connect(
+            &mut EarlyReader,
+            &stop,
+            &mut sink,
+            &flags,
+            &mut inputs,
+            &mut hints,
+        );
+        let mut session = session.unwrap();
+        assert_eq!(session.1, [TurnHints::default()], "read before the turn");
+        let mut out = Events::new(&mut sink, &flags);
+        hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
+        hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
+        assert_eq!(
+            session.1,
+            [TurnHints::default(), putter],
+            "handed over once"
+        );
+        turns.send(putter).unwrap();
+        hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
+        assert_eq!(session.1.len(), 2, "the same hints again are no change");
+    }
+
+    #[test]
+    fn a_peer_message_reaches_the_running_session_once_and_none_from_before_it() {
+        let config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let info = DriverInfo::new("early", "Early", Source::Virtual);
+        let (hints_tx, hints_rx) = channel();
+        let (bus_tx, bus_rx) = channel();
+        let (note_tx, note_rx) = channel();
+        let (_to_net, rx) = sync_channel(QUEUE);
+        let (_conn_tx, conn_rx) = channel();
+        let links = Links {
+            rx,
+            conn_rx,
+            hints_tx,
+            bus_tx,
+            note_tx,
+            down_tx: None,
+        };
+        let mut net = Net::new(&config, &info, links, Instant::now());
+        let observe = |_: &ServerEvent<'_>| {};
+        let mut inputs = Inputs {
+            hints_rx: &hints_rx,
+            bus_rx: &bus_rx,
+            note_rx: &note_rx,
+            observe: &observe,
+            log_level: Level::Info,
+        };
+        let stop = Stop::new();
+        let flags = HostFlags::new();
+        let mut sink = |_| {};
+        let mut hints = TurnHints::default();
+        let shot = |n| {
+            let key = crate::ShotKey::new(format!("shot-{n}"), n);
+            FrpMessage::new("a1", ShotFinished { key })
+        };
+
+        net.on_peer_message(shot(1));
+        let (session, mut handed) = connect(
+            &mut EarlyReader,
+            &stop,
+            &mut sink,
+            &flags,
+            &mut inputs,
+            &mut hints,
+        );
+        let mut session = session.unwrap();
+        net.on_peer_message(shot(2));
+        let mut out = Events::new(&mut sink, &flags);
+        hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
+        hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
+        assert_eq!(
+            session.2,
+            [shot(2)],
+            "the message from before the session is dropped, the one during it handed over once"
+        );
+    }
+
+    #[test]
+    fn a_connects_blockers_and_battery_wait_for_its_session_and_each_connect_starts_fresh() {
+        let mut net = net(None);
+        let t0 = net.now;
+        let reported = || {
+            DeviceStatus::new()
+                .with_battery(50)
+                .with_telemetry("radar_mode", "armed")
+                .with_flag("radar_mode", true)
+                .with_flag("battery_pct", true)
+        };
+        net.handle(ToNet::ConnectStarted, t0);
+        net.handle(ToNet::Status(reported()), t0);
+        assert_eq!(net.actor.blockers, ["not_armed"], "no session: not ready");
+        assert_eq!(net.actor.device.as_ref().unwrap().battery_pct, None);
+        assert_eq!(net.actor.telemetry.as_ref().unwrap()["radar_mode"], "armed");
+        assert_eq!(net.actor.flagged, ["radar_mode"]);
+        // That connect failed; the next one starts from `not_armed`.
+        net.handle(ToNet::ConnectStarted, t0);
+        assert_eq!(net.actor.telemetry.as_ref().unwrap()["radar_mode"], "idle");
+        assert!(net.actor.flagged.is_empty());
+        net.handle(ToNet::Status(reported()), t0);
+        net.handle(ToNet::Identified(DeviceIdentity::new("SERIAL-123")), t0);
+        assert!(net.actor.is_clear(), "the session is up: ready");
+        assert_eq!(net.actor.device.as_ref().unwrap().battery_pct, Some(50));
+        assert_eq!(net.actor.flagged, ["battery_pct", "radar_mode"]);
+        // A connect after a session starts from `not_armed` as well.
+        net.handle(ToNet::SessionEnded, t0);
+        net.handle(ToNet::ConnectStarted, t0);
+        net.handle(ToNet::Status(reported()), t0);
+        assert_eq!(net.actor.blockers, ["not_armed"], "the old session is over");
+        assert_eq!(net.actor.device.as_ref().unwrap().battery_pct, None);
     }
 
     #[test]
@@ -1226,17 +1597,17 @@ mod tests {
         net.apply_identity(&identity);
         let status = DeviceStatus::new()
             .with_battery(80)
-            .with_attitude(0.4, -0.2)
             .with_telemetry("radar_mode", "armed");
         assert!(net.apply_status(status));
         net.on_session_ended();
         assert_eq!(net.actor.blockers, ["not_armed"]);
-        assert_eq!(net.actor.telemetry, None);
-        let device = net.actor.device.as_ref().unwrap();
         assert_eq!(
-            (device.battery_pct, device.tilt, device.roll),
-            (None, None, None)
+            net.actor.telemetry.as_ref().unwrap()["radar_mode"],
+            "idle",
+            "back at its declared value"
         );
+        let device = net.actor.device.as_ref().unwrap();
+        assert_eq!(device.battery_pct, None);
         assert_eq!(device.model.as_deref(), Some("Eagle One"), "identity stays");
         assert!(!net.clear_session_status(), "a second end changes nothing");
         assert_eq!(net.status, DeviceStatus::not_armed());

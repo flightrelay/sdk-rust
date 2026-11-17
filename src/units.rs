@@ -10,15 +10,24 @@ use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
+use crate::types::InvalidUnitValue;
+
 /// A distance value with unit. Serializes as a suffix string: `"1.5in"`,
 /// `"9ft"`, `"3m"`, `"30cm"`, `"100yd"`, `"42mm"`.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum Distance {
+    /// Feet (`ft`).
     Feet(f64),
+    /// Inches (`in`).
     Inches(f64),
+    /// Meters (`m`).
     Meters(f64),
+    /// Centimeters (`cm`).
     Centimeters(f64),
+    /// Yards (`yd`).
     Yards(f64),
+    /// Millimeters (`mm`).
     Millimeters(f64),
 }
 
@@ -36,7 +45,7 @@ impl<'de> Deserialize<'de> for Distance {
 }
 
 impl std::str::FromStr for Distance {
-    type Err = String;
+    type Err = InvalidUnitValue;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
@@ -53,17 +62,18 @@ impl std::str::FromStr for Distance {
                 let v: f64 = num
                     .trim()
                     .parse()
-                    .map_err(|_| format!("invalid number in distance: {s:?}"))?;
+                    .map_err(|_| InvalidUnitValue(format!("invalid number in distance: {s:?}")))?;
                 return Ok(ctor(v));
             }
         }
-        Err(format!(
+        Err(InvalidUnitValue(format!(
             "invalid distance {s:?}: expected number with suffix (ft, in, m, cm, yd, mm)"
-        ))
+        )))
     }
 }
 
 impl Distance {
+    /// The number, in this value's own unit.
     #[must_use]
     pub fn value(self) -> f64 {
         match self {
@@ -76,6 +86,7 @@ impl Distance {
         }
     }
 
+    /// The unit suffix this value is written with on the wire, e.g. `"m"`.
     #[must_use]
     pub fn unit_suffix(self) -> &'static str {
         match self {
@@ -88,6 +99,7 @@ impl Distance {
         }
     }
 
+    /// This distance in feet.
     #[must_use]
     pub fn as_feet(self) -> f64 {
         match self {
@@ -100,6 +112,7 @@ impl Distance {
         }
     }
 
+    /// This distance in inches.
     #[must_use]
     pub fn as_inches(self) -> f64 {
         match self {
@@ -112,6 +125,7 @@ impl Distance {
         }
     }
 
+    /// This distance in meters.
     #[must_use]
     pub fn as_meters(self) -> f64 {
         match self {
@@ -124,6 +138,7 @@ impl Distance {
         }
     }
 
+    /// This distance in centimeters.
     #[must_use]
     pub fn as_centimeters(self) -> f64 {
         match self {
@@ -136,6 +151,7 @@ impl Distance {
         }
     }
 
+    /// This distance in yards.
     #[must_use]
     pub fn as_yards(self) -> f64 {
         match self {
@@ -148,6 +164,7 @@ impl Distance {
         }
     }
 
+    /// This distance in millimeters.
     #[must_use]
     pub fn as_millimeters(self) -> f64 {
         match self {
@@ -167,13 +184,24 @@ impl fmt::Display for Distance {
     }
 }
 
+/// Meters per second in one mile per hour, exactly.
+const MPS_PER_MPH: f64 = 0.44704;
+
+/// Meters in one foot, exactly.
+const M_PER_FT: f64 = 0.3048;
+
 /// A velocity value with unit. Serializes as a suffix string: `"67.2mps"`,
 /// `"150.3mph"`, `"108.0kph"`, `"100.0fps"`.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum Velocity {
+    /// Miles per hour (`mph`).
     MilesPerHour(f64),
+    /// Feet per second (`fps`).
     FeetPerSecond(f64),
+    /// Meters per second (`mps`).
     MetersPerSecond(f64),
+    /// Kilometers per hour (`kph`).
     KilometersPerHour(f64),
 }
 
@@ -191,7 +219,7 @@ impl<'de> Deserialize<'de> for Velocity {
 }
 
 impl std::str::FromStr for Velocity {
-    type Err = String;
+    type Err = InvalidUnitValue;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
@@ -206,17 +234,18 @@ impl std::str::FromStr for Velocity {
                 let v: f64 = num
                     .trim()
                     .parse()
-                    .map_err(|_| format!("invalid number in velocity: {s:?}"))?;
+                    .map_err(|_| InvalidUnitValue(format!("invalid number in velocity: {s:?}")))?;
                 return Ok(ctor(v));
             }
         }
-        Err(format!(
+        Err(InvalidUnitValue(format!(
             "invalid velocity {s:?}: expected number with suffix (mph, mps, kph, fps)"
-        ))
+        )))
     }
 }
 
 impl Velocity {
+    /// The number, in this value's own unit.
     #[must_use]
     pub fn value(self) -> f64 {
         match self {
@@ -227,6 +256,7 @@ impl Velocity {
         }
     }
 
+    /// The unit suffix this value is written with on the wire, e.g. `"mps"`.
     #[must_use]
     pub fn unit_suffix(self) -> &'static str {
         match self {
@@ -237,41 +267,45 @@ impl Velocity {
         }
     }
 
+    /// This velocity in miles per hour.
     #[must_use]
     pub fn as_mph(self) -> f64 {
         match self {
             Self::MilesPerHour(v) => v,
-            Self::FeetPerSecond(v) => v * 0.681_818,
-            Self::MetersPerSecond(v) => v * 2.23694,
-            Self::KilometersPerHour(v) => v * 0.621_371,
+            Self::FeetPerSecond(v) => v * M_PER_FT / MPS_PER_MPH,
+            Self::MetersPerSecond(v) => v / MPS_PER_MPH,
+            Self::KilometersPerHour(v) => v / 3.6 / MPS_PER_MPH,
         }
     }
 
+    /// This velocity in feet per second.
     #[must_use]
     pub fn as_fps(self) -> f64 {
         match self {
-            Self::MilesPerHour(v) => v * 1.46667,
+            Self::MilesPerHour(v) => v * MPS_PER_MPH / M_PER_FT,
             Self::FeetPerSecond(v) => v,
-            Self::MetersPerSecond(v) => v * 3.28084,
-            Self::KilometersPerHour(v) => v * 0.911_344,
+            Self::MetersPerSecond(v) => v / M_PER_FT,
+            Self::KilometersPerHour(v) => v / 3.6 / M_PER_FT,
         }
     }
 
+    /// This velocity in meters per second.
     #[must_use]
     pub fn as_mps(self) -> f64 {
         match self {
-            Self::MilesPerHour(v) => v * 0.44704,
-            Self::FeetPerSecond(v) => v * 0.3048,
+            Self::MilesPerHour(v) => v * MPS_PER_MPH,
+            Self::FeetPerSecond(v) => v * M_PER_FT,
             Self::MetersPerSecond(v) => v,
             Self::KilometersPerHour(v) => v / 3.6,
         }
     }
 
+    /// This velocity in kilometers per hour.
     #[must_use]
     pub fn as_kph(self) -> f64 {
         match self {
-            Self::MilesPerHour(v) => v * 1.60934,
-            Self::FeetPerSecond(v) => v * 1.09728,
+            Self::MilesPerHour(v) => v * MPS_PER_MPH * 3.6,
+            Self::FeetPerSecond(v) => v * M_PER_FT * 3.6,
             Self::MetersPerSecond(v) => v * 3.6,
             Self::KilometersPerHour(v) => v,
         }
@@ -344,5 +378,22 @@ mod tests {
         assert!((d.as_feet() - 3.28084).abs() < 0.001);
         assert!((d.as_yards() - 1.09361).abs() < 0.001);
         assert!((d.as_millimeters() - 1000.0).abs() < 0.001);
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-12 * b.abs()
+    }
+
+    #[test]
+    fn velocity_conversions_use_exact_factors() {
+        assert!(close(Velocity::MilesPerHour(60.0).as_fps(), 88.0));
+        assert!(close(Velocity::FeetPerSecond(88.0).as_mph(), 60.0));
+        assert!(close(Velocity::MilesPerHour(1.0).as_kph(), 1.609_344));
+        assert!(close(Velocity::KilometersPerHour(1.609_344).as_mph(), 1.0));
+        assert!(close(Velocity::MetersPerSecond(0.44704).as_mph(), 1.0));
+        assert!(close(
+            Velocity::KilometersPerHour(3.6).as_fps(),
+            1.0 / 0.3048
+        ));
     }
 }

@@ -1,36 +1,4 @@
 //! Shot accumulator for collectors.
-//!
-//! Requires the `controller` feature. [`ShotAggregator`] composes a shot
-//! from its `shot.*` messages and yields it when `shot.finished` arrives.
-//!
-//! - A shot is identified by `key.shot_id` alone: its messages are
-//!   accumulated whoever sent them. `shot.trigger` opens it; the actor that
-//!   sent the trigger is the shot's [`from`](CompletedShot::from), and only
-//!   that actor's `shot.finished` finishes it (one from any other actor is
-//!   ignored).
-//! - A shot keeps the first `shot.launch`, `shot.club` and `shot.impact` it
-//!   receives, and every `shot.flight`, in the order they arrive; each
-//!   [`Flight`] records its sender, and its flight result its model.
-//! - A shot carries the [`Source`] its launch monitor declares in the
-//!   `device` block of its `bus.actor`, the `golfer.turn` current when its
-//!   trigger arrived, and the open `practice.block` of that turn's golfer.
-//! - A finished shot is remembered for one timeout after it finished, and a
-//!   message for it is attached while it is. A message from the shot's own
-//!   launch monitor (the actor that sent its `shot.finished`) is out of order
-//!   and yields a [`ShotEvent::Late`] for the caller to log as a warning. A
-//!   message from any other actor, such as a flight model's `shot.flight`,
-//!   is an addendum: when it changed the shot (a flight, or a launch, club or
-//!   impact the shot did not have yet) it yields a [`ShotEvent::Updated`]
-//!   with the updated shot; one that changed nothing yields nothing. A
-//!   message for a finished shot no longer remembered is ignored.
-//! - A shot that has not finished within the accumulator timeout
-//!   ([`DEFAULT_SHOT_TIMEOUT`] unless set with
-//!   [`ShotAggregator::with_timeout`]) is discarded, and its messages are
-//!   ignored for one more timeout, so a late message never starts a new
-//!   partial shot. The open shots of an actor that is gone
-//!   ([`ShotAggregator::forget_actor`], or its `bus.actor` removal) are
-//!   discarded the same way.
-//! - `shot.raw` is not part of a shot, even with a key.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -43,6 +11,7 @@ use crate::types::{Basis, ClubData, FaceImpact, FlightResult, Launch, ShotKey, S
 
 /// A shot with all the data its messages carried.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CompletedShot {
     /// The actor that sent `shot.trigger`: the launch monitor that saw the
     /// strike.
@@ -83,6 +52,24 @@ pub struct Flight {
 }
 
 impl CompletedShot {
+    /// A shot `key` triggered by `from`, with no data yet: every other field
+    /// empty. For tests of code that reads shots.
+    #[must_use]
+    pub fn new(from: impl Into<String>, key: ShotKey) -> Self {
+        Self {
+            from: from.into(),
+            key,
+            timestamp: None,
+            launch: None,
+            club: None,
+            impact: None,
+            flights: Vec::new(),
+            source: None,
+            turn: None,
+            block: None,
+        }
+    }
+
     /// The flight result to show: the first [`Tracked`](Basis::Tracked) one,
     /// else the first from the shot's launch monitor, else the first.
     #[must_use]
@@ -92,6 +79,16 @@ impl CompletedShot {
             .find(|f| f.flight.basis == Basis::Tracked)
             .or_else(|| self.flights.iter().find(|f| f.from == self.from))
             .or_else(|| self.flights.first())
+            .map(|f| &f.flight)
+    }
+
+    /// The launch monitor's own flight result: the first one from
+    /// [`from`](Self::from), never another actor's.
+    #[must_use]
+    pub fn own_flight(&self) -> Option<&FlightResult> {
+        self.flights
+            .iter()
+            .find(|f| f.from == self.from)
             .map(|f| &f.flight)
     }
 
@@ -141,6 +138,7 @@ impl CompletedShot {
 
 /// What feeding a message produced.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ShotEvent {
     /// `shot.finished` arrived for a shot in progress.
     Finished(CompletedShot),
@@ -158,6 +156,7 @@ pub enum ShotEvent {
 /// A shot message that the shot's launch monitor sent after its own
 /// `shot.finished` for the shot. Its `Display` is a warning line.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct LateMessage {
     /// The sender of the late message: the shot's launch monitor.
     pub from: String,
@@ -183,8 +182,37 @@ struct InProgress {
     started: Instant,
 }
 
-/// Composes shots from `shot.*` messages, keyed by `shot_id`. See the
-/// [module docs](self).
+/// Composes shots from `shot.*` messages, keyed by `shot_id`, and yields
+/// each when `shot.finished` arrives. Requires the `collector` feature.
+///
+/// - A shot is identified by `key.shot_id` alone: its messages are
+///   accumulated whoever sent them. `shot.trigger` opens it; the actor that
+///   sent the trigger is the shot's [`from`](CompletedShot::from), and only
+///   that actor's `shot.finished` finishes it (one from any other actor is
+///   ignored).
+/// - A shot keeps the first `shot.launch`, `shot.club` and `shot.impact` it
+///   receives, and every `shot.flight`, in the order they arrive; each
+///   [`Flight`] records its sender, and its flight result its model.
+/// - A shot carries the [`Source`] its launch monitor declares in the
+///   `device` block of its `bus.actor`, the `golfer.turn` current when its
+///   trigger arrived, and the open `practice.block` of that turn's golfer.
+/// - A finished shot is remembered for one timeout after it finished, and a
+///   message for it is attached while it is. A message from the shot's own
+///   launch monitor (the actor that sent its `shot.finished`) is out of order
+///   and yields a [`ShotEvent::Late`] for the caller to log as a warning. A
+///   message from any other actor, such as a flight model's `shot.flight`,
+///   is an addendum: when it changed the shot (a flight, or a launch, club or
+///   impact the shot did not have yet) it yields a [`ShotEvent::Updated`]
+///   with the updated shot; one that changed nothing yields nothing. A
+///   message for a finished shot no longer remembered is ignored.
+/// - A shot that has not finished within the accumulator timeout
+///   ([`DEFAULT_SHOT_TIMEOUT`] unless set with
+///   [`ShotAccumulator::with_timeout`]) is discarded, and its messages are
+///   ignored for one more timeout, so a late message never starts a new
+///   partial shot. The open shots of an actor that is gone
+///   ([`ShotAccumulator::forget_actor`], or its `bus.actor` removal) are
+///   discarded the same way.
+/// - `shot.raw` is not part of a shot, even with a key.
 ///
 /// Feed every message with [`feed`](Self::feed). Besides shot messages it
 /// reads `bus.actor` (each launch monitor's source), `golfer.turn` and
@@ -193,16 +221,16 @@ struct InProgress {
 /// [`BusState::expire`](crate::BusState::expire) reports.
 ///
 /// ```
-/// use flightrelay::{FrpMessage, ShotAggregator, ShotEvent, ShotFinished, ShotKey, ShotTrigger};
+/// use flightrelay::{FrpMessage, ShotAccumulator, ShotEvent, ShotFinished, ShotKey, ShotTrigger};
 ///
-/// let mut shots = ShotAggregator::new();
+/// let mut shots = ShotAccumulator::new();
 /// let key = ShotKey::new("550e8400-e29b-41d4-a716-446655440000", 1);
 /// shots.feed(&FrpMessage::new("7d2f9a41c03be856", ShotTrigger::new(key.clone())));
 /// let done = shots.feed(&FrpMessage::new("7d2f9a41c03be856", ShotFinished { key }));
 /// assert!(matches!(done, Some(ShotEvent::Finished(_))));
 /// ```
 #[derive(Debug)]
-pub struct ShotAggregator {
+pub struct ShotAccumulator {
     timeout: Duration,
     pending: HashMap<String, InProgress>,
     /// Finished shots, remembered for addenda and late messages, with when
@@ -215,7 +243,7 @@ pub struct ShotAggregator {
     blocks: HashMap<String, (String, PracticeBlock)>,
 }
 
-impl Default for ShotAggregator {
+impl Default for ShotAccumulator {
     fn default() -> Self {
         Self {
             timeout: DEFAULT_SHOT_TIMEOUT,
@@ -229,8 +257,8 @@ impl Default for ShotAggregator {
     }
 }
 
-impl ShotAggregator {
-    /// An aggregator with the [`DEFAULT_SHOT_TIMEOUT`].
+impl ShotAccumulator {
+    /// An accumulator with the [`DEFAULT_SHOT_TIMEOUT`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -256,7 +284,8 @@ impl ShotAggregator {
         self.feed_at(msg, Instant::now())
     }
 
-    fn feed_at(&mut self, msg: &FrpMessage, now: Instant) -> Option<ShotEvent> {
+    /// [`feed`](Self::feed) at `now`: what the timeouts count from.
+    pub fn feed_at(&mut self, msg: &FrpMessage, now: Instant) -> Option<ShotEvent> {
         self.discard_expired_at(now);
         let from = msg.from.as_str();
         match &msg.body {
@@ -352,16 +381,11 @@ impl ShotAggregator {
             .find(|(_, b)| b.golfer.as_ref() == golfer)
             .map(|(_, b)| b.id.clone());
         CompletedShot {
-            from: from.to_owned(),
-            key,
             timestamp,
-            launch: None,
-            club: None,
-            impact: None,
-            flights: Vec::new(),
             source: self.source(from),
             turn,
             block,
+            ..CompletedShot::new(from, key)
         }
     }
 
@@ -372,7 +396,8 @@ impl ShotAggregator {
         self.discard_expired_at(Instant::now())
     }
 
-    fn discard_expired_at(&mut self, now: Instant) -> usize {
+    /// [`discard_expired`](Self::discard_expired) at `now`.
+    pub fn discard_expired_at(&mut self, now: Instant) -> usize {
         let timeout = self.timeout;
         let fresh = |at: &Instant| now.saturating_duration_since(*at) <= timeout;
         self.finished.retain(|_, (_, at)| fresh(at));
@@ -399,7 +424,8 @@ impl ShotAggregator {
         self.discard_at(shot_id, Instant::now())
     }
 
-    fn discard_at(&mut self, shot_id: &str, now: Instant) -> bool {
+    /// [`discard`](Self::discard) at `now`.
+    pub fn discard_at(&mut self, shot_id: &str, now: Instant) -> bool {
         if self.pending.remove(shot_id).is_none() {
             return false;
         }
@@ -415,7 +441,8 @@ impl ShotAggregator {
         self.forget_actor_at(actor, Instant::now());
     }
 
-    fn forget_actor_at(&mut self, actor: &str, now: Instant) {
+    /// [`forget_actor`](Self::forget_actor) at `now`.
+    pub fn forget_actor_at(&mut self, actor: &str, now: Instant) {
         self.sources.remove(actor);
         if self.turn.as_ref().is_some_and(|(owner, _)| owner == actor) {
             self.turn = None;

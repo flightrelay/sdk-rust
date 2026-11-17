@@ -1,11 +1,10 @@
-//! [`run`]: a complete `main` for a [`DeviceDriver`], and
-//! [`config_actor_id`] for a binary that builds its own [`FrpServer`].
+//! [`run`]: a complete `main` for a [`FrpDriver`].
 //!
 //! Requires the `main` feature. A binary is one line:
 //!
 //! ```no_run
-//! # use flightrelay::driver::DeviceDriver;
-//! # fn main_for<D: DeviceDriver>() -> std::process::ExitCode {
+//! # use flightrelay::driver::FrpDriver;
+//! # fn main_for<D: FrpDriver>() -> std::process::ExitCode {
 //! flightrelay::run::<D>()
 //! # }
 //! ```
@@ -66,14 +65,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 use serde_json::{Map, Value};
 
 use crate::config::{ConfigError, DriverConfig};
-use crate::driver::{DeviceDriver, DeviceEvent, Level, Stop};
-use crate::{FrpBody, FrpServer, ServerConfig, ServerEvent, Transport};
+use crate::driver::{DeviceEvent, FrpDriver, Level, Stop};
+use crate::{FrpBody, FrpServer, ServerConfig, ServerEvent, Target};
 
 /// The table of the config file that holds the runner's own settings.
 const RUNNER_TABLE: &str = "frp";
 
-/// What differs between binaries that run on [`run`].
-pub struct RunOptions<D: DeviceDriver> {
+/// What differs between binaries that run on [`run`]. Start from
+/// [`RunOptions::default`] and set the fields that differ.
+#[non_exhaustive]
+pub struct RunOptions<D: FrpDriver> {
     /// The config the file and `--set` flags apply over. Default:
     /// `D::Config::default`.
     pub default_config: fn() -> D::Config,
@@ -86,7 +87,7 @@ pub struct RunOptions<D: DeviceDriver> {
     pub program: Option<&'static str>,
 }
 
-impl<D: DeviceDriver> Default for RunOptions<D> {
+impl<D: FrpDriver> Default for RunOptions<D> {
     fn default() -> Self {
         Self {
             default_config: D::Config::default,
@@ -96,7 +97,7 @@ impl<D: DeviceDriver> Default for RunOptions<D> {
     }
 }
 
-impl<D: DeviceDriver> std::fmt::Debug for RunOptions<D> {
+impl<D: FrpDriver> std::fmt::Debug for RunOptions<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunOptions")
             .field("default_target", &self.default_target)
@@ -108,14 +109,14 @@ impl<D: DeviceDriver> std::fmt::Debug for RunOptions<D> {
 /// Run `D` as a program: the arguments come from `std::env`. Never returns
 /// before the process should exit.
 #[must_use]
-pub fn run<D: DeviceDriver>() -> ExitCode {
+pub fn run<D: FrpDriver>() -> ExitCode {
     run_with::<D>(RunOptions::default())
 }
 
 /// [`run`] with options.
 #[must_use]
 #[allow(clippy::needless_pass_by_value)] // the options belong to the program being run
-pub fn run_with<D: DeviceDriver>(options: RunOptions<D>) -> ExitCode {
+pub fn run_with<D: FrpDriver>(options: RunOptions<D>) -> ExitCode {
     let mut args = std::env::args_os().map(|a| a.to_string_lossy().into_owned());
     let program = args.next().map(|path| {
         std::path::Path::new(&path)
@@ -128,14 +129,14 @@ pub fn run_with<D: DeviceDriver>(options: RunOptions<D>) -> ExitCode {
 /// [`run`] over explicit arguments, which exclude the program name.
 #[must_use]
 #[allow(clippy::needless_pass_by_value)] // the options belong to the program being run
-pub fn run_args<D: DeviceDriver>(
+pub fn run_args<D: FrpDriver>(
     args: impl Iterator<Item = String>,
     options: RunOptions<D>,
 ) -> ExitCode {
     run_with_program::<D>(None, args, &options)
 }
 
-fn run_with_program<D: DeviceDriver>(
+fn run_with_program<D: FrpDriver>(
     argv0: Option<String>,
     args: impl Iterator<Item = String>,
     options: &RunOptions<D>,
@@ -307,23 +308,19 @@ fn resolve<C: DriverConfig>(base: &C, args: &Args) -> Result<(C, Runner), Config
     Ok((C::from_map(map)?, runner))
 }
 
-/// The launch monitor actor id kept in a config file, from
-/// [`config_actor_id`].
+/// A new launch monitor actor id and whether it was saved to the config
+/// file.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ConfigActorId {
+struct ConfigActorId {
     /// The actor id.
-    pub id: String,
-    /// Whether it was read, or generated and saved or not.
-    pub origin: ActorIdOrigin,
+    id: String,
+    /// Whether it was saved.
+    origin: ActorIdOrigin,
 }
 
-/// Where a [`ConfigActorId`] came from.
+/// Whether a new actor id ([`ConfigActorId`]) was saved.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ActorIdOrigin {
-    /// The file's `[frp]` table had it.
-    Read,
+enum ActorIdOrigin {
     /// The file had none: the id is new and is now in the file's `[frp]`
     /// table.
     Saved,
@@ -336,63 +333,6 @@ pub enum ActorIdOrigin {
     /// The file had none: the id is new, and writing it failed for this
     /// reason; the file is as it was.
     SaveFailed(String),
-}
-
-/// The launch monitor actor id in the `[frp]` table (`frp.actor_id`) of the
-/// TOML config file at `path`, for a binary that builds its own
-/// [`FrpServer`] instead of calling [`run`].
-///
-/// When the file has none, a new id ([`new_actor_id`](crate::new_actor_id))
-/// is written into its `[frp]` table by the same rules [`run`] follows: the
-/// file is changed only when the edit reads back as the same config plus
-/// `actor_id`, and it is replaced through a temporary file in the same
-/// directory, so a failed write leaves the old file whole. The other keys of
-/// the `[frp]` table are not checked.
-///
-/// ```no_run
-/// use flightrelay::{ActorIdOrigin, ServerConfig, Transport, config_actor_id};
-///
-/// let kept = config_actor_id("launch-monitor.toml")?;
-/// if !matches!(kept.origin, ActorIdOrigin::Read | ActorIdOrigin::Saved) {
-///     eprintln!("new actor id {} for this run only", kept.id);
-/// }
-/// let config = ServerConfig::new(Transport::listen("0.0.0.0:5880"), kept.id);
-/// # Ok::<(), flightrelay::config::ConfigError>(())
-/// ```
-///
-/// # Errors
-///
-/// Returns a [`ConfigError`] when the file cannot be read or is not TOML,
-/// when `frp` is not a table, or when `frp.actor_id` is not a non-empty
-/// string.
-pub fn config_actor_id(path: impl AsRef<std::path::Path>) -> Result<ConfigActorId, ConfigError> {
-    let path = path.as_ref();
-    let shown = path.display();
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| ConfigError::new(format!("cannot read {shown}: {e}")))?;
-    let table: toml::Table =
-        toml::from_str(&text).map_err(|e| ConfigError::new(format!("{shown}: {}", e.message())))?;
-    let id = match table.get(RUNNER_TABLE) {
-        None => None,
-        Some(toml::Value::Table(frp)) => match frp.get("actor_id") {
-            None => None,
-            Some(toml::Value::String(id)) if !id.is_empty() => Some(id.clone()),
-            Some(_) => {
-                return Err(ConfigError::field(
-                    "frp.actor_id",
-                    "must be a non-empty string",
-                ));
-            }
-        },
-        Some(_) => return Err(ConfigError::field(RUNNER_TABLE, "must be a table")),
-    };
-    Ok(match id {
-        Some(id) => ConfigActorId {
-            id,
-            origin: ActorIdOrigin::Read,
-        },
-        None => generate_and_save(path),
-    })
 }
 
 /// A new actor id, written into the `[frp]` table of the file at `path`
@@ -676,7 +616,7 @@ fn render_table(path: &str, map: &Map<String, Value>, out: &mut String) {
 }
 
 /// The testable body of [`run`]: returns the exit code.
-fn execute<D: DeviceDriver>(
+fn execute<D: FrpDriver>(
     program: &str,
     args: &[String],
     options: &RunOptions<D>,
@@ -733,9 +673,9 @@ fn execute<D: DeviceDriver>(
         return 2;
     }
     let transport = if target.starts_with("ws://") {
-        Transport::connect(target)
+        Target::connect(target)
     } else {
-        Transport::listen(target)
+        Target::listen(target)
     };
     let actor_id = runner
         .actor_id
@@ -775,7 +715,7 @@ fn new_actor_id(program: &str, path: Option<&str>, stderr: &Stream) -> String {
     };
     let ConfigActorId { id, origin } = generate_and_save(std::path::Path::new(path));
     let line = match origin {
-        ActorIdOrigin::Read | ActorIdOrigin::Saved => {
+        ActorIdOrigin::Saved => {
             format!("{program}: new actor id {id}, saved to {path}")
         }
         ActorIdOrigin::NotSaved => format!(
@@ -815,13 +755,10 @@ fn describe(event: &ServerEvent<'_>, log: Level) -> Option<String> {
         ServerEvent::DeviceConnected(identity) => {
             format!("device connected: {}", identity.label())
         }
-        ServerEvent::DeviceLost { error, retry_in } => {
-            let why = error.map_or_else(|| "stopped".to_owned(), ToString::to_string);
-            match retry_in {
-                Some(d) => format!("device lost: {why}; retrying in {}", delay_text(*d)),
-                None => format!("device lost: {why}; giving up"),
-            }
-        }
+        ServerEvent::DeviceLost { error, retry_in } => match retry_in {
+            Some(d) => format!("device lost: {error}; retrying in {}", delay_text(*d)),
+            None => format!("device lost: {error}; giving up"),
+        },
         ServerEvent::Hints(hints) => format!(
             "turn: hand={} club={} mode={}",
             opt(hints.handedness.map(|h| h.to_string())),

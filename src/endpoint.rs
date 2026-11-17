@@ -1,32 +1,4 @@
 //! The WebSocket binding of FRP.
-//!
-//! Requires the `transport` feature. One message per text frame; the default
-//! URL is `ws://localhost:5880/frp`. There is no handshake beyond the
-//! WebSocket upgrade: on connecting, each side sends `bus.actor` for each
-//! actor it hosts, then the state those actors own, then `bus.sync`
-//! ([`FrpConnection::greet`]).
-//!
-//! Either side may open the socket. [`Transport`] picks whether an endpoint
-//! listens or dials; once connected, both sides are peers on the bus.
-//!
-//! An actor that stays connected republishes its `bus.actor` every heartbeat
-//! and in answer to `bus.sync`; [`FrpConnection::recv_timeout`] lets one
-//! blocking loop do that between messages (see the collector loop in the
-//! [crate docs](crate#a-collector)).
-//!
-//! ```no_run
-//! use flightrelay::{BusActor, EndpointConfig, FrpEndpoint, FrpMessage, Transport};
-//!
-//! let mut ep = FrpEndpoint::open(EndpointConfig::new(Transport::connect("ws://hub:5880/frp")))?;
-//! let mut conn = ep.establish()?;
-//! let me = FrpMessage::new("e4a7136b9f02cd58", BusActor::new("Fairway Physics", 2.0));
-//! conn.greet(&[me], &[])?; // `bus.actor`, no state of its own, then `bus.sync`
-//! loop {
-//!     let msg = conn.recv()?;
-//!     println!("{} from {}", msg.kind(), msg.from);
-//! }
-//! # Ok::<(), flightrelay::FrpError>(())
-//! ```
 
 use std::fmt;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -38,20 +10,22 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::protocol::{WebSocket, WebSocketConfig};
 use tungstenite::stream::MaybeTlsStream;
 
-use crate::error::FrpError;
+use crate::error::{FrpError, websocket};
 use crate::kinds::BusSync;
 use crate::message::FrpMessage;
 
-/// How this endpoint obtains a WebSocket connection.
+/// Where an endpoint gets its WebSocket connection: the address it listens
+/// on, or the URL it dials.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Transport {
+#[non_exhaustive]
+pub enum Target {
     /// Bind a TCP listener and accept incoming connections.
     Listen(String),
     /// Dial a remote FRP endpoint.
     Connect(String),
 }
 
-impl Transport {
+impl Target {
     /// Accept incoming connections on `addr` (e.g. `"0.0.0.0:5880"`).
     #[must_use]
     pub fn listen(addr: impl Into<String>) -> Self {
@@ -67,9 +41,10 @@ impl Transport {
 
 /// Configuration for an [`FrpEndpoint`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EndpointConfig {
-    /// How this endpoint obtains a connection.
-    pub transport: Transport,
+    /// Where this endpoint listens, or whom it dials.
+    pub target: Target,
     /// How long the WebSocket upgrade may take, from the connection opening
     /// to the upgrade's answer. `None` waits as long as the peer does.
     pub handshake_timeout: Option<Duration>,
@@ -92,12 +67,12 @@ const ACCEPT_POLL: Duration = Duration::from_millis(100);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl EndpointConfig {
-    /// A config over `transport`, with no upgrade timeout and the
+    /// A config for `target`, with no upgrade timeout and the
     /// [`DEFAULT_WRITE_BUFFER_LIMIT`].
     #[must_use]
-    pub fn new(transport: Transport) -> Self {
+    pub fn new(target: Target) -> Self {
         Self {
-            transport,
+            target,
             handshake_timeout: None,
             write_buffer_limit: DEFAULT_WRITE_BUFFER_LIMIT,
         }
@@ -125,7 +100,36 @@ impl EndpointConfig {
     }
 }
 
-/// A way of obtaining FRP connections: a listener, or a URL to dial.
+/// A way of obtaining FRP connections: a listener, or a URL to dial. The
+/// WebSocket binding of FRP.
+///
+/// Requires the `transport` feature. One message per text frame; the default
+/// URL is `ws://localhost:5880/frp`. There is no handshake beyond the
+/// WebSocket upgrade: on connecting, each side sends `bus.actor` for each
+/// actor it hosts, then the state those actors own, then `bus.sync`
+/// ([`FrpConnection::greet`]).
+///
+/// Either side may open the socket. [`Target`] picks whether an endpoint
+/// listens or dials; once connected, both sides are peers on the bus.
+///
+/// An actor that stays connected republishes its `bus.actor` every heartbeat
+/// and in answer to `bus.sync`; [`FrpConnection::recv_timeout`] lets one
+/// blocking loop do that between messages (see the collector loop in the
+/// [crate docs](crate#a-collector)).
+///
+/// ```no_run
+/// use flightrelay::{BusActor, EndpointConfig, FrpEndpoint, FrpMessage, Target};
+///
+/// let mut ep = FrpEndpoint::open(EndpointConfig::new(Target::connect("ws://hub:5880/frp")))?;
+/// let mut conn = ep.establish()?;
+/// let me = FrpMessage::new("e4a7136b9f02cd58", BusActor::new("Fairway Physics", 2.0));
+/// conn.greet(&[me], &[])?; // `bus.actor`, no state of its own, then `bus.sync`
+/// loop {
+///     let msg = conn.recv()?;
+///     println!("{} from {}", msg.kind(), msg.from);
+/// }
+/// # Ok::<(), flightrelay::FrpError>(())
+/// ```
 ///
 /// An endpoint is long-lived and outlives the connections it produces. Call
 /// [`establish`](Self::establish) again to reconnect — the caller owns any
@@ -136,21 +140,21 @@ pub struct FrpEndpoint {
 }
 
 impl FrpEndpoint {
-    /// Open an endpoint. Binds the TCP listener for [`Transport::Listen`];
-    /// [`Transport::Connect`] defers all I/O to [`establish`](Self::establish).
+    /// Open an endpoint. Binds the TCP listener for [`Target::Listen`];
+    /// [`Target::Connect`] defers all I/O to [`establish`](Self::establish).
     ///
     /// # Errors
     ///
     /// Returns an error if the TCP listener cannot bind.
     pub fn open(config: EndpointConfig) -> Result<Self, FrpError> {
-        let listener = match &config.transport {
-            Transport::Listen(addr) => Some(TcpListener::bind(addr).map_err(io_error)?),
-            Transport::Connect(_) => None,
+        let listener = match &config.target {
+            Target::Listen(addr) => Some(TcpListener::bind(addr).map_err(io_error)?),
+            Target::Connect(_) => None,
         };
         Ok(Self { config, listener })
     }
 
-    /// The local address of the bound listener, for [`Transport::Listen`].
+    /// The local address of the bound listener, for [`Target::Listen`].
     ///
     /// # Errors
     ///
@@ -162,8 +166,8 @@ impl FrpEndpoint {
         }
     }
 
-    /// Obtain a connection: accept an inbound one ([`Transport::Listen`]) or
-    /// dial the configured URL ([`Transport::Connect`]), and complete the
+    /// Obtain a connection: accept an inbound one ([`Target::Listen`]) or
+    /// dial the configured URL ([`Target::Connect`]), and complete the
     /// WebSocket upgrade, bounded by [`EndpointConfig::handshake_timeout`]
     /// when one is set. Nothing is sent on the new connection; call
     /// [`FrpConnection::greet`] next.
@@ -206,8 +210,8 @@ impl FrpEndpoint {
         cancelable: bool,
     ) -> Result<Option<FrpConnection>, FrpError> {
         let ws = self.config.ws_config();
-        match (&self.config.transport, &self.listener) {
-            (Transport::Listen(_), Some(listener)) => {
+        match (&self.config.target, &self.listener) {
+            (Target::Listen(_), Some(listener)) => {
                 let stream = if cancelable {
                     match accept_until(listener, stop)? {
                         Some(stream) => stream,
@@ -225,16 +229,15 @@ impl FrpEndpoint {
                         .map_err(|e| handshake_error(e, deadline))?;
                 finish(socket).map(Some)
             }
-            (Transport::Connect(url), _)
-                if !cancelable && self.config.handshake_timeout.is_none() =>
-            {
+            (Target::Connect(url), _) if !cancelable && self.config.handshake_timeout.is_none() => {
                 // Nothing to bound or cancel: the plain blocking connect, which
                 // follows HTTP redirects.
-                let socket = tungstenite::client::connect_with_config(url.as_str(), Some(ws), 3)?.0;
+                let socket = tungstenite::client::connect_with_config(url.as_str(), Some(ws), 3)
+                    .map_err(websocket)?
+                    .0;
                 finish(socket).map(Some)
             }
-            (Transport::Connect(url), _) => {
-                let deadline = self.config.handshake_timeout.map(|t| Instant::now() + t);
+            (Target::Connect(url), _) => {
                 let Some(stream) = dial(
                     url,
                     self.config.handshake_timeout,
@@ -243,7 +246,9 @@ impl FrpEndpoint {
                 else {
                     return Ok(None);
                 };
-                let request = url.as_str().into_client_request()?;
+                // The upgrade clock starts when the connection opens.
+                let deadline = self.config.handshake_timeout.map(|t| Instant::now() + t);
+                let request = url.as_str().into_client_request().map_err(websocket)?;
                 arm(&stream, deadline)?;
                 let socket = tungstenite::client::client_with_config(
                     request,
@@ -254,7 +259,7 @@ impl FrpEndpoint {
                 .0;
                 finish(socket).map(Some)
             }
-            (Transport::Listen(_), None) => Err(FrpError::Handshake("listener not bound".into())),
+            (Target::Listen(_), None) => Err(FrpError::Handshake("listener not bound".into())),
         }
     }
 }
@@ -274,7 +279,7 @@ fn finish(socket: Socket) -> Result<FrpConnection, FrpError> {
 }
 
 fn io_error(e: std::io::Error) -> FrpError {
-    FrpError::WebSocket(Box::new(tungstenite::Error::Io(e)))
+    websocket(tungstenite::Error::Io(e))
 }
 
 fn is_timeout(e: &std::io::Error) -> bool {
@@ -310,7 +315,7 @@ fn dial(
     timeout: Option<Duration>,
     stop: Option<&AtomicBool>,
 ) -> Result<Option<TcpStream>, FrpError> {
-    let request = url.into_client_request()?;
+    let request = url.into_client_request().map_err(websocket)?;
     let uri = request.uri();
     if uri.scheme_str() != Some("ws") {
         return Err(FrpError::Handshake(format!(
@@ -362,7 +367,7 @@ fn handshake_error<R: tungstenite::handshake::HandshakeRole>(
         {
             FrpError::Handshake("handshake timed out".into())
         }
-        tungstenite::HandshakeError::Failure(e) => FrpError::WebSocket(Box::new(e)),
+        tungstenite::HandshakeError::Failure(e) => websocket(e),
         tungstenite::HandshakeError::Interrupted(_) if deadline.is_some() => {
             FrpError::Handshake("handshake timed out".into())
         }
@@ -375,7 +380,7 @@ fn handshake_error<R: tungstenite::handshake::HandshakeRole>(
 impl fmt::Debug for FrpEndpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrpEndpoint")
-            .field("transport", &self.config.transport)
+            .field("target", &self.config.target)
             .finish_non_exhaustive()
     }
 }
@@ -453,7 +458,7 @@ impl FrpConnection {
     /// Returns an error if the connection failed or closed.
     pub fn recv_text(&mut self) -> Result<String, FrpError> {
         loop {
-            match self.socket.read()? {
+            match self.socket.read().map_err(websocket)? {
                 Message::Text(text) => return Ok(text.as_str().to_owned()),
                 Message::Close(_) => return Err(FrpError::Closed),
                 _ => {}
@@ -497,7 +502,7 @@ impl FrpConnection {
                 Ok(Message::Close(_)) => break Err(FrpError::Closed),
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(ref e)) if is_timeout(e) => break Ok(None),
-                Err(e) => break Err(e.into()),
+                Err(e) => break Err(websocket(e)),
             }
         };
         // Other reads block without a limit; a failure to reset is reported
@@ -547,7 +552,7 @@ impl FrpConnection {
                 {
                     return Ok(None);
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(websocket(e)),
             }
         }
     }
@@ -593,6 +598,22 @@ impl FrpConnection {
         }
     }
 
+    /// [`flush`](Self::flush) that tells whether it got everything out:
+    /// `Ok(true)` once nothing is left queued, `Ok(false)` while the socket
+    /// cannot take more yet.
+    pub(crate) fn flushed(&mut self) -> Result<bool, FrpError> {
+        match self.socket.flush() {
+            Ok(()) => Ok(true),
+            Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Ok(false)
+            }
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                Err(FrpError::Closed)
+            }
+            Err(e) => Err(websocket(e)),
+        }
+    }
+
     /// Cleanly close the WebSocket connection.
     ///
     /// On a non-blocking connection the close frame is queued and the call
@@ -615,7 +636,7 @@ impl FrpConnection {
                 {
                     return Ok(());
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(websocket(e)),
                 _ => {}
             }
         }
@@ -629,7 +650,7 @@ impl FrpConnection {
 fn queued(result: Result<(), tungstenite::Error>) -> Result<(), FrpError> {
     match result {
         Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
-        other => Ok(other?),
+        other => other.map_err(websocket),
     }
 }
 
@@ -647,7 +668,7 @@ mod tests {
 
     #[test]
     fn config_defaults() {
-        let cfg = EndpointConfig::new(Transport::listen("0.0.0.0:5880"));
+        let cfg = EndpointConfig::new(Target::listen("0.0.0.0:5880"));
         assert_eq!(cfg.handshake_timeout, None);
         assert_eq!(cfg.write_buffer_limit, DEFAULT_WRITE_BUFFER_LIMIT);
         let cfg = cfg.with_handshake_timeout(Duration::from_secs(1));

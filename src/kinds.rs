@@ -1,16 +1,4 @@
-//! One Rust type per FRP message kind.
-//!
-//! Each type holds the kind's own fields; the envelope fields `kind` and
-//! `from` live on [`FrpMessage`](crate::FrpMessage). Optional fields are left
-//! out on the wire while `None`. A field that is required but may be `null`
-//! (e.g. `golfer.turn` `club`) is an `Option` that writes `null` for `None`.
-//! A field that may be absent, `null` or a value (e.g. `golfer.select`
-//! `club`) is an `Option<Option<_>>`: `None` absent, `Some(None)` null.
-//!
-//! Where a field holds a value from a closed set (a club code, handedness,
-//! mode, sex, a reply error, a match result) or a golfer id, a value that is
-//! not recognized reads as absent and the rest of the message still applies.
-//! Unknown fields are ignored.
+//! One Rust type per FRP message kind; see the crate docs.
 
 #![allow(clippy::option_option)] // absent, null and a value are three different things on the wire
 
@@ -39,7 +27,7 @@ pub struct BusActor {
     pub frp: String,
     /// The interval, in seconds, at which the actor republishes `bus.actor`.
     pub heartbeat: f64,
-    /// The actor's roles; see [`roles`](crate::types::roles). Other strings
+    /// The actor's roles; see [`roles`](crate::roles). Other strings
     /// are allowed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
@@ -47,7 +35,7 @@ pub struct BusActor {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub namespaces: Vec<String>,
     /// The actor's own reasons a shot shouldn't be taken now; empty when it
-    /// sees none. See [`blockers`](crate::types::blockers). Display only: no
+    /// sees none. See [`blockers`](crate::blockers). Display only: no
     /// actor is required to act on another actor's blockers.
     pub blockers: Vec<String>,
     /// For launch monitors: the device behind the actor. A value that is
@@ -68,12 +56,23 @@ pub struct BusActor {
         deserialize_with = "crate::lenient::map"
     )]
     pub telemetry: Option<BTreeMap<String, String>>,
+    /// The values that need the user's attention now: telemetry keys, and
+    /// `battery_pct`. The actor decides what is out of range. Replaced whole
+    /// like [`blockers`](Self::blockers); empty (absent on the wire) when
+    /// nothing is flagged. Display only. An entry that is not a string is
+    /// left out.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::lenient::list"
+    )]
+    pub flagged: Vec<String>,
 }
 
 impl BusActor {
     /// An actor named `name` that speaks [`SPEC_VERSION`](crate::SPEC_VERSION)
     /// and republishes every `heartbeat` seconds, with no roles, namespaces,
-    /// blockers, device or telemetry.
+    /// blockers, device, telemetry or flagged values.
     #[must_use]
     pub fn new(name: impl Into<String>, heartbeat: f64) -> Self {
         Self {
@@ -85,6 +84,7 @@ impl BusActor {
             blockers: Vec::new(),
             device: None,
             telemetry: None,
+            flagged: Vec::new(),
         }
     }
 
@@ -122,7 +122,7 @@ impl BusActor {
     }
 
     /// Whether the actor lists the blocker `blocker`, e.g.
-    /// [`blockers::NOT_ARMED`](crate::types::blockers::NOT_ARMED).
+    /// [`blockers::NOT_ARMED`](crate::blockers::NOT_ARMED).
     #[must_use]
     pub fn has_blocker(&self, blocker: &str) -> bool {
         self.blockers.iter().any(|b| b == blocker)
@@ -173,20 +173,6 @@ pub struct DeviceInfo {
         deserialize_with = "battery"
     )]
     pub battery_pct: Option<u8>,
-    /// Device attitude, degrees.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::lenient::option"
-    )]
-    pub tilt: Option<f64>,
-    /// Device attitude, degrees.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "crate::lenient::option"
-    )]
-    pub roll: Option<f64>,
 }
 
 fn battery<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u8>, D::Error> {
@@ -271,6 +257,7 @@ impl BusReply {
 /// Why an owner refused a command, on [`BusReply::error`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ReplyError {
     /// Invalid fields.
     BadRequest,
@@ -350,6 +337,14 @@ pub struct ShotLaunch {
     pub launch: Launch,
 }
 
+impl ShotLaunch {
+    /// The launch of shot `key`.
+    #[must_use]
+    pub fn new(key: ShotKey, launch: Launch) -> Self {
+        Self { key, launch }
+    }
+}
+
 /// `shot.club` (occurrence, launch monitor): the measured club delivery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShotClub {
@@ -357,6 +352,14 @@ pub struct ShotClub {
     pub key: ShotKey,
     /// The measured club values.
     pub club: ClubData,
+}
+
+impl ShotClub {
+    /// The club delivery of shot `key`.
+    #[must_use]
+    pub fn new(key: ShotKey, club: ClubData) -> Self {
+        Self { key, club }
+    }
 }
 
 /// `shot.impact` (occurrence, launch monitor): where on the face the ball
@@ -367,6 +370,14 @@ pub struct ShotImpact {
     pub key: ShotKey,
     /// The impact location.
     pub impact: FaceImpact,
+}
+
+impl ShotImpact {
+    /// The face impact of shot `key`.
+    #[must_use]
+    pub fn new(key: ShotKey, impact: FaceImpact) -> Self {
+        Self { key, impact }
+    }
 }
 
 /// `shot.flight` (occurrence, launch monitor or any flight model): results
@@ -380,12 +391,28 @@ pub struct ShotFlight {
     pub flight: FlightResult,
 }
 
+impl ShotFlight {
+    /// A flight result of shot `key`.
+    #[must_use]
+    pub fn new(key: ShotKey, flight: FlightResult) -> Self {
+        Self { key, flight }
+    }
+}
+
 /// `shot.finished` (occurrence, launch monitor): the launch monitor has sent
 /// everything it will for the shot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShotFinished {
     /// The shot.
     pub key: ShotKey,
+}
+
+impl ShotFinished {
+    /// The end of shot `key`.
+    #[must_use]
+    pub fn new(key: ShotKey) -> Self {
+        Self { key }
+    }
 }
 
 // --------------------------------------------------------------- golfer
@@ -583,6 +610,28 @@ pub struct PracticeBlock {
     pub started_at: u64,
 }
 
+impl PracticeBlock {
+    /// A block with every required field.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        golfer: Option<GolferId>,
+        club: Option<Club>,
+        number: u32,
+        session: u32,
+        started_at: u64,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            golfer,
+            club,
+            number,
+            session,
+            started_at,
+        }
+    }
+}
+
 /// `practice.new_block` (command, to `practice`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PracticeNewBlock {
@@ -601,6 +650,18 @@ pub struct PracticeNewBlock {
     /// Close every open block and count the session up.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub new_session: bool,
+}
+
+impl PracticeNewBlock {
+    /// A new block for the golfer in `golfer.turn`, in the current session.
+    #[must_use]
+    pub fn new(r#ref: impl Into<String>) -> Self {
+        Self {
+            r#ref: r#ref.into(),
+            golfer: None,
+            new_session: false,
+        }
+    }
 }
 
 // ----------------------------------------------------------------- game
@@ -637,9 +698,34 @@ pub struct GameRound {
     pub hole: Option<Hole>,
 }
 
+impl GameRound {
+    /// A round with every required field and no end reason, course or
+    /// scoring.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        status: RoundStatus,
+        players: Vec<RoundPlayer>,
+        up: Option<GolferId>,
+        hole: Option<Hole>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            status,
+            end_reason: None,
+            course: None,
+            scoring: None,
+            players,
+            up,
+            hole,
+        }
+    }
+}
+
 /// [`GameRound::status`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RoundStatus {
     /// The round is loading.
     Loading,
@@ -654,6 +740,7 @@ pub enum RoundStatus {
 /// [`GameRound::end_reason`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum EndReason {
     /// Every hole was played.
     Completed,
@@ -692,6 +779,20 @@ pub struct RoundPlayer {
     pub local: bool,
 }
 
+impl RoundPlayer {
+    /// A player with no team or handicap.
+    #[must_use]
+    pub fn new(golfer: GolferId, name: impl Into<String>, local: bool) -> Self {
+        Self {
+            golfer,
+            name: name.into(),
+            team: None,
+            handicap: None,
+            local,
+        }
+    }
+}
+
 /// [`GameRound::hole`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hole {
@@ -711,6 +812,20 @@ pub struct Hole {
     pub pin: Option<Position>,
 }
 
+impl Hole {
+    /// Hole `number` with nothing else known.
+    #[must_use]
+    pub fn new(number: u32) -> Self {
+        Self {
+            number,
+            par: None,
+            stroke_index: None,
+            length: None,
+            pin: None,
+        }
+    }
+}
+
 /// `game.scores` (state, `game`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GameScores {
@@ -718,6 +833,17 @@ pub struct GameScores {
     pub round: String,
     /// Per golfer.
     pub players: Vec<PlayerScore>,
+}
+
+impl GameScores {
+    /// The scores of round `round`.
+    #[must_use]
+    pub fn new(round: impl Into<String>, players: Vec<PlayerScore>) -> Self {
+        Self {
+            round: round.into(),
+            players,
+        }
+    }
 }
 
 /// One entry of [`GameScores::players`].
@@ -743,6 +869,22 @@ pub struct PlayerScore {
     /// Per hole.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holes: Vec<HoleScore>,
+}
+
+impl PlayerScore {
+    /// The score of `golfer` with no totals or holes yet.
+    #[must_use]
+    pub fn new(golfer: GolferId) -> Self {
+        Self {
+            golfer,
+            strokes: None,
+            to_par: None,
+            net_to_par: None,
+            points: None,
+            rank: None,
+            holes: Vec::new(),
+        }
+    }
 }
 
 /// One entry of [`PlayerScore::holes`].
@@ -780,9 +922,28 @@ pub struct HoleScore {
     pub r#final: Option<bool>,
 }
 
+impl HoleScore {
+    /// The score on hole `number` with nothing recorded yet.
+    #[must_use]
+    pub fn new(number: u32) -> Self {
+        Self {
+            number,
+            strokes: None,
+            putts: None,
+            to_par: None,
+            net_to_par: None,
+            points: None,
+            result: None,
+            holed_out: None,
+            r#final: None,
+        }
+    }
+}
+
 /// [`HoleScore::result`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MatchResult {
     /// The hole was won.
     Won,
@@ -823,10 +984,29 @@ pub struct GameBall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distance_to_hole: Option<Distance>,
     /// While the game's `bus.actor` lists
-    /// [`blockers::AWAITING_DECISION`](crate::types::blockers::AWAITING_DECISION): text for people,
+    /// [`blockers::AWAITING_DECISION`](crate::blockers::AWAITING_DECISION): text for people,
     /// e.g. "Take a drop?".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,
+}
+
+impl GameBall {
+    /// The ball of `golfer` on `hole` before stroke `stroke_number`, with
+    /// nothing else known.
+    #[must_use]
+    pub fn new(golfer: GolferId, hole: u32, stroke_number: u32) -> Self {
+        Self {
+            golfer,
+            hole,
+            stroke_number,
+            allowed_commands: None,
+            lie: None,
+            position: None,
+            aim: None,
+            distance_to_hole: None,
+            decision: None,
+        }
+    }
 }
 
 /// Where a ball lies, on [`GameBall`] and [`GameStroke`].
@@ -894,6 +1074,38 @@ pub struct GameStroke {
     pub end_distance_to_hole: Option<Distance>,
 }
 
+impl GameStroke {
+    /// A stroke with every required field and no shot, flight, penalty or
+    /// positions.
+    #[must_use]
+    pub fn new(
+        stroke_id: impl Into<String>,
+        golfer: GolferId,
+        hole: u32,
+        stroke_number: u32,
+        outcome: StrokeOutcome,
+    ) -> Self {
+        Self {
+            stroke_id: stroke_id.into(),
+            shot_id: None,
+            replaces: None,
+            golfer,
+            hole,
+            stroke_number,
+            flown: None,
+            flight: None,
+            outcome,
+            putt: None,
+            penalty_strokes: 0,
+            lie: None,
+            start_position: None,
+            end_position: None,
+            start_distance_to_hole: None,
+            end_distance_to_hole: None,
+        }
+    }
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)] // a `skip_serializing_if` function takes a reference
 fn is_zero(v: &u32) -> bool {
     *v == 0
@@ -902,6 +1114,7 @@ fn is_zero(v: &u32) -> bool {
 /// [`GameStroke::outcome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StrokeOutcome {
     /// In play.
     InPlay,
@@ -941,9 +1154,23 @@ pub struct GameAim {
     pub target: Option<Position>,
 }
 
+impl GameAim {
+    /// An aim command with `ref` and `action`, and no degrees or target.
+    #[must_use]
+    pub fn new(r#ref: impl Into<String>, action: AimAction) -> Self {
+        Self {
+            r#ref: r#ref.into(),
+            action,
+            degrees: None,
+            target: None,
+        }
+    }
+}
+
 /// [`GameAim::action`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AimAction {
     /// Turn the aim by `degrees`.
     Nudge,

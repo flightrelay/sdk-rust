@@ -1,40 +1,4 @@
 //! [`Hub`]: forwards every message to every other connection.
-//!
-//! Requires the `transport` feature. A hub joins bus segments: each message
-//! that arrives on one connection goes out, as its text arrived, on every
-//! other connection, never back to the one it came from. Messages of every
-//! kind are forwarded, unknown and extension kinds included; text that is
-//! not an FRP message is not. Hubs connected in a loop forward messages
-//! forever: a loop is a configuration error, and nothing here detects it.
-//!
-//! The hub also hands every message it received to its caller, which hosts
-//! actors of its own: [`Hub::poll`] returns them, and [`Hub::send`] publishes
-//! the caller's own messages on every connection.
-//!
-//! The hub is synchronous and caller-driven: call [`poll`](Hub::poll)
-//! regularly. Its connections are non-blocking; a peer that reads slowly is
-//! queued, and dropped once its queue passes the connection's
-//! [`write_buffer_limit`](crate::EndpointConfig::write_buffer_limit).
-//!
-//! ```no_run
-//! use flightrelay::{BusActor, EndpointConfig, FrpEndpoint, FrpMessage, Hub, HubEvent, Transport};
-//!
-//! let mut endpoint = FrpEndpoint::open(EndpointConfig::new(Transport::listen("0.0.0.0:5880")))?;
-//! let me = FrpMessage::new("a1b2c3d4e5f60718", BusActor::new("Range hub", 2.0));
-//! let mut hub = Hub::new();
-//! let mut conn = endpoint.establish()?;
-//! conn.greet(std::slice::from_ref(&me), &[])?;
-//! hub.add(conn)?;
-//! loop {
-//!     for event in hub.poll() {
-//!         if let HubEvent::Message { message, .. } = event {
-//!             println!("{} from {}", message.kind(), message.from);
-//!         }
-//!     }
-//!     std::thread::sleep(std::time::Duration::from_millis(10));
-//! }
-//! # Ok::<(), flightrelay::FrpError>(())
-//! ```
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -62,6 +26,7 @@ impl fmt::Display for PeerId {
 // the small variants costs nothing; boxing would only complicate matching.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum HubEvent {
     /// A message arrived on `peer` and was forwarded to every other
     /// connection.
@@ -95,8 +60,43 @@ struct Peer {
     conn: FrpConnection,
 }
 
-/// Forwards every message to every other connection. See the
-/// [module docs](self).
+/// Forwards every message to every other connection.
+///
+/// Requires the `transport` feature. A hub joins bus segments: each message
+/// that arrives on one connection goes out, as its text arrived, on every
+/// other connection, never back to the one it came from. Messages of every
+/// kind are forwarded, unknown and extension kinds included; text that is
+/// not an FRP message is not. Hubs connected in a loop forward messages
+/// forever: a loop is a configuration error, and nothing here detects it.
+///
+/// The hub also hands every message it received to its caller, which hosts
+/// actors of its own: [`Hub::poll`] returns them, and [`Hub::send`] publishes
+/// the caller's own messages on every connection.
+///
+/// The hub is synchronous and caller-driven: call [`poll`](Hub::poll)
+/// regularly. Its connections are non-blocking; a peer that reads slowly is
+/// queued, and dropped once its queue passes the connection's
+/// [`write_buffer_limit`](crate::EndpointConfig::write_buffer_limit).
+///
+/// ```no_run
+/// use flightrelay::{BusActor, EndpointConfig, FrpEndpoint, FrpMessage, Hub, HubEvent, Target};
+///
+/// let mut endpoint = FrpEndpoint::open(EndpointConfig::new(Target::listen("0.0.0.0:5880")))?;
+/// let me = FrpMessage::new("a1b2c3d4e5f60718", BusActor::new("Range hub", 2.0));
+/// let mut hub = Hub::new();
+/// let mut conn = endpoint.establish()?;
+/// conn.greet(std::slice::from_ref(&me), &[])?;
+/// hub.add(conn)?;
+/// loop {
+///     for event in hub.poll() {
+///         if let HubEvent::Message { message, .. } = event {
+///             println!("{} from {}", message.kind(), message.from);
+///         }
+///     }
+///     std::thread::sleep(std::time::Duration::from_millis(10));
+/// }
+/// # Ok::<(), flightrelay::FrpError>(())
+/// ```
 #[derive(Default)]
 pub struct Hub {
     peers: Vec<Peer>,
@@ -231,16 +231,21 @@ impl Hub {
         events
     }
 
-    /// Close every connection, after pushing out what is queued for about
-    /// `flush_for`. A peer that reads more slowly than that sees the
+    /// Close every connection once what is queued has gone out, waiting at
+    /// most `flush_for`. A peer that reads more slowly than that sees the
     /// connection reset instead of a close.
     pub fn close_all(&mut self, flush_for: std::time::Duration) {
         let until = std::time::Instant::now() + flush_for;
-        while std::time::Instant::now() < until {
+        loop {
+            let mut done = true;
             for p in &mut self.peers {
-                let _ = p.conn.flush();
+                // A failed connection has nothing more to send.
+                done &= p.conn.flushed().unwrap_or(true);
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            if done || std::time::Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         for p in std::mem::take(&mut self.peers) {
             let _ = p.conn.close();
@@ -283,7 +288,7 @@ impl Hub {
 /// Why a connection was dropped, in words.
 pub(crate) fn describe(e: &FrpError) -> String {
     match e {
-        FrpError::WebSocket(inner) if matches!(**inner, tungstenite::Error::WriteBufferFull(_)) => {
+        FrpError::WebSocket(inner) if inner.is_write_buffer_full() => {
             "write buffer full: the peer reads too slowly".into()
         }
         FrpError::Closed => "closed".into(),

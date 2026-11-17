@@ -1,9 +1,8 @@
 //! What a driver emits: [`DeviceEvent`] and the [`Events`] sink.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::types::blockers;
 use crate::{
@@ -13,6 +12,7 @@ use crate::{
 
 /// Log severity of a [`DeviceEvent::Log`] line, lowest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Level {
     /// Wire-level detail, e.g. the hex of a frame.
     Trace,
@@ -57,22 +57,30 @@ impl fmt::Display for Level {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum DeviceEvent {
-    /// A message body of this launch monitor: a `shot.*` message or a
-    /// `bus.alert`. The host publishes it with the actor's id as `from`;
-    /// other kinds are not the driver's to send, and the host drops them.
+    /// A message body of this actor, of a kind its roles send
+    /// ([`DriverInfo::sends`](super::DriverInfo::sends) is the rule). The
+    /// host publishes it with the actor's id as `from`; other kinds are not
+    /// the driver's to send, and the host drops them.
     Frp(FrpBody),
-    /// The device's whole status: blockers, battery, attitude, telemetry.
-    /// It replaces the status the host holds, so a value it leaves out is
-    /// off the actor's next `bus.actor`. The host republishes `bus.actor`
-    /// when something changed.
+    /// The device's whole status: blockers, battery, telemetry, flagged
+    /// values. It replaces the status the host holds: a battery it leaves
+    /// out is off the actor's next `bus.actor`, and a telemetry key it
+    /// leaves out reads as its value in
+    /// [`DriverInfo::telemetry`](super::DriverInfo::telemetry). The host
+    /// republishes `bus.actor` when something changed.
     Status(DeviceStatus),
     /// A change to one part of the device's status; the rest stays as the
     /// host holds it. The host republishes `bus.actor` when something
     /// changed.
     StatusChange(StatusChange),
-    /// Where a connect or a (re)configure is, for status displays:
-    /// `"discovering"`, `"connecting"`, `"handshaking"`, `"configuring"`,
-    /// `"arming"`, `"measuring"`. Host-only.
+    /// What the driver is doing, for status displays, from the start of a
+    /// connect through the session: `"discovering"`, `"listening"` (waiting
+    /// for the device to connect), `"connecting"`, `"handshaking"`,
+    /// `"configuring"`, then, once a session is up,
+    /// `"measuring"` (it takes shots) or `"connected"` (a session that takes
+    /// none, such as an output). A driver sets one at the start of every
+    /// connect and once its session is up; a host shows the last one set.
+    /// Host-only.
     Phase(&'static str),
     /// A log line for the host's logger. Host-only.
     Log(Level, String),
@@ -83,9 +91,10 @@ pub enum DeviceEvent {
 }
 
 /// A launch monitor's whole status, as its `bus.actor` carries it: the
-/// blockers, battery, attitude and telemetry. A host holds one per actor and
-/// publishes exactly what it holds; a value that is `None` (or a telemetry
-/// key that is not there) is not on the bus.
+/// blockers, battery, telemetry and flagged values. A host holds one per
+/// actor and publishes what it holds: a battery that is `None` is not on the
+/// bus, and a telemetry key that is not there goes out with its value in
+/// [`DriverInfo::telemetry`](super::DriverInfo::telemetry).
 ///
 /// Build one with [`new`](Self::new) or [`not_armed`](Self::not_armed) and
 /// the `with_*` methods, and send it with [`Events::status`]; or change one
@@ -97,10 +106,11 @@ pub enum DeviceEvent {
 /// let status = DeviceStatus::new()
 ///     .with_blockers(["no_ball"])
 ///     .with_battery(80)
-///     .with_attitude(0.4, -0.2)
-///     .with_telemetry("radar_mode", "armed");
+///     .with_telemetry("tilt", "6.5°")
+///     .with_flag("tilt", true);
 /// assert_eq!(status.blockers, ["no_ball"]);
 /// assert_eq!(status.battery_pct, Some(80));
+/// assert!(status.flagged.contains("tilt"));
 ///
 /// // No battery reading any more: the battery leaves the actor.
 /// let status = status.with_battery(None);
@@ -114,26 +124,46 @@ pub struct DeviceStatus {
     pub blockers: Vec<String>,
     /// Battery charge, 0 to 100 percent; `None` when there is no reading.
     pub battery_pct: Option<u8>,
-    /// Device attitude, degrees; `None` when there is no reading.
-    pub tilt: Option<f64>,
-    /// Device attitude, degrees; `None` when there is no reading.
-    pub roll: Option<f64>,
-    /// Free key/value pairs, for display only.
+    /// Free key/value pairs, for display only. Every key is one of
+    /// [`DriverInfo::telemetry`](super::DriverInfo::telemetry); a key that
+    /// is not here reads as its value there.
     pub telemetry: BTreeMap<String, String>,
+    /// The values that need the user's attention now: telemetry keys, and
+    /// `battery_pct`. The driver decides what is out of range.
+    pub flagged: BTreeSet<String>,
 }
 
 impl DeviceStatus {
-    /// Nothing in the way, and no battery, attitude or telemetry.
+    /// Nothing in the way, no battery, no telemetry reported, nothing
+    /// flagged.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Blocked by [`blockers::NOT_ARMED`], and no battery, attitude or
-    /// telemetry: a launch monitor actor's status while no session is up.
+    /// Blocked by [`blockers::NOT_ARMED`], no battery, no telemetry
+    /// reported, nothing flagged: a launch monitor actor's status while no
+    /// session is up.
     #[must_use]
     pub fn not_armed() -> Self {
         Self::new().with_blockers([blockers::NOT_ARMED])
+    }
+
+    /// What a host publishes of this status while no session is up (during
+    /// a connect, and after one that failed): blocked by
+    /// [`blockers::NOT_ARMED`], no battery, and this status's telemetry and
+    /// flagged values (a flagged `battery_pct` goes with the battery). A
+    /// connect's blockers and battery count once its session is up.
+    ///
+    /// The host keeps the status it holds and publishes this in its place;
+    /// once the session is up the actor carries the held status whole.
+    #[must_use]
+    pub fn off_session(&self) -> Self {
+        let mut held = Self::not_armed();
+        held.telemetry.clone_from(&self.telemetry);
+        held.flagged.clone_from(&self.flagged);
+        held.flagged.remove("battery_pct");
+        held
     }
 
     /// With these blockers (empty: nothing in the way). Standard names are
@@ -152,19 +182,6 @@ impl DeviceStatus {
         self
     }
 
-    /// With this attitude, degrees; `None` for a value there is no reading
-    /// of.
-    #[must_use]
-    pub fn with_attitude(
-        mut self,
-        tilt: impl Into<Option<f64>>,
-        roll: impl Into<Option<f64>>,
-    ) -> Self {
-        self.tilt = tilt.into();
-        self.roll = roll.into();
-        self
-    }
-
     /// With one more telemetry key, replacing its value if it was there.
     #[must_use]
     pub fn with_telemetry(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -172,23 +189,26 @@ impl DeviceStatus {
         self
     }
 
-    /// Applies a change: the part it names is replaced (or, for telemetry,
-    /// each key it names is set or removed), and the rest stays.
+    /// With `key` (a telemetry key, or `battery_pct`) flagged or not.
+    #[must_use]
+    pub fn with_flag(mut self, key: impl Into<String>, flagged: bool) -> Self {
+        self.apply(StatusChange::Flag(key.into(), flagged));
+        self
+    }
+
+    /// Applies a change: the part it names is replaced (for telemetry,
+    /// each key it names is set; for a flag, that one key), and the rest
+    /// stays.
     pub fn apply(&mut self, change: StatusChange) {
         match change {
             StatusChange::Blockers(list) => self.blockers = list,
             StatusChange::Battery(pct) => self.battery_pct = pct.map(|p| p.min(100)),
-            StatusChange::Attitude { tilt, roll } => {
-                self.tilt = tilt;
-                self.roll = roll;
+            StatusChange::Telemetry(pairs) => self.telemetry.extend(pairs),
+            StatusChange::Flag(key, true) => {
+                self.flagged.insert(key);
             }
-            StatusChange::Telemetry(pairs) => {
-                for (key, value) in pairs {
-                    match value {
-                        Some(value) => self.telemetry.insert(key, value),
-                        None => self.telemetry.remove(&key),
-                    };
-                }
+            StatusChange::Flag(key, false) => {
+                self.flagged.remove(&key);
             }
         }
     }
@@ -202,16 +222,11 @@ pub enum StatusChange {
     Blockers(Vec<String>),
     /// The battery charge, 0 to 100 percent, or `None` for no reading.
     Battery(Option<u8>),
-    /// The attitude, degrees; `None` for a value there is no reading of.
-    Attitude {
-        /// Tilt, degrees.
-        tilt: Option<f64>,
-        /// Roll, degrees.
-        roll: Option<f64>,
-    },
-    /// Telemetry keys: each `Some` value is set, each `None` key removed.
-    /// Keys not named stay.
-    Telemetry(BTreeMap<String, Option<String>>),
+    /// Telemetry keys and their values. Keys not named stay.
+    Telemetry(BTreeMap<String, String>),
+    /// One value (a telemetry key, or `battery_pct`) flagged (`true`) or
+    /// not. Other flags stay.
+    Flag(String, bool),
 }
 
 /// Flags and limits the host keeps live for a driver to read through
@@ -293,16 +308,6 @@ impl<'a> Events<'a> {
         Self { sink, flags }
     }
 
-    /// A shorter-lived sink over the same closure and flags, to hand to a
-    /// callee while this one stays usable afterwards.
-    #[must_use]
-    pub fn reborrow(&mut self) -> Events<'_> {
-        Events {
-            sink: &mut *self.sink,
-            flags: self.flags,
-        }
-    }
-
     /// Push any event.
     pub fn emit(&mut self, event: DeviceEvent) {
         (self.sink)(event);
@@ -314,13 +319,15 @@ impl<'a> Events<'a> {
     }
 
     /// Push the device's whole status, replacing what the host holds: a
-    /// value `status` leaves out comes off the actor.
+    /// battery `status` leaves out comes off the actor, and a telemetry key
+    /// it leaves out goes back to its value in
+    /// [`DriverInfo::telemetry`](super::DriverInfo::telemetry).
     pub fn status(&mut self, status: DeviceStatus) {
         self.emit(DeviceEvent::Status(status));
     }
 
     /// Push a change to one part of the status.
-    pub fn status_change(&mut self, change: StatusChange) {
+    fn status_change(&mut self, change: StatusChange) {
         self.emit(DeviceEvent::StatusChange(change));
     }
 
@@ -346,15 +353,14 @@ impl<'a> Events<'a> {
         level >= self.flags.min_level()
     }
 
-    /// `shot.trigger` without a timestamp.
-    pub fn shot_trigger(&mut self, key: ShotKey) {
-        self.frp(ShotTrigger::new(key));
-    }
-
-    /// `shot.trigger` with the strike time in milliseconds since the Unix
-    /// epoch (UTC).
-    pub fn shot_trigger_at(&mut self, key: ShotKey, timestamp_ms: u64) {
-        self.frp(ShotTrigger::at(key, timestamp_ms));
+    /// `shot.trigger`, with the strike time in milliseconds since the Unix
+    /// epoch (UTC) when `at` gives one: `shot_trigger(key, None)` or
+    /// `shot_trigger(key, ms)`.
+    pub fn shot_trigger(&mut self, key: ShotKey, at: impl Into<Option<u64>>) {
+        self.frp(match at.into() {
+            Some(ms) => ShotTrigger::at(key, ms),
+            None => ShotTrigger::new(key),
+        });
     }
 
     /// `shot.launch`.
@@ -407,17 +413,10 @@ impl<'a> Events<'a> {
         self.status_change(StatusChange::Battery(pct.into().map(|p| p.min(100))));
     }
 
-    /// The device attitude, degrees; `None` takes a value off the actor
-    /// (`attitude(None, None)` takes both).
-    pub fn attitude(&mut self, tilt: impl Into<Option<f64>>, roll: impl Into<Option<f64>>) {
-        self.status_change(StatusChange::Attitude {
-            tilt: tilt.into(),
-            roll: roll.into(),
-        });
-    }
-
-    /// Set free telemetry keys, for display only. Send only what changed:
-    /// keys not named stay as they are.
+    /// Set telemetry keys, for display only. Send only what changed: keys
+    /// not named stay as they are. Each key is one of
+    /// [`DriverInfo::telemetry`](super::DriverInfo::telemetry), and has a
+    /// value: one with nothing to report says so (`"none"`, `"unknown"`).
     pub fn telemetry<K: Into<String>, V: Into<String>>(
         &mut self,
         pairs: impl IntoIterator<Item = (K, V)>,
@@ -425,16 +424,16 @@ impl<'a> Events<'a> {
         self.status_change(StatusChange::Telemetry(
             pairs
                 .into_iter()
-                .map(|(k, v)| (k.into(), Some(v.into())))
+                .map(|(k, v)| (k.into(), v.into()))
                 .collect(),
         ));
     }
 
-    /// Take telemetry keys off the actor.
-    pub fn clear_telemetry<K: Into<String>>(&mut self, keys: impl IntoIterator<Item = K>) {
-        self.status_change(StatusChange::Telemetry(
-            keys.into_iter().map(|k| (k.into(), None)).collect(),
-        ));
+    /// Flag `key` (a telemetry key, or `battery_pct`) as needing the user's
+    /// attention now, or take the flag off. The driver decides what is out
+    /// of range.
+    pub fn flag(&mut self, key: impl Into<String>, flagged: bool) {
+        self.status_change(StatusChange::Flag(key.into(), flagged));
     }
 
     /// A `bus.alert`.
@@ -459,21 +458,29 @@ impl<'a> Events<'a> {
         self.emit(DeviceEvent::ShotDiscarded);
     }
 
-    /// A `shot.raw` of one protocol message, stamped with the current time,
-    /// with `seq` left at 0 for the host to number. Does nothing while raw
-    /// frames are off ([`wants_raw`](Self::wants_raw)). The caller makes sure
-    /// the message carries no device or user identity; those go to
-    /// [`audit`](Self::audit).
-    pub fn raw(&mut self, dir: RawDir, label: impl Into<String>, data: &[u8]) {
-        if !self.wants_raw() {
-            return;
+    /// One protocol message as it crossed the transport at `at_ms` (UTC
+    /// milliseconds, [`utc_ms`](crate::utc_ms) at capture): a `shot.raw`
+    /// with `seq` left at 0 for the host to number while raw frames are on
+    /// ([`wants_raw`](Self::wants_raw)) and the message is not `private`,
+    /// else an [`audit`](Self::audit) line. A wire driver calls this once
+    /// per captured message; a private message never leaves the machine.
+    pub fn wire(
+        &mut self,
+        dir: RawDir,
+        label: impl Into<String>,
+        data: Vec<u8>,
+        at_ms: Option<u64>,
+        private: bool,
+    ) {
+        if private || !self.wants_raw() {
+            self.audit(dir, &label.into(), &data);
+        } else {
+            self.frp(FrpBody::ShotRaw(RawFrame {
+                timestamp: at_ms,
+                label: Some(label.into()),
+                ..RawFrame::new(dir, 0, data)
+            }));
         }
-        let frame = RawFrame {
-            timestamp: now_ms(),
-            label: Some(label.into()),
-            ..RawFrame::new(dir, 0, data.to_vec())
-        };
-        self.frp(FrpBody::ShotRaw(frame));
     }
 
     /// A message that must not leave the machine as a `shot.raw`, such as
@@ -500,14 +507,6 @@ impl fmt::Debug for Events<'_> {
     }
 }
 
-/// The current UTC time in milliseconds since the Unix epoch.
-fn now_ms() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,7 +523,7 @@ mod tests {
         let flags = HostFlags::new();
         let key = ShotKey::new("id", 1);
         let seen = collect(&flags, |out| {
-            out.shot_trigger(key.clone());
+            out.shot_trigger(key.clone(), None);
             out.shot_finished(key.clone());
             out.ready(false);
             out.alert(Severity::Warn, "careful");
@@ -557,17 +556,15 @@ mod tests {
     }
 
     #[test]
-    fn status_helpers_change_one_part_each_and_can_clear_it() {
+    fn status_helpers_change_one_part_each() {
         let flags = HostFlags::new();
         let seen = collect(&flags, |out| {
             out.ready(true);
             out.blockers(["no_ball"]);
             out.battery(140);
             out.battery(None);
-            out.attitude(0.4, -0.2);
-            out.attitude(None, None);
             out.telemetry([("radar_mode", "armed")]);
-            out.clear_telemetry(["radar_mode"]);
+            out.flag("radar_mode", true);
         });
         let changes: Vec<&StatusChange> = seen
             .iter()
@@ -580,28 +577,11 @@ mod tests {
         assert_eq!(changes[1], &StatusChange::Blockers(vec!["no_ball".into()]));
         assert_eq!(changes[2], &StatusChange::Battery(Some(100)));
         assert_eq!(changes[3], &StatusChange::Battery(None));
-        assert_eq!(
-            changes[4],
-            &StatusChange::Attitude {
-                tilt: Some(0.4),
-                roll: Some(-0.2)
-            }
-        );
-        assert_eq!(
-            changes[5],
-            &StatusChange::Attitude {
-                tilt: None,
-                roll: None
-            }
-        );
-        let StatusChange::Telemetry(set) = changes[6] else {
-            panic!("{:?}", changes[6]);
+        let StatusChange::Telemetry(set) = changes[4] else {
+            panic!("{:?}", changes[4]);
         };
-        assert_eq!(set["radar_mode"].as_deref(), Some("armed"));
-        let StatusChange::Telemetry(cleared) = changes[7] else {
-            panic!("{:?}", changes[7]);
-        };
-        assert_eq!(cleared["radar_mode"], None);
+        assert_eq!(set["radar_mode"], "armed");
+        assert_eq!(changes[5], &StatusChange::Flag("radar_mode".into(), true));
     }
 
     #[test]
@@ -621,20 +601,20 @@ mod tests {
     fn the_builders_set_and_clear_each_part() {
         let status = DeviceStatus::not_armed()
             .with_battery(250)
-            .with_attitude(1.5, None)
             .with_telemetry("a", "1")
-            .with_telemetry("a", "2");
+            .with_telemetry("a", "2")
+            .with_flag("a", true);
         assert_eq!(status.blockers, ["not_armed"]);
         assert_eq!(status.battery_pct, Some(100));
-        assert_eq!((status.tilt, status.roll), (Some(1.5), None));
         assert_eq!(status.telemetry["a"], "2");
+        assert!(status.flagged.contains("a"));
         let cleared = status
             .with_blockers(Vec::<String>::new())
             .with_battery(None)
-            .with_attitude(None, None);
+            .with_flag("a", false);
         assert!(cleared.blockers.is_empty());
         assert_eq!(cleared.battery_pct, None);
-        assert_eq!((cleared.tilt, cleared.roll), (None, None));
+        assert!(cleared.flagged.is_empty());
         assert_eq!(DeviceStatus::new(), DeviceStatus::default());
     }
 
@@ -643,28 +623,27 @@ mod tests {
         let mut status = DeviceStatus::new()
             .with_blockers(["no_ball"])
             .with_battery(80)
-            .with_attitude(0.4, -0.2)
             .with_telemetry("radar_mode", "armed")
-            .with_telemetry("tracking_mode", "full");
+            .with_telemetry("tracking_mode", "full")
+            .with_flag("battery_pct", true);
         status.apply(StatusChange::Battery(None));
         assert_eq!(status.battery_pct, None);
         assert_eq!(status.blockers, ["no_ball"], "other parts stay");
-        status.apply(StatusChange::Attitude {
-            tilt: None,
-            roll: Some(1.0),
-        });
-        assert_eq!((status.tilt, status.roll), (None, Some(1.0)));
         status.apply(StatusChange::Telemetry(BTreeMap::from([
-            ("radar_mode".to_owned(), None),
-            ("signal".to_owned(), Some("good".to_owned())),
+            ("radar_mode".to_owned(), "idle".to_owned()),
+            ("signal".to_owned(), "good".to_owned()),
         ])));
         assert_eq!(
             status.telemetry,
             BTreeMap::from([
+                ("radar_mode".to_owned(), "idle".to_owned()),
                 ("signal".to_owned(), "good".to_owned()),
                 ("tracking_mode".to_owned(), "full".to_owned()),
             ])
         );
+        status.apply(StatusChange::Flag("tilt".into(), true));
+        status.apply(StatusChange::Flag("battery_pct".into(), false));
+        assert_eq!(status.flagged, BTreeSet::from(["tilt".to_owned()]));
         status.apply(StatusChange::Blockers(vec![]));
         assert!(status.blockers.is_empty());
         status.apply(StatusChange::Battery(Some(200)));
@@ -672,21 +651,46 @@ mod tests {
     }
 
     #[test]
-    fn raw_frames_are_built_only_while_wanted() {
+    fn a_wire_message_is_a_raw_frame_when_wanted_and_public_else_an_audit_line() {
         let flags = HostFlags::new();
-        assert!(collect(&flags, |out| out.raw(RawDir::Rx, "x", &[1])).is_empty());
-        flags.set_wants_raw(true);
-        let seen = collect(&flags, |out| {
-            out.raw(RawDir::Tx, "tx result", &[0xde, 0xad]);
-        });
-        let [DeviceEvent::Frp(FrpBody::ShotRaw(frame))] = &seen[..] else {
+        let send = |out: &mut Events<'_>| {
+            out.wire(RawDir::Rx, "result", vec![0xab], Some(42), false);
+            out.wire(RawDir::Tx, "identity", vec![0x01], Some(43), true);
+        };
+        // Raw frames off: both messages, as trace lines.
+        let seen = collect(&flags, send);
+        let [
+            DeviceEvent::Log(Level::Trace, public),
+            DeviceEvent::Log(Level::Trace, private),
+        ] = &seen[..]
+        else {
             panic!("{seen:?}");
         };
-        assert_eq!(frame.dir, RawDir::Tx);
-        assert_eq!(frame.seq, 0);
-        assert_eq!(frame.label.as_deref(), Some("tx result"));
-        assert_eq!(frame.data, [0xde, 0xad]);
-        assert!(frame.timestamp.is_some_and(|t| t > 1_600_000_000_000));
+        assert_eq!(public, "rx result ab");
+        assert_eq!(private, "tx identity 01");
+        flags.set_wants_raw(true);
+        let seen = collect(&flags, send);
+        let [
+            DeviceEvent::Frp(FrpBody::ShotRaw(frame)),
+            DeviceEvent::Log(..),
+        ] = &seen[..]
+        else {
+            panic!("{seen:?}");
+        };
+        assert_eq!(
+            frame,
+            &RawFrame {
+                timestamp: Some(42),
+                label: Some("result".into()),
+                ..RawFrame::new(RawDir::Rx, 0, vec![0xab])
+            }
+        );
+        // A private message stays local even while trace lines are hidden.
+        flags.set_min_level(Level::Info);
+        let seen = collect(&flags, |out| {
+            out.wire(RawDir::Tx, "identity", vec![0x01], None, true);
+        });
+        assert!(seen.is_empty(), "{seen:?}");
     }
 
     #[test]

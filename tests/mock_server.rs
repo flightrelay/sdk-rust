@@ -1,17 +1,16 @@
 //! The mock driver run by `FrpServer`, read by a collector the way an
 //! application would: greet, publish a turn, collect shots and bus state.
 
-#![cfg(all(feature = "mock", feature = "server", feature = "controller"))]
+#![cfg(all(feature = "mock", feature = "server", feature = "collector"))]
 
 use std::time::{Duration, Instant};
 
-use flightrelay::driver::{DeviceDriver, Stop};
+use flightrelay::driver::{FrpDriver, Stop};
 use flightrelay::mock::{MockConfig, MockDriver};
-use flightrelay::types::roles;
 use flightrelay::{
     Basis, BusActor, BusState, EndpointConfig, FrpBody, FrpEndpoint, FrpMessage, FrpServer,
-    GolferTurn, Handedness, Mode, ServerConfig, ServerEvent, ShotAggregator, ShotEvent, Source,
-    Transport,
+    GolferTurn, Handedness, Mode, ServerConfig, ServerEvent, ShotAccumulator, ShotEvent, Source,
+    Target, roles,
 };
 
 const MOCK: &str = "7d2f9a41c03be856";
@@ -19,21 +18,19 @@ const COLLECTOR: &str = "c19e04b7a2d5f318";
 
 #[test]
 fn a_collector_receives_complete_virtual_shots_from_the_mock() {
-    let driver = MockDriver::new(MockConfig {
-        shot_interval_s: 0.05,
-        arm_delay_s: 0.02,
-        ball_ready_delay_s: 0.02,
-        post_shot_delay_s: 0.02,
-        ..MockConfig::default()
-    })
-    .expect("config");
+    let mut config = MockConfig::default();
+    config.shot_interval_s = 0.05;
+    config.arm_delay_s = 0.02;
+    config.ball_ready_delay_s = 0.02;
+    config.post_shot_delay_s = 0.02;
+    let driver = MockDriver::new(config).expect("config");
     let stop = Stop::new();
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     let server_stop = stop.clone();
     let server = std::thread::spawn(move || {
         FrpServer::new(
             driver,
-            ServerConfig::new(Transport::listen("127.0.0.1:0"), MOCK),
+            ServerConfig::new(Target::listen("127.0.0.1:0"), MOCK),
         )
         .on_event(move |event| {
             if let ServerEvent::Listening(addr) = event {
@@ -46,7 +43,7 @@ fn a_collector_receives_complete_virtual_shots_from_the_mock() {
         .recv_timeout(Duration::from_secs(5))
         .expect("listening");
 
-    let mut endpoint = FrpEndpoint::open(EndpointConfig::new(Transport::connect(format!(
+    let mut endpoint = FrpEndpoint::open(EndpointConfig::new(Target::connect(format!(
         "ws://{addr}/frp"
     ))))
     .expect("open");
@@ -66,8 +63,8 @@ fn a_collector_receives_complete_virtual_shots_from_the_mock() {
         .expect("turn");
 
     let mut bus = BusState::new();
-    let mut shots = ShotAggregator::new();
-    // Our own turn, as the aggregator would have heard it on the bus.
+    let mut shots = ShotAccumulator::new();
+    // Our own turn, as the accumulator would have heard it on the bus.
     shots.feed(&FrpMessage::new(COLLECTOR, turn.clone()));
     let mut done = Vec::new();
     let give_up = Instant::now() + Duration::from_secs(10);
@@ -79,7 +76,12 @@ fn a_collector_receives_complete_virtual_shots_from_the_mock() {
             panic!("unexpected alert: {}", alert.message);
         }
         bus.apply(&msg);
-        if let Some(ShotEvent::Finished(shot)) = shots.feed(&msg) {
+        // The mock shoots on its own clock from the moment it listens, so a
+        // shot can finish before our turn reaches it. Count only shots made
+        // under our turn.
+        if let Some(ShotEvent::Finished(shot)) = shots.feed(&msg)
+            && shot.turn.as_ref() == Some(&turn)
+        {
             done.push(shot);
         }
     }
@@ -98,9 +100,9 @@ fn a_collector_receives_complete_virtual_shots_from_the_mock() {
     }
     assert!(bus.actor(MOCK).is_none(), "the actor removed itself");
 
-    for (i, shot) in done.iter().enumerate() {
+    assert_eq!(done[1].key.shot_number, done[0].key.shot_number + 1);
+    for shot in &done {
         assert_eq!(shot.from, MOCK);
-        assert_eq!(shot.key.shot_number as usize, i + 1);
         assert_eq!(shot.source, Some(Source::Virtual));
         assert_eq!(shot.turn.as_ref(), Some(&turn));
         assert!(shot.timestamp.is_some());

@@ -1,10 +1,13 @@
 [package]
 name = "flightrelay"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Flight Relay Protocol (FRP) — a message bus for golf simulators, launch monitors and games, over WebSocket"
 repository = "https://github.com/flightrelay/sdk-rust"
+keywords = ["golf", "launch-monitor", "simulator", "websocket", "frp"]
+categories = ["network-programming", "web-programming::websocket"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -18,13 +21,23 @@ toml = { version = "1", default-features = false, features = ["std", "serde", "p
 ctrlc = { version = "3", features = ["termination"], optional = true }
 
 [features]
-controller = []
+# ShotAccumulator and BusState, for actors that read shots and bus state.
+collector = []
+# The WebSocket binding: FrpEndpoint, FrpConnection and Hub.
 transport = ["dep:tungstenite"]
+# DriverConfig, the serde settings of a device driver.
 config = []
+# The FrpDriver / FrpSession contract between a launch monitor and its host.
 driver = ["config"]
+# FrpServer, which hosts one driver as an actor on the bus; its roles decide
+# what it sends.
 server = ["driver", "transport"]
+# run, a complete main for a driver: config file, --set, --help, Ctrl-C.
 main = ["server", "dep:toml", "dep:ctrlc"]
+# MockDriver, a simulated launch monitor.
 mock = ["driver"]
+# TestHost and event readers, for driver tests.
+testing = ["driver"]
 
 [[example]]
 name = "frp-mock"

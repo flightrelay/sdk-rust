@@ -39,18 +39,27 @@ impl ShotKey {
 /// Results of the ball's flight, such as carry, travel in [`FlightResult`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Launch {
+    /// Ball speed at launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_speed: Option<Velocity>,
+    /// Horizontal launch angle in degrees; + = right of the target line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_azimuth: Option<f64>,
+    /// Vertical launch angle in degrees above horizontal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_elevation: Option<f64>,
+    /// Backspin component in rpm; + = backspin, - = topspin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backspin_rpm: Option<i32>,
+    /// Sidespin component in rpm; + = curves the ball right (target-line
+    /// frame).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidespin_rpm: Option<i32>,
+    /// Total spin rate in rpm; never negative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_spin_rpm: Option<i32>,
+    /// Tilt of the spin axis from horizontal in degrees; + = tilted right,
+    /// curving the ball right (as `sidespin_rpm`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spin_axis: Option<f64>,
 }
@@ -99,6 +108,47 @@ impl Launch {
         }
     }
 
+    /// The ball's back and side spin, for a receiver that reads the spin
+    /// as components: the ones the launch has, else its total split by its
+    /// spin axis. A total spin with no axis is all backspin; no sidespin is
+    /// made up, so a receiver that needs one fills its own default.
+    #[must_use]
+    pub fn spin_components(&self) -> (Option<i32>, Option<i32>) {
+        if self.backspin_rpm.is_some() || self.sidespin_rpm.is_some() {
+            return (self.backspin_rpm, self.sidespin_rpm);
+        }
+        let Some(total) = self.total_spin_rpm else {
+            return (None, None);
+        };
+        let Some(axis) = self.spin_axis.filter(|a| a.is_finite()) else {
+            return (Some(total), None);
+        };
+        let mut spin = Launch {
+            total_spin_rpm: Some(total),
+            spin_axis: Some(axis),
+            ..Launch::default()
+        };
+        spin.complete_spin();
+        (spin.backspin_rpm, spin.sidespin_rpm)
+    }
+
+    /// The backspin for a receiver with a backspin field of its own: the
+    /// launch's, or, for a total spin with no axis and no components, the
+    /// total, all of it backspin. No sidespin or axis is made up for such a
+    /// total; a receiver that must send a number for them sends 0.
+    #[must_use]
+    pub fn output_backspin(&self) -> Option<i32> {
+        match (
+            self.backspin_rpm,
+            self.sidespin_rpm,
+            self.total_spin_rpm,
+            self.spin_axis,
+        ) {
+            (None, None, Some(total), None) => Some(total),
+            (back, ..) => back,
+        }
+    }
+
     /// Fill each value this launch lacks from the `assumed` launch of
     /// `flight`, when its [`basis`](FlightResult::basis) is
     /// [`Modeled`](Basis::Modeled). A value this launch has is kept, and a
@@ -135,18 +185,27 @@ impl Launch {
 /// the `launch` value. It may hold a partial spin pair.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AssumedLaunch {
+    /// Ball speed at launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_speed: Option<Velocity>,
+    /// Horizontal launch angle in degrees; + = right of the target line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_azimuth: Option<f64>,
+    /// Vertical launch angle in degrees above horizontal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_elevation: Option<f64>,
+    /// Backspin component in rpm; + = backspin, - = topspin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backspin_rpm: Option<i32>,
+    /// Sidespin component in rpm; + = curves the ball right (target-line
+    /// frame).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidespin_rpm: Option<i32>,
+    /// Total spin rate in rpm; never negative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_spin_rpm: Option<i32>,
+    /// Tilt of the spin axis from horizontal in degrees; + = tilted right,
+    /// curving the ball right (as `sidespin_rpm`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spin_axis: Option<f64>,
 }
@@ -194,20 +253,28 @@ pub struct FlightResult {
     /// logging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Carry distance, launch to landing (ball in the air only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carry_distance: Option<Distance>,
+    /// Landing point's lateral offset from the target line; + = right.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carry_offline: Option<Distance>,
+    /// Total distance to the rest position, roll included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_distance: Option<Distance>,
+    /// Rest position's lateral offset from the target line; + = right.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_offline: Option<Distance>,
+    /// Roll after landing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll_distance: Option<Distance>,
+    /// Apex height.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_height: Option<Distance>,
+    /// Time of flight, launch to landing, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flight_time: Option<f64>,
+    /// Angle of descent below horizontal at landing, in degrees.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descent_angle: Option<f64>,
     /// Launch values the flight model assumed because the shot's
@@ -288,30 +355,50 @@ impl fmt::Display for Basis {
 /// Club head measurement data. All fields optional.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClubData {
+    /// Club head speed at impact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club_speed: Option<Velocity>,
+    /// Club head speed just after impact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club_speed_post: Option<Velocity>,
+    /// Club path relative to the target line in degrees; + = right (in-to-out
+    /// for RH, out-to-in for LH).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<f64>,
+    /// Attack angle in degrees; + = ascending (hitting up).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attack_angle: Option<f64>,
+    /// Face angle at impact relative to the target line in degrees; + = right
+    /// (open for RH, closed for LH).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub face_angle: Option<f64>,
+    /// Effective loft at impact, in degrees.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_loft: Option<f64>,
+    /// Ball speed divided by club speed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smash_factor: Option<f64>,
+    /// Horizontal swing plane rotation in degrees; + = right (in-to-out for RH,
+    /// out-to-in for LH).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swing_plane_horizontal: Option<f64>,
+    /// Vertical swing plane angle relative to the ground, in degrees.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub swing_plane_vertical: Option<f64>,
+    /// Club head's lateral position at impact relative to the ball center; + =
+    /// toward the toe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club_offset: Option<Distance>,
+    /// Club head's vertical position at impact relative to the ball center; + =
+    /// above center.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub club_height: Option<Distance>,
+    /// Angle between the club head's direction of travel and the face normal at
+    /// impact, in three dimensions, in degrees.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spin_loft: Option<f64>,
+    /// Lowest point of the club head's arc along the target line, relative to
+    /// the ball; + = target side, - = behind the ball.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub low_point_distance: Option<Distance>,
 }
@@ -319,8 +406,10 @@ pub struct ClubData {
 /// Face impact location — where on the club face the ball was struck.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FaceImpact {
+    /// Horizontal offset from face center; + = toward the toe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lateral: Option<Distance>,
+    /// Vertical offset from face center; + = above center.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vertical: Option<Distance>,
 }
@@ -475,6 +564,7 @@ mod hex {
 /// Alert severity level, on `bus.alert`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Severity {
     /// Something went wrong that the sender handled.
     Warn,
@@ -524,6 +614,7 @@ impl fmt::Display for Source {
 /// `golfer.select`. A launch monitor may tune its detection to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Mode {
     /// A full swing.
     Full,
@@ -566,6 +657,7 @@ impl fmt::Display for Handedness {
 /// A golfer's sex on `golfer.profile`, for published norms that depend on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Sex {
     /// `"male"`.
     Male,
@@ -585,70 +677,103 @@ pub enum Sex {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Club {
+    /// Driver (`DR`).
     #[serde(rename = "DR")]
     Driver,
+    /// Mini driver (`MD`).
     #[serde(rename = "MD")]
     MiniDriver,
+    /// 2-wood (`2W`).
     #[serde(rename = "2W")]
     Wood2,
+    /// 3-wood (`3W`).
     #[serde(rename = "3W")]
     Wood3,
+    /// 4-wood (`4W`).
     #[serde(rename = "4W")]
     Wood4,
+    /// 5-wood (`5W`).
     #[serde(rename = "5W")]
     Wood5,
+    /// 6-wood (`6W`).
     #[serde(rename = "6W")]
     Wood6,
+    /// 7-wood (`7W`).
     #[serde(rename = "7W")]
     Wood7,
+    /// 8-wood (`8W`).
     #[serde(rename = "8W")]
     Wood8,
+    /// 9-wood (`9W`).
     #[serde(rename = "9W")]
     Wood9,
+    /// 1-hybrid (`1H`).
     #[serde(rename = "1H")]
     Hybrid1,
+    /// 2-hybrid (`2H`).
     #[serde(rename = "2H")]
     Hybrid2,
+    /// 3-hybrid (`3H`).
     #[serde(rename = "3H")]
     Hybrid3,
+    /// 4-hybrid (`4H`).
     #[serde(rename = "4H")]
     Hybrid4,
+    /// 5-hybrid (`5H`).
     #[serde(rename = "5H")]
     Hybrid5,
+    /// 6-hybrid (`6H`).
     #[serde(rename = "6H")]
     Hybrid6,
+    /// 7-hybrid (`7H`).
     #[serde(rename = "7H")]
     Hybrid7,
+    /// 8-hybrid (`8H`).
     #[serde(rename = "8H")]
     Hybrid8,
+    /// 9-hybrid (`9H`).
     #[serde(rename = "9H")]
     Hybrid9,
+    /// 1-iron (`1I`).
     #[serde(rename = "1I")]
     Iron1,
+    /// 2-iron (`2I`).
     #[serde(rename = "2I")]
     Iron2,
+    /// 3-iron (`3I`).
     #[serde(rename = "3I")]
     Iron3,
+    /// 4-iron (`4I`).
     #[serde(rename = "4I")]
     Iron4,
+    /// 5-iron (`5I`).
     #[serde(rename = "5I")]
     Iron5,
+    /// 6-iron (`6I`).
     #[serde(rename = "6I")]
     Iron6,
+    /// 7-iron (`7I`).
     #[serde(rename = "7I")]
     Iron7,
+    /// 8-iron (`8I`).
     #[serde(rename = "8I")]
     Iron8,
+    /// 9-iron (`9I`).
     #[serde(rename = "9I")]
     Iron9,
+    /// Pitching wedge (`PW`).
     #[serde(rename = "PW")]
     PitchingWedge,
+    /// Gap wedge (`GW`).
     #[serde(rename = "GW")]
     GapWedge,
+    /// Sand wedge (`SW`).
     #[serde(rename = "SW")]
     SandWedge,
+    /// Lob wedge (`LW`).
     #[serde(rename = "LW")]
     LobWedge,
+    /// Putter (`PT`).
     #[serde(rename = "PT")]
     Putter,
 }
@@ -737,14 +862,14 @@ impl fmt::Display for Club {
 }
 
 impl FromStr for Club {
-    type Err = String;
+    type Err = UnknownClub;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::ALL
             .iter()
             .copied()
             .find(|club| club.code() == s)
-            .ok_or_else(|| format!("unknown club code: {s:?}"))
+            .ok_or_else(|| UnknownClub(s.to_owned()))
     }
 }
 
@@ -772,6 +897,18 @@ pub struct GolferId(String);
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("not a golfer id (<namespace>.<id>): {0:?}")]
 pub struct InvalidGolferId(pub String);
+
+/// A string that is not the code of a [`Club`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown club code: {0:?}")]
+pub struct UnknownClub(pub String);
+
+/// A string that is not a unit-tagged [`Distance`] or [`Velocity`]: a
+/// number followed by a known unit suffix. Its text says which value was
+/// expected and why it failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidUnitValue(pub(crate) String);
 
 impl GolferId {
     /// The id `local` in `namespace`.
@@ -915,6 +1052,54 @@ pub mod blockers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn components(back: Option<i32>, side: Option<i32>) -> Launch {
+        Launch {
+            backspin_rpm: back,
+            sidespin_rpm: side,
+            ..Launch::default()
+        }
+    }
+
+    fn total(total: Option<i32>, axis: Option<f64>) -> Launch {
+        Launch {
+            total_spin_rpm: total,
+            spin_axis: axis,
+            ..Launch::default()
+        }
+    }
+
+    /// The launch's components as they are; else the total split by its
+    /// axis; a total with no axis is all backspin with no sidespin.
+    #[test]
+    fn spin_components_read_either_pair() {
+        let ball = components(Some(3200), Some(-450));
+        assert_eq!(ball.spin_components(), (Some(3200), Some(-450)));
+        let (back, side) = total(Some(3231), Some(-8.0)).spin_components();
+        assert_eq!((back, side), (Some(3200), Some(-450)));
+        assert_eq!(
+            total(Some(6897), None).spin_components(),
+            (Some(6897), None)
+        );
+        assert_eq!(total(None, Some(3.0)).spin_components(), (None, None));
+        assert_eq!(Launch::default().spin_components(), (None, None));
+    }
+
+    /// A total with no axis and no components is all backspin; any other
+    /// launch keeps its own backspin, none made up.
+    #[test]
+    fn output_backspin_takes_a_lone_total() {
+        assert_eq!(total(Some(6897), None).output_backspin(), Some(6897));
+        assert_eq!(total(Some(3231), Some(-8.0)).output_backspin(), None);
+        assert_eq!(total(None, None).output_backspin(), None);
+        assert_eq!(
+            components(Some(3200), Some(-450)).output_backspin(),
+            Some(3200)
+        );
+        let mut both = components(None, Some(-450));
+        both.total_spin_rpm = Some(3231);
+        assert_eq!(both.output_backspin(), None, "a partial pair is kept");
+    }
 
     #[test]
     fn complete_spin_from_components() {

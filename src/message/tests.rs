@@ -21,8 +21,10 @@ fn examples() -> Vec<Value> {
             "heartbeat": 2.0, "roles": ["launch_monitor"], "blockers": [],
             "device": {
                 "manufacturer": "Birdie Labs", "model": "Eagle One", "firmware": "2.4.1",
-                "source": "measured", "battery_pct": 82, "tilt": 0.4, "roll": -0.2
-            }
+                "source": "measured", "battery_pct": 82
+            },
+            "telemetry": { "mode": "outdoor", "tilt": "6.5°", "roll": "-0.2°" },
+            "flagged": ["tilt"]
         }),
         json!({ "kind": "bus.sync", "from": PHYSICS }),
         json!({
@@ -214,7 +216,9 @@ fn spec_examples_parse_to_the_expected_values() {
     };
     assert_eq!(actor.heartbeat, 2.0);
     assert!(actor.is_clear());
-    assert!(actor.has_role(crate::types::roles::LAUNCH_MONITOR));
+    assert!(actor.has_role(crate::roles::LAUNCH_MONITOR));
+    assert_eq!(actor.telemetry.as_ref().unwrap()["tilt"], "6.5°");
+    assert_eq!(actor.flagged, ["tilt"]);
     let device = actor.device.unwrap();
     assert_eq!(device.source, Some(Source::Measured));
     assert_eq!(device.battery_pct, Some(82));
@@ -529,7 +533,7 @@ fn lenient_device_fields_and_reply_errors() {
     assert_eq!(device.source, None);
     assert_eq!(device.battery_pct, None);
     assert_eq!(device.model.as_deref(), Some("M"));
-    assert!(actor.has_blocker(crate::types::blockers::NOT_ARMED));
+    assert!(actor.has_blocker(crate::blockers::NOT_ARMED));
     assert!(
         actor.has_blocker("warming_up"),
         "unknown blockers are kept as is"
@@ -563,7 +567,8 @@ fn bad_device_values_and_telemetry_never_make_a_bus_actor_unknown() {
             "manufacturer": 7, "model": ["M"], "firmware": "2.4.1",
             "tilt": "level", "roll": -0.2, "battery_pct": "full"
         },
-        "telemetry": { "radar_mode": "armed", "temp": 31, "flags": null }
+        "telemetry": { "radar_mode": "armed", "temp": 31, "flags": null },
+        "flagged": ["radar_mode", 3, null]
     }));
     let FrpBody::BusActor(actor) = actor.body else {
         panic!("a bad optional field leaves the bus.actor known: {actor:?}")
@@ -572,9 +577,17 @@ fn bad_device_values_and_telemetry_never_make_a_bus_actor_unknown() {
     assert_eq!(device.manufacturer, None);
     assert_eq!(device.model, None);
     assert_eq!(device.firmware.as_deref(), Some("2.4.1"));
-    assert_eq!(device.tilt, None);
-    assert_eq!(device.roll, Some(-0.2));
     assert_eq!(device.battery_pct, None);
+    assert_eq!(
+        actor.flagged,
+        ["radar_mode"],
+        "non-string entries are left out"
+    );
+    let device_json = serde_json::to_string(&device).unwrap();
+    assert!(
+        !device_json.contains("tilt") && !device_json.contains("roll"),
+        "an old device attitude is ignored: {device_json}"
+    );
     let telemetry = actor.telemetry.unwrap();
     assert_eq!(telemetry.len(), 1, "non-string entries are left out");
     assert_eq!(telemetry["radar_mode"], "armed");
@@ -667,8 +680,8 @@ fn every_club_code_round_trips() {
 #[test]
 fn builders_make_the_matching_messages() {
     let actor = BusActor::new("Clubhouse", 2.0)
-        .with_role(crate::types::roles::SESSION)
-        .with_role(crate::types::roles::PRACTICE)
+        .with_role(crate::roles::SESSION)
+        .with_role(crate::roles::PRACTICE)
         .with_namespace("clubhouse");
     let v: Value =
         serde_json::from_str(&FrpMessage::new(CLUBHOUSE, actor).to_json().unwrap()).unwrap();

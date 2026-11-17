@@ -1,10 +1,9 @@
 //! Small helpers every driver host and driver shares: [`Stop`], [`Backoff`],
-//! [`Live`], [`ShotIds`] and [`connect_tcp`].
+//! [`Live`] and [`ShotIds`].
 
-use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::ShotKey;
 use crate::rand::Rng;
@@ -15,6 +14,7 @@ use crate::rand::Rng;
 pub struct Stop(Arc<AtomicBool>);
 
 /// How often [`Stop::sleep`] looks at the flag.
+#[cfg(feature = "server")]
 const SLEEP_SLICE: Duration = Duration::from_millis(20);
 
 impl Stop {
@@ -35,24 +35,23 @@ impl Stop {
         self.0.load(Ordering::SeqCst)
     }
 
-    /// The flag behind the token, for a transport layer that takes a
-    /// `cancel: Option<&AtomicBool>` and needs no flightrelay types.
-    #[must_use]
-    pub fn flag(&self) -> &AtomicBool {
+    /// The shared flag itself, for work that hands it on.
+    pub(crate) fn shared(&self) -> &Arc<AtomicBool> {
         &self.0
     }
 
     /// Sleep for `duration`, waking early on a stop. Returns `true` when the
     /// full duration passed and `false` when a stop cut it short (or was
     /// already requested).
+    #[cfg(feature = "server")]
     #[must_use]
-    pub fn sleep(&self, duration: Duration) -> bool {
-        let end = Instant::now() + duration;
+    pub(crate) fn sleep(&self, duration: Duration) -> bool {
+        let end = std::time::Instant::now() + duration;
         loop {
             if self.is_stopped() {
                 return false;
             }
-            let left = end.saturating_duration_since(Instant::now());
+            let left = end.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 return true;
             }
@@ -67,13 +66,13 @@ const STEP: Duration = Duration::from_secs(1);
 /// Shortest session that restarts a [`Backoff`] at its minimum. Longer than
 /// any connect-time setup, so a link that is accepted and then drops during
 /// setup counts as a failed attempt and keeps growing toward the cap.
-pub const STABLE_SESSION: Duration = Duration::from_secs(10);
+pub(crate) const STABLE_SESSION: Duration = Duration::from_secs(10);
 
 /// Linear reconnect backoff: starts at `min`, grows by 1 s per failed
-/// attempt, capped at `max`. A session that lasted at least
-/// [`STABLE_SESSION`] restarts the sequence at `min`, so one long outage does
-/// not slow every later reconnect, while a link that keeps connecting and
-/// dropping at once still backs off to `max`.
+/// attempt, capped at `max`. A session that lasted at least 10 s restarts
+/// the sequence at `min`, so one long outage does not slow every later
+/// reconnect, while a link that keeps connecting and dropping at once still
+/// backs off to `max`.
 #[derive(Debug, Clone)]
 pub struct Backoff {
     min: Duration,
@@ -238,21 +237,6 @@ fn uuid_string(b: &[u8; 16]) -> String {
     s
 }
 
-/// Connect to `addr` within `timeout`, giving up as soon as `stop` is
-/// requested: `Ok(None)`. The connect runs on a thread of its own; one that
-/// completes after the caller gave up closes the connection at once.
-///
-/// # Errors
-///
-/// Returns the connect error, e.g. a refusal or the timeout.
-pub fn connect_tcp(
-    addr: SocketAddr,
-    timeout: Duration,
-    stop: &Stop,
-) -> std::io::Result<Option<TcpStream>> {
-    crate::net::connect_cancelable(addr, timeout, || !stop.is_stopped())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,22 +327,14 @@ mod tests {
     }
 
     #[test]
-    fn stop_is_shared_by_clones_and_cuts_a_sleep_short() {
+    fn stop_is_shared_by_clones_and_a_stopped_token_never_sleeps() {
         let stop = Stop::new();
-        assert!(!stop.is_stopped());
-        assert!(stop.sleep(Duration::from_millis(10)));
         let other = stop.clone();
-        let at = Instant::now();
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
-            other.stop();
-        });
-        assert!(!stop.sleep(secs(10)));
-        assert!(at.elapsed() < secs(2));
+        assert!(!stop.is_stopped());
+        other.stop();
         assert!(stop.is_stopped());
-        assert!(stop.flag().load(Ordering::SeqCst));
+        #[cfg(feature = "server")]
         assert!(!stop.sleep(secs(10)), "a stopped token never sleeps");
-        handle.join().expect("thread");
     }
 
     #[test]
@@ -370,36 +346,5 @@ mod tests {
         assert_eq!(a.update(|v| std::mem::replace(v, 7)), 5);
         assert_eq!(b.get(), 7);
         assert_eq!(Live::<u8>::default().get(), 0);
-    }
-
-    #[test]
-    fn a_connect_returns_the_stream() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let stream = connect_tcp(addr, secs(2), &Stop::new())
-            .expect("connect")
-            .expect("not stopped");
-        assert_eq!(stream.peer_addr().expect("peer"), addr);
-    }
-
-    #[test]
-    fn a_stopped_token_gives_up_a_connect_at_once() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let stop = Stop::new();
-        stop.stop();
-        let at = Instant::now();
-        let stream = connect_tcp(addr, secs(5), &stop).expect("no error");
-        assert!(stream.is_none());
-        assert!(at.elapsed() < secs(1));
-    }
-
-    #[test]
-    fn a_refused_connect_is_an_error() {
-        let addr = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            l.local_addr().expect("addr")
-        };
-        assert!(connect_tcp(addr, secs(2), &Stop::new()).is_err());
     }
 }

@@ -11,8 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flightrelay::{
-    BusActor, Club, EndpointConfig, FrpBody, FrpConnection, FrpEndpoint, FrpError, FrpMessage,
-    GolferTurn, Handedness, Hub, HubEvent, Launch, Mode, ShotKey, ShotLaunch, Transport, Velocity,
+    BusActor, Club, EndpointConfig, FrpBody, FrpEndpoint, FrpError, FrpMessage, GolferTurn,
+    Handedness, Hub, HubEvent, Launch, Mode, PeerId, ShotKey, ShotLaunch, Target, Velocity,
 };
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
@@ -20,11 +20,13 @@ use tungstenite::{Message, WebSocket};
 const LM: &str = "7d2f9a41c03be856";
 const CLUBHOUSE: &str = "c19e04b7a2d5f318";
 const GAME: &str = "5b80e2f7d14c9a63";
+/// The flooding peer and the reading peer of the flood tests.
+const B: &str = GAME;
+const C: &str = CLUBHOUSE;
 
 /// Bind an endpoint on an ephemeral port and report the address it got.
 fn listener() -> (FrpEndpoint, String) {
-    let ep =
-        FrpEndpoint::open(EndpointConfig::new(Transport::listen("127.0.0.1:0"))).expect("bind");
+    let ep = FrpEndpoint::open(EndpointConfig::new(Target::listen("127.0.0.1:0"))).expect("bind");
     let addr = ep
         .local_addr()
         .expect("addr")
@@ -34,7 +36,7 @@ fn listener() -> (FrpEndpoint, String) {
 }
 
 fn dialer(addr: &str) -> FrpEndpoint {
-    FrpEndpoint::open(EndpointConfig::new(Transport::connect(format!(
+    FrpEndpoint::open(EndpointConfig::new(Target::connect(format!(
         "ws://{addr}/frp"
     ))))
     .expect("open")
@@ -170,104 +172,84 @@ fn a_connection_keeps_reading_after_text_that_is_not_frp() {
 
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
 
-/// A hub on its own thread with `n` raw peers connected to it.
-struct Rig {
-    peers: Vec<Ws>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    hub: thread::JoinHandle<Vec<String>>,
-}
-
-fn rig(n: usize) -> Rig {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+/// A hub with `n` raw peers connected to it, all on the calling thread.
+fn hub_with_peers(n: usize) -> (Hub, Vec<Ws>) {
     let (mut ep, addr) = listener();
-    let accepted = thread::spawn(move || {
+    let dial = thread::spawn(move || {
         (0..n)
-            .map(|_| ep.establish().expect("accept"))
-            .collect::<Vec<FrpConnection>>()
+            .map(|_| tungstenite::connect(format!("ws://{addr}/frp")).unwrap().0)
+            .collect::<Vec<Ws>>()
     });
-    let peers: Vec<Ws> = (0..n)
-        .map(|_| {
-            let (ws, _) = tungstenite::connect(format!("ws://{addr}/frp")).expect("connect");
-            if let MaybeTlsStream::Plain(tcp) = ws.get_ref() {
-                tcp.set_read_timeout(Some(Duration::from_millis(300)))
-                    .unwrap();
-            }
-            ws
-        })
-        .collect();
-    let conns = accepted.join().unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&stop);
-    let hub = thread::spawn(move || {
-        let mut hub = Hub::new();
-        for conn in conns {
-            hub.add(conn).unwrap();
-        }
-        let mut seen = Vec::new();
-        while !flag.load(Ordering::SeqCst) {
-            for event in hub.poll() {
-                match event {
-                    HubEvent::Message { peer, message } => {
-                        seen.push(format!("{peer}: {}", message.kind()));
-                    }
-                    HubEvent::Invalid { peer, .. } => seen.push(format!("{peer}: invalid")),
-                    HubEvent::Left { peer, .. } => seen.push(format!("{peer}: left")),
-                }
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        seen
-    });
-    Rig { peers, stop, hub }
-}
-
-impl Rig {
-    fn finish(self) -> Vec<String> {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        drop(self.peers);
-        self.hub.join().unwrap()
+    let mut hub = Hub::new();
+    for _ in 0..n {
+        hub.add(ep.establish().expect("accept")).unwrap();
     }
+    (hub, dial.join().unwrap())
 }
 
-/// Every text frame `ws` receives within its read timeout.
-fn drain(ws: &mut Ws) -> Vec<String> {
+/// The text frames `ws` reads up to and including `last`.
+fn read_through(ws: &mut Ws, last: &str) -> Vec<String> {
     let mut got = Vec::new();
-    while let Ok(msg) = ws.read() {
-        if let Message::Text(text) = msg {
+    loop {
+        if let Message::Text(text) = ws.read().unwrap() {
             got.push(text.to_string());
+            if text.as_str() == last {
+                return got;
+            }
         }
     }
-    got
 }
 
 #[test]
 fn a_hub_forwards_to_every_other_peer_and_never_back() {
-    let mut rig = rig(3);
+    let (mut hub, mut peers) = hub_with_peers(3);
     let from_a = shot().to_json().unwrap();
     // An extension with fields nobody here knows travels unchanged.
     let from_b =
         r#"{"kind":"x.birdielabs.glow","from":"5b80e2f7d14c9a63","hue":120,"extra":[1,2]}"#;
-    rig.peers[0].send(Message::text(from_a.clone())).unwrap();
-    rig.peers[1].send(Message::text(from_b)).unwrap();
-    rig.peers[1].send(Message::text("not frp")).unwrap();
-    thread::sleep(Duration::from_millis(100));
-    let got: Vec<Vec<String>> = rig.peers.iter_mut().map(drain).collect();
-    assert_eq!(got[0], [from_b.to_owned()], "a gets b's, not its own");
+    peers[0].send(Message::text(from_a.clone())).unwrap();
+    peers[1].send(Message::text(from_b)).unwrap();
+    peers[1].send(Message::text("not frp")).unwrap();
+    let mut seen = Vec::new();
+    let give_up = Instant::now() + Duration::from_secs(10);
+    while seen.len() < 3 {
+        assert!(Instant::now() < give_up, "saw only {seen:?}");
+        for event in hub.poll() {
+            seen.push(match event {
+                HubEvent::Message { peer, message } => format!("{peer}: {}", message.kind()),
+                HubEvent::Invalid { peer, .. } => format!("{peer}: invalid"),
+                HubEvent::Left { peer, .. } => format!("{peer}: left"),
+                other => format!("{other:?}"),
+            });
+        }
+    }
     assert_eq!(
-        got[1],
-        std::slice::from_ref(&from_a),
-        "b gets a's, not its own"
-    );
-    assert_eq!(got[2], [from_a, from_b.to_owned()], "c gets both, in order");
-    let seen = rig.finish();
-    assert_eq!(
-        seen[..3],
+        seen,
         [
             "peer 0: shot.launch",
             "peer 1: x.birdielabs.glow",
             "peer 1: invalid"
         ]
+    );
+    // The hub's own message goes to everyone after what it forwarded.
+    let mark = actor(CLUBHOUSE, "Clubhouse");
+    assert!(hub.send(&mark).unwrap().is_empty());
+    let mark = mark.to_json().unwrap();
+    let got: Vec<Vec<String>> = peers.iter_mut().map(|p| read_through(p, &mark)).collect();
+    assert_eq!(
+        got[0],
+        [from_b.to_owned(), mark.clone()],
+        "a gets b's, not its own"
+    );
+    assert_eq!(
+        got[1],
+        [from_a.clone(), mark.clone()],
+        "b gets a's, not its own"
+    );
+    assert_eq!(
+        got[2],
+        [from_a, from_b.to_owned(), mark],
+        "c gets both, in order"
     );
 }
 
@@ -331,25 +313,67 @@ fn padded(from: &str, pad: usize, n: u64) -> String {
     )
 }
 
-/// Peer A stops reading while peer B floods the hub (and, with `with_c`, peer
-/// C sends small messages and reads everything). The hub drops A once its
-/// queue passes the write buffer limit, in the middle of forwarding B's
-/// messages. The limit holds 16 of B's messages, so C, which reads
-/// everything, never fills its queue on a slow machine. The hub must not panic, must attribute every message to the
-/// peer that sent it, and must never echo a message to its source.
+/// Whether a non-blocking socket call only found the socket busy.
+fn would_block(e: &tungstenite::Error) -> bool {
+    matches!(e, tungstenite::Error::Io(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+}
+
+/// What the hub reported during a flood from B (and C).
+#[derive(Default)]
+struct Tally {
+    left: Option<PeerId>,
+    b_messages: u64,
+    from_c_after_left: u64,
+    misattributed: Vec<String>,
+}
+
+impl Tally {
+    fn poll(&mut self, hub: &mut Hub, pa: PeerId, pb: PeerId) {
+        for event in hub.poll() {
+            match event {
+                HubEvent::Message { peer, message } => {
+                    let from = if peer == pb { B } else { C };
+                    if message.from != from {
+                        self.misattributed.push(format!("{peer}: {}", message.from));
+                    }
+                    if peer == pb {
+                        self.b_messages += 1;
+                    } else if self.left.is_some() {
+                        self.from_c_after_left += 1;
+                    }
+                }
+                HubEvent::Left { peer, .. } => {
+                    assert_eq!(peer, pa, "only the stalled peer is dropped");
+                    self.left = Some(peer);
+                }
+                other => panic!("everything sent is FRP: {other:?}"),
+            }
+        }
+    }
+}
+
+/// Peer A stops reading while peer B floods the hub with 64 KB messages
+/// (and, with `with_c`, peer C sends small messages and reads everything).
+/// With a write buffer limit far under the flood, the hub drops A in the
+/// middle of forwarding B's messages; with one far over it, nobody is
+/// dropped. The hub must not panic, must attribute every message to the peer
+/// that sent it, and must never echo a message to its source.
+///
+/// Everything runs on the test thread, so the order is fixed: each round B
+/// sends one message, C sends one, and the hub and C's reads alternate until
+/// C has every B message the hub has reported. C's queue at the hub never
+/// holds more than a message or two; A's grows by one per round.
 // One scenario, read top to bottom: splitting it would scatter the setup.
 #[allow(clippy::too_many_lines)]
-fn a_stalled_peer_is_dropped_mid_forward(with_c: bool) {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    const B: &str = "5b80e2f7d14c9a63";
-    const C: &str = "c19e04b7a2d5f318";
+fn a_flood_past_a_stalled_peer(with_c: bool, limit: usize) {
+    // A hang guard: A is dropped long before this on any kernel.
+    const ROUNDS: u64 = 2000;
+    let dropping = limit < 16 * 1024 * 1024;
+    let total_b = if dropping { ROUNDS } else { 160 };
     let n = if with_c { 3 } else { 2 };
     let (mut ep, addr) = {
         let ep = FrpEndpoint::open(
-            EndpointConfig::new(Transport::listen("127.0.0.1:0"))
-                .with_write_buffer_limit(1024 * 1024),
+            EndpointConfig::new(Target::listen("127.0.0.1:0")).with_write_buffer_limit(limit),
         )
         .expect("listen");
         let addr = ep.local_addr().unwrap().unwrap().to_string();
@@ -364,131 +388,89 @@ fn a_stalled_peer_is_dropped_mid_forward(with_c: bool) {
             thread::spawn(move || tungstenite::connect(format!("ws://{addr}/frp")).unwrap().0)
         };
         let conn = ep.establish().expect("accept");
-        clients.push(dial.join().unwrap());
+        let ws: Ws = dial.join().unwrap();
+        let MaybeTlsStream::Plain(tcp) = ws.get_ref() else {
+            unreachable!("ws:// is plain TCP")
+        };
+        tcp.set_nonblocking(true).unwrap();
+        clients.push(ws);
         ids.push(hub.add(conn).unwrap());
     }
     let (pa, pb) = (ids[0], ids[1]);
     let mut clients = clients.into_iter();
     // A never reads.
     let _stalled = clients.next().unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-
     let mut wb = clients.next().unwrap();
-    let flag = Arc::clone(&stop);
-    let b = thread::spawn(move || {
-        let mut sent = 0;
-        while !flag.load(Ordering::SeqCst) && sent < 2000 {
-            if wb.send(Message::text(padded(B, 64 * 1024, sent))).is_err() {
-                break;
-            }
-            sent += 1;
-        }
-        wb
-    });
+    let mut wc = clients.next();
 
-    // C writes and reads on two threads over one socket, so it always has
-    // messages waiting at the hub while it reads everything forwarded to it.
-    let c = clients.next().map(|mut wc| {
-        let MaybeTlsStream::Plain(tcp) = wc.get_ref() else {
-            unreachable!("ws:// is plain TCP")
+    let mut seen = Tally::default();
+    let (mut b_sent, mut c_got_b, mut echoed) = (0, 0, 0);
+    for round in 0..ROUNDS * 2 {
+        let done = if dropping {
+            seen.left.is_some() && (!with_c || seen.from_c_after_left > 0)
+        } else {
+            seen.b_messages == total_b
         };
-        tcp.set_read_timeout(Some(Duration::from_millis(5)))
-            .unwrap();
-        let mut reader = WebSocket::from_raw_socket(
-            MaybeTlsStream::Plain(tcp.try_clone().unwrap()),
-            tungstenite::protocol::Role::Client,
-            None,
-        );
-        let flag = Arc::clone(&stop);
-        let writer = thread::spawn(move || {
-            let mut sent = 0;
-            while !flag.load(Ordering::SeqCst) {
-                if wc.send(Message::text(padded(C, 16, sent))).is_err() {
-                    break;
-                }
-                sent += 1;
-                thread::sleep(Duration::from_micros(200));
+        if done {
+            break;
+        }
+        assert!(round < ROUNDS * 2 - 1, "never done");
+        // A send that finds the socket full stays queued in B's buffer.
+        if b_sent < total_b {
+            match wb.send(Message::text(padded(B, 64 * 1024, b_sent))) {
+                Err(e) if !would_block(&e) => panic!("b: {e}"),
+                _ => b_sent += 1,
             }
-            sent
-        });
-        let flag = Arc::clone(&stop);
-        let reader = thread::spawn(move || {
-            let mut echoed = 0;
-            while !flag.load(Ordering::SeqCst) {
-                match reader.read() {
-                    Ok(Message::Text(text)) => {
-                        if FrpMessage::parse(&text).is_ok_and(|m| m.from == C) {
-                            echoed += 1;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(tungstenite::Error::Io(e))
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(_) => break,
-                }
+        } else if let Err(e) = wb.flush() {
+            assert!(would_block(&e), "b: {e}");
+        }
+        if let Some(wc) = &mut wc {
+            match wc.send(Message::text(padded(C, 16, round))) {
+                Err(e) if !would_block(&e) => panic!("c: {e}"),
+                _ => {}
             }
-            echoed
-        });
-        (writer, reader)
-    });
-
-    let from_of = |peer| if peer == pb { B } else { C };
-    let mut misattributed = Vec::new();
-    let mut left = None;
-    let mut seen_from_c_after = 0;
-    let give_up = Instant::now() + Duration::from_secs(30);
-    let mut after = None;
-    while after.is_none_or(|t: Instant| t.elapsed() < Duration::from_millis(300)) {
-        assert!(Instant::now() < give_up, "a was never dropped");
-        for event in hub.poll() {
-            match event {
-                HubEvent::Message { peer, message } => {
-                    if message.from != from_of(peer) {
-                        misattributed.push(format!("{peer}: {}", message.from));
-                    }
-                    if left.is_some() && peer != pb {
-                        seen_from_c_after += 1;
-                    }
-                }
-                HubEvent::Left { peer, .. } => {
-                    assert_eq!(peer, pa, "only the stalled peer is dropped");
-                    left = Some(peer);
-                    after.get_or_insert_with(Instant::now);
-                }
-                HubEvent::Invalid { .. } => panic!("everything sent is FRP"),
+        }
+        seen.poll(&mut hub, pa, pb);
+        let Some(wc) = &mut wc else { continue };
+        // Drain C completely: everything the hub has taken from B so far.
+        while c_got_b < seen.b_messages {
+            match wc.read() {
+                Ok(Message::Text(text)) => match FrpMessage::parse(&text).unwrap().from.as_str() {
+                    B => c_got_b += 1,
+                    _ => echoed += 1,
+                },
+                Ok(_) => {}
+                Err(e) if would_block(&e) => seen.poll(&mut hub, pa, pb),
+                Err(e) => panic!("c: {e}"),
             }
         }
     }
-    assert_eq!(hub.peers().map(|(p, _)| p).collect::<Vec<_>>(), ids[1..]);
-    stop.store(true, Ordering::SeqCst);
-    // Keep serving B and C until their threads end, so neither blocks.
-    while !b.is_finished()
-        || c.as_ref()
-            .is_some_and(|(w, r)| !w.is_finished() || !r.is_finished())
-    {
-        let _ = hub.poll();
-        thread::sleep(Duration::from_millis(1));
-    }
-    let _wb = b.join().unwrap();
-    assert_eq!(left, Some(pa));
-    assert!(misattributed.is_empty(), "{misattributed:?}");
-    if let Some((writer, reader)) = c {
-        let (sent, echoed) = (writer.join().unwrap(), reader.join().unwrap());
-        assert!(sent > 0);
-        assert_eq!(echoed, 0, "c never gets its own messages back");
-        assert!(seen_from_c_after > 0, "c is still served after a left");
+    assert!(seen.misattributed.is_empty(), "{:?}", seen.misattributed);
+    assert_eq!(echoed, 0, "c never gets its own messages back");
+    if dropping {
+        assert_eq!(seen.left, Some(pa));
+        assert_eq!(hub.peers().map(|(p, _)| p).collect::<Vec<_>>(), ids[1..]);
+        assert!(
+            !with_c || seen.from_c_after_left > 0,
+            "c is still served after a left"
+        );
+    } else {
+        assert_eq!(seen.left, None, "every queue stays under the limit");
+        assert_eq!(hub.len(), n);
     }
 }
 
 #[test]
 fn a_stalled_peer_is_dropped_mid_forward_with_two_peers() {
-    a_stalled_peer_is_dropped_mid_forward(false);
+    a_flood_past_a_stalled_peer(false, 1024 * 1024);
 }
 
 #[test]
 fn a_stalled_peer_is_dropped_mid_forward_with_three_peers() {
-    a_stalled_peer_is_dropped_mid_forward(true);
+    a_flood_past_a_stalled_peer(true, 1024 * 1024);
+}
+
+#[test]
+fn a_slow_peer_under_a_large_limit_is_kept() {
+    a_flood_past_a_stalled_peer(true, 256 * 1024 * 1024);
 }
