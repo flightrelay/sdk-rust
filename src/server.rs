@@ -171,7 +171,8 @@ type Observer = Box<dyn FnMut(&ServerEvent<'_>)>;
 ///
 /// The caller's thread is the device thread: [`connect`](FrpDriver::connect),
 /// [`step`](FrpSession::step), [`hints`](FrpSession::hints),
-/// [`close`](FrpSession::close) and the retry sleeps all run on it, so a
+/// [`bus`](FrpSession::bus), [`close`](FrpSession::close) and the retry
+/// sleeps all run on it, so a
 /// session can be `!Send`. A network thread owns every connection, as a
 /// [`Hub`], so peers are served while a connect blocks. An acceptor thread
 /// obtains connections: it accepts in listen mode and dials, and redials, in
@@ -217,6 +218,13 @@ type Observer = Box<dyn FnMut(&ServerEvent<'_>)>;
 ///   next connect through
 ///   [`ConnectCtx::hints`](crate::driver::ConnectCtx::hints). The hints of
 ///   the last complete turn stay when the session actor goes away.
+/// - Every message a peer sends, a `golfer.turn` and a `bus.sync`
+///   included, reaches the running session through
+///   [`bus`](FrpSession::bus), in arrival order, before its next
+///   [`step`](FrpSession::step). A message that arrives while no session
+///   is up (during a connect or a retry wait) is dropped, not kept for the
+///   next session. An error from `bus` ends the session as one from `step`
+///   does.
 /// - A session is always closed when it ends: after an error, and on a
 ///   stop. On a stop the actor's removal (`bus.actor` with
 ///   `"removed": true`) then goes out.
@@ -355,6 +363,7 @@ impl<D: FrpDriver> FrpServer<D> {
 
         let (to_net, net_rx) = sync_channel::<ToNet>(QUEUE);
         let (hints_tx, hints_rx) = channel::<TurnHints>();
+        let (bus_tx, bus_rx) = channel::<FrpMessage>();
         let (note_tx, note_rx) = channel::<Note>();
         let (conn_tx, conn_rx) = channel::<FrpConnection>();
         let (down_tx, down_rx) = channel::<()>();
@@ -366,6 +375,7 @@ impl<D: FrpDriver> FrpServer<D> {
                 rx: net_rx,
                 conn_rx,
                 hints_tx,
+                bus_tx,
                 note_tx: note_tx.clone(),
                 down_tx: bridge.then_some(down_tx),
             },
@@ -413,6 +423,7 @@ impl<D: FrpDriver> FrpServer<D> {
         let mut attempts: u32 = 0;
         let mut inputs = Inputs {
             hints_rx: &hints_rx,
+            bus_rx: &bus_rx,
             note_rx: &note_rx,
             observe: &observe,
             log_level: config.log_level,
@@ -492,6 +503,7 @@ impl<D: FrpDriver> FrpServer<D> {
             let until = Instant::now() + delay;
             while Instant::now() < until && !stop.is_stopped() && !net_thread.is_finished() {
                 let _ = inputs.drain(&mut hints);
+                inputs.drop_bus();
                 std::thread::sleep(
                     until
                         .saturating_duration_since(Instant::now())
@@ -520,6 +532,7 @@ impl<D: FrpDriver> FrpServer<D> {
 /// The device thread's view of what the other threads send it.
 struct Inputs<'a> {
     hints_rx: &'a Receiver<TurnHints>,
+    bus_rx: &'a Receiver<FrpMessage>,
     note_rx: &'a Receiver<Note>,
     observe: &'a dyn Fn(&ServerEvent<'_>),
     log_level: Level,
@@ -562,6 +575,11 @@ impl Inputs<'_> {
         }
         changed
     }
+
+    /// Drops the peer messages waiting: no session is up to take them.
+    fn drop_bus(&self) {
+        while self.bus_rx.try_recv().is_ok() {}
+    }
 }
 
 /// The [`ConnectHost`] of a server: the hints of the last complete turn.
@@ -573,6 +591,7 @@ struct Host<'a, 'b> {
 impl ConnectHost for Host<'_, '_> {
     fn tick(&mut self) {
         let _ = self.inputs.drain(self.hints);
+        self.inputs.drop_bus();
     }
 
     fn hints(&self) -> &TurnHints {
@@ -581,9 +600,9 @@ impl ConnectHost for Host<'_, '_> {
 }
 
 /// One connect of `driver`, with the turns that arrive meanwhile taken into
-/// `hints`. Returns its outcome and the hints of the connect's start: the
-/// session starts with those, so a turn that arrives during the connect
-/// reaches it at the first [`hand_over`].
+/// `hints` and the peer messages dropped. Returns its outcome and the hints
+/// of the connect's start: the session starts with those, so a turn that
+/// arrives during the connect reaches it at the first [`hand_over`].
 fn connect<D: FrpDriver>(
     driver: &mut D,
     stop: &Stop,
@@ -595,11 +614,13 @@ fn connect<D: FrpDriver>(
     let handed = *hints;
     let mut host = Host { inputs, hints };
     let mut ctx = ConnectCtx::new(stop, Events::new(sink, flags), &mut host);
-    (driver.connect(&mut ctx), handed)
+    let connected = driver.connect(&mut ctx);
+    host.inputs.drop_bus();
+    (connected, handed)
 }
 
 /// Takes the turns waiting and hands `session` the hints when they differ
-/// from the ones it has (`handed`).
+/// from the ones it has (`handed`), then each peer message waiting.
 fn hand_over<S: FrpSession>(
     session: &mut S,
     inputs: &mut Inputs<'_>,
@@ -608,11 +629,14 @@ fn hand_over<S: FrpSession>(
     out: &mut Events<'_>,
 ) -> Result<(), S::Error> {
     let _ = inputs.drain(hints);
-    if hints == handed {
-        return Ok(());
+    if hints != handed {
+        *handed = *hints;
+        session.hints(hints, out)?;
     }
-    *handed = *hints;
-    session.hints(hints, out)
+    while let Ok(msg) = inputs.bus_rx.try_recv() {
+        session.bus(&msg, out)?;
+    }
+    Ok(())
 }
 
 /// Step `session` for about `timeout` of real time, waiting [`IDLE`] after a
@@ -731,6 +755,7 @@ struct Links {
     rx: Receiver<ToNet>,
     conn_rx: Receiver<FrpConnection>,
     hints_tx: Sender<TurnHints>,
+    bus_tx: Sender<FrpMessage>,
     note_tx: Sender<Note>,
     down_tx: Option<Sender<()>>,
 }
@@ -926,13 +951,7 @@ impl Net {
         let mut left = false;
         for event in events {
             match event {
-                HubEvent::Message { message, .. } => match &message.body {
-                    FrpBody::GolferTurn(turn) => {
-                        let _ = self.links.hints_tx.send(TurnHints::from_turn(turn));
-                    }
-                    FrpBody::BusSync(_) => self.publish_actor(),
-                    _ => {}
-                },
+                HubEvent::Message { message, .. } => self.on_peer_message(message),
                 HubEvent::Invalid { .. } => {}
                 HubEvent::Left { addr, reason, .. } => {
                     self.note(Note::PeerLeft(addr, reason));
@@ -943,6 +962,19 @@ impl Net {
         if left {
             self.link_down_if_none();
         }
+    }
+
+    /// A peer's message: a `golfer.turn` becomes the hints, a `bus.sync`
+    /// republishes the actor, and every message goes on to the session.
+    fn on_peer_message(&mut self, message: FrpMessage) {
+        match &message.body {
+            FrpBody::GolferTurn(turn) => {
+                let _ = self.links.hints_tx.send(TurnHints::from_turn(turn));
+            }
+            FrpBody::BusSync(_) => self.publish_actor(),
+            _ => {}
+        }
+        let _ = self.links.bus_tx.send(message);
     }
 
     fn publish(&mut self, msg: &FrpMessage) {
@@ -1125,6 +1157,7 @@ mod tests {
     fn net_with_info(config: &ServerConfig, info: &DriverInfo) -> (Net, Receiver<Note>) {
         let (_to_net, rx) = sync_channel(QUEUE);
         let (hints_tx, _) = channel();
+        let (bus_tx, _) = channel();
         let (note_tx, notes) = channel();
         let (_conn_tx, conn_rx) = channel();
         let net = Net::new(
@@ -1134,6 +1167,7 @@ mod tests {
                 rx,
                 conn_rx,
                 hints_tx,
+                bus_tx,
                 note_tx,
                 down_tx: None,
             },
@@ -1375,8 +1409,8 @@ mod tests {
     /// Reads its hints at the top of a connect, then ticks once.
     #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
     struct EarlyReader;
-    /// Records every `hints` call.
-    struct Heard(DeviceIdentity, Vec<TurnHints>);
+    /// Records every `hints` and `bus` call.
+    struct Heard(DeviceIdentity, Vec<TurnHints>, Vec<FrpMessage>);
 
     impl crate::driver::DriverConfig for EarlyReader {}
 
@@ -1398,7 +1432,7 @@ mod tests {
         fn connect(&mut self, ctx: &mut ConnectCtx<'_>) -> Result<Heard, Halt> {
             let read = *ctx.hints();
             ctx.tick()?;
-            Ok(Heard(DeviceIdentity::new("Early-1"), vec![read]))
+            Ok(Heard(DeviceIdentity::new("Early-1"), vec![read], vec![]))
         }
     }
 
@@ -1412,6 +1446,10 @@ mod tests {
             self.1.push(*hints);
             Ok(())
         }
+        fn bus(&mut self, msg: &FrpMessage, _: &mut Events<'_>) -> Result<(), Halt> {
+            self.2.push(msg.clone());
+            Ok(())
+        }
         fn identity(&self) -> &DeviceIdentity {
             &self.0
         }
@@ -1421,10 +1459,12 @@ mod tests {
     #[test]
     fn a_turn_during_the_connect_reaches_the_session_before_its_first_step() {
         let (turns, hints_rx) = channel();
+        let (_peers, bus_rx) = channel();
         let (_notes, note_rx) = channel();
         let observe = |_: &ServerEvent<'_>| {};
         let mut inputs = Inputs {
             hints_rx: &hints_rx,
+            bus_rx: &bus_rx,
             note_rx: &note_rx,
             observe: &observe,
             log_level: Level::Info,
@@ -1456,6 +1496,62 @@ mod tests {
         turns.send(putter).unwrap();
         hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
         assert_eq!(session.1.len(), 2, "the same hints again are no change");
+    }
+
+    #[test]
+    fn a_peer_message_reaches_the_running_session_once_and_none_from_before_it() {
+        let config = ServerConfig::new(Target::listen("127.0.0.1:0"), "7d2f9a41c03be856");
+        let info = DriverInfo::new("early", "Early", Source::Virtual);
+        let (hints_tx, hints_rx) = channel();
+        let (bus_tx, bus_rx) = channel();
+        let (note_tx, note_rx) = channel();
+        let (_to_net, rx) = sync_channel(QUEUE);
+        let (_conn_tx, conn_rx) = channel();
+        let links = Links {
+            rx,
+            conn_rx,
+            hints_tx,
+            bus_tx,
+            note_tx,
+            down_tx: None,
+        };
+        let mut net = Net::new(&config, &info, links, Instant::now());
+        let observe = |_: &ServerEvent<'_>| {};
+        let mut inputs = Inputs {
+            hints_rx: &hints_rx,
+            bus_rx: &bus_rx,
+            note_rx: &note_rx,
+            observe: &observe,
+            log_level: Level::Info,
+        };
+        let stop = Stop::new();
+        let flags = HostFlags::new();
+        let mut sink = |_| {};
+        let mut hints = TurnHints::default();
+        let shot = |n| {
+            let key = crate::ShotKey::new(format!("shot-{n}"), n);
+            FrpMessage::new("a1", ShotFinished { key })
+        };
+
+        net.on_peer_message(shot(1));
+        let (session, mut handed) = connect(
+            &mut EarlyReader,
+            &stop,
+            &mut sink,
+            &flags,
+            &mut inputs,
+            &mut hints,
+        );
+        let mut session = session.unwrap();
+        net.on_peer_message(shot(2));
+        let mut out = Events::new(&mut sink, &flags);
+        hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
+        hand_over(&mut session, &mut inputs, &mut hints, &mut handed, &mut out).unwrap();
+        assert_eq!(
+            session.2,
+            [shot(2)],
+            "the message from before the session is dropped, the one during it handed over once"
+        );
     }
 
     #[test]
